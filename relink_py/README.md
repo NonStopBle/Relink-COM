@@ -6,6 +6,64 @@ wrapper around the C++ library (`relink/`). Proven wire-compatible with
 the C++ node in both directions and over both discovery modes -- see
 `tests/two_process_pub.py` / `tests/two_process_sub.py`.
 
+## Abstract -- why this exists
+
+Robotics and distributed-sensor stacks have reached for ROS as the
+default pub/sub layer for over a decade, but ROS's messaging core
+carries costs that show up directly in latency and jitter budgets:
+ROS1's TCPROS pays a per-message connection-management tax and depends
+on a single master for topic registration; ROS2's DDS fixes the master
+but replaces it with continuous multicast re-announcement (SPDP) that
+scales as O(N²) with node count and can flood constrained or WiFi
+networks the longer a system stays up. Neither was designed around a
+hard real-time latency floor -- they were designed around generality
+(arbitrary QoS policies, arbitrary transports, arbitrary serialization),
+and generality has a cost.
+
+**ReLink exists for the case where you don't need that generality and do
+need the latency floor**: a fixed-layout message over raw UDP,
+discovered once at startup (not re-announced forever), serialized by a
+straight `memcpy`/`ctypes` cast instead of a schema-driven encoder,
+dispatched on a dedicated thread with no lock in the hot path. In
+head-to-head measurement against ROS2 Humble on identical
+hardware/payload/rate (see the root `README.md`'s Benchmarks section),
+that design difference is not theoretical: ReLink's C++ node measured
+**~3x lower average latency and ~10x lower worst-case tail latency**.
+
+This Python binding exists so that role isn't C++-only: a Python node
+speaks the exact same bytes on the wire as the C++ one (proven
+bidirectionally, over both discovery modes, in `tests/two_process_*.py`)
+-- useful for tooling, test scripts, ground-station/UI processes, or any
+node that isn't itself on the hard real-time hot path but still needs to
+publish or subscribe into a ReLink system. It is a from-scratch,
+stdlib-only reimplementation of the documented byte layout, not a
+C-extension wrapper around the C++ library, so it carries zero
+third-party dependencies and stays honest about not claiming the C++
+side's 1000Hz hot-path guarantee (see Performance note below): Python's
+interpreter overhead and per-object heap allocation make it unsuitable
+for the same zero-allocation hot-path claim the C++ transport makes, so
+this binding is positioned for interoperability and non-hot-path nodes,
+not as a second implementation racing the C++ core for the performance
+target.
+
+### Performance note
+
+`relink/include/relink/udp_transport.hpp`'s docstring states this
+explicitly: the C++ side's 1000Hz/≤1ms hard requirement is a claim about
+that implementation specifically, not the protocol in the abstract.
+Every language binding gets the same wire format and discovery modes;
+only C++ (with CPU pinning + `SCHED_FIFO`, see the root README's
+Benchmarks) has been measured against the hard latency floor.
+
+The tradeoff is explicit, not hidden: ReLink is a **protocol**, not a
+general messaging framework. One message type per topic, fixed at
+registration. No arbitrary QoS matrix, no reliable-transport path in v1,
+no schema evolution story. If your system needs those things, ROS2/DDS
+is the more complete answer. If your system needs a small, fixed set of
+nodes on a LAN exchanging fixed-layout messages with minimal overhead --
+and Python is the right language for that particular node -- this
+binding is built specifically for that case.
+
 ## Install
 
 No build step -- it's pure Python stdlib:
