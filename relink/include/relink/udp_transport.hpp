@@ -88,6 +88,15 @@ public:
 
     uint16_t local_port() const { return local_port_; }
 
+    // Exposes the underlying socket fd, needed ONLY so callers (namely
+    // RelinkNode's com-core registration step) can reuse this exact
+    // socket for a pre-start() synchronous request/reply, keeping the
+    // NAT-mapped source port com-core observes consistent with the port
+    // this transport will actually receive data on. Safe to use before
+    // start() launches the dedicated data thread; not meant for general
+    // use once the thread is running (it owns recv from that point on).
+    int native_handle() const { return sock_; }
+
     // Register the raw-bytes handler for a topic_id. Must be called
     // before start() for the topics this node will receive traffic on
     // (v1: no locking needed here since registration happens before the

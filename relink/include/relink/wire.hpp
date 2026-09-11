@@ -31,6 +31,15 @@ inline constexpr uint8_t kStopByte  = 0x0A; // '\n'
 inline constexpr uint8_t kFlagSecure   = 0x01; // bit 0
 inline constexpr uint8_t kFlagChecksum = 0x02; // bit 1
 
+// Reserved topic id used only for NAT hole-punching keepalive datagrams
+// (see multicast/com-core NAT traversal support) -- never register a
+// real advertise<T>/subscribe<T> on this id. A punch datagram is a
+// normal ReLink frame with an empty payload; since no handler is ever
+// registered for this topic, UdpTransport's existing
+// "no subscriber for this topic -> drop" path silently discards it on
+// arrival, with no special-case receive logic needed.
+inline constexpr uint16_t kNatPunchTopicId = 0xFFFF;
+
 // ---------------------------------------------------------------------
 // RelinkHeader — 7 bytes on the wire, immediately after the start byte.
 //   topic_id    : uint16_t, little-endian

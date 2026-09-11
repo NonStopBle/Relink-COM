@@ -191,19 +191,6 @@ private:
         }
 
         transport_.bind(0);
-        // Pin the data thread to a dedicated core, per spec's Threading/
-        // Lean-optimization sections ("the single highest-leverage fix
-        // for tail-latency spikes"). NOT auto-pinned by default: per
-        // spec, "if a robot runs multiple ReLink nodes on the same
-        // board... be deliberate about which core each node's data
-        // thread pins to -- two data threads fighting for the same
-        // pinned core reintroduces the exact scheduling jitter pinning
-        // was meant to eliminate." An auto-picked default (e.g. "last
-        // core") cannot safely avoid that collision across independent
-        // processes with no shared coordination, so pinning here is
-        // opt-in only via set_data_thread_core(core).
-        int pin_core = (data_thread_core_override_ == kAutoPinCore) ? -1 : data_thread_core_override_;
-        transport_.start(pin_core, use_realtime_, rt_priority_);
 
         std::vector<uint16_t> topics;
         {
@@ -211,17 +198,33 @@ private:
             topics.assign(declared_topics_.begin(), declared_topics_.end());
         }
 
+        std::vector<PeerAddr> newly_learned_peers; // for the NAT punch burst below
+
         if (mode == DiscoveryMode::ComCore) {
+            // Registration MUST happen on transport_'s own socket, before
+            // transport_.start() hands that socket's recv loop to the
+            // dedicated data thread (two threads calling recvfrom() on
+            // the same fd concurrently would race the ack reply against
+            // the data thread's recv_and_dispatch). This also has a
+            // second purpose beyond avoiding that race: when com-core is
+            // run with --nat, it learns each node's real (NAT-mapped)
+            // public endpoint from the register request's UDP source
+            // port -- that's only useful/correct if it's the SAME port
+            // the node's data traffic actually arrives on, i.e. this
+            // socket, not a throwaway one.
             uint32_t self_ip = detect_local_ip_for_peer(set_com_core.resolved_ip(),
                                                          set_com_core.resolved_port());
-            auto outcome = register_with_com_core(
+            auto outcome = register_with_com_core_on_socket(
+                transport_.native_handle(),
                 set_com_core.resolved_ip(), set_com_core.resolved_port(),
                 self_ip, transport_.local_port(),
                 topics.data(), static_cast<uint16_t>(topics.size()));
             if (outcome.ok) {
                 std::lock_guard<std::mutex> lock2(state_mutex_);
                 for (const auto& p : outcome.peers) {
-                    peers_[p.topic_id].push_back(PeerAddr{p.ip, p.port});
+                    PeerAddr addr{p.ip, p.port};
+                    peers_[p.topic_id].push_back(addr);
+                    newly_learned_peers.push_back(addr);
                 }
             }
             // If registration failed after retries, register_with_com_core
@@ -241,6 +244,39 @@ private:
                 peers_[topic].push_back(PeerAddr{p.ip, p.port});
             });
             mcast_->start();
+        }
+
+        // Pin the data thread to a dedicated core, per spec's Threading/
+        // Lean-optimization sections ("the single highest-leverage fix
+        // for tail-latency spikes"). NOT auto-pinned by default: per
+        // spec, "if a robot runs multiple ReLink nodes on the same
+        // board... be deliberate about which core each node's data
+        // thread pins to -- two data threads fighting for the same
+        // pinned core reintroduces the exact scheduling jitter pinning
+        // was meant to eliminate." An auto-picked default (e.g. "last
+        // core") cannot safely avoid that collision across independent
+        // processes with no shared coordination, so pinning here is
+        // opt-in only via set_data_thread_core(core).
+        int pin_core = (data_thread_core_override_ == kAutoPinCore) ? -1 : data_thread_core_override_;
+        transport_.start(pin_core, use_realtime_, rt_priority_);
+
+        // NAT hole punching: fire a small burst of empty datagrams at
+        // every peer learned from this registration. This only matters
+        // (and is only correct) when com-core is run with --nat, which
+        // makes it hand out each peer's real internet-facing endpoint
+        // instead of their self-reported LAN address -- sending a
+        // datagram FROM this node TO that endpoint opens this node's own
+        // NAT's outbound mapping, so the peer's (simultaneous) punch
+        // datagram back can get through. Harmless no-op cost on a plain
+        // LAN (a handful of tiny UDP packets to addresses already
+        // reachable directly). Uses the reserved kNatPunchTopicId, which
+        // every node silently drops on receive since nothing ever
+        // subscribes to it.
+        for (const auto& peer : newly_learned_peers) {
+            for (int i = 0; i < 3; ++i) {
+                transport_.publish_raw(kNatPunchTopicId, nullptr, 0, peer);
+                std::this_thread::sleep_for(std::chrono::milliseconds(30));
+            }
         }
 
         started_ = true;

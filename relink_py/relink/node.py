@@ -11,9 +11,9 @@ import threading
 import time
 from typing import Callable, Dict, List, Optional, Set, Type
 
-from .wire import is_wire_type
+from .wire import is_wire_type, NAT_PUNCH_TOPIC_ID
 from .udp_transport import UdpTransport, PeerAddr, ipv4_to_host_order
-from .com_core_client import register_with_com_core
+from .com_core_client import register_with_com_core_on_socket
 from .multicast_discovery import (
     MulticastDiscovery, MulticastDiscoveryConfig,
     DEFAULT_MULTICAST_GROUP, DEFAULT_MULTICAST_PORT,
@@ -166,24 +166,40 @@ class RelinkNode:
                 raise RuntimeError("com-core IP not set -- call set_com_core.ip(...)")
 
             self._transport.bind(0)
-            self._transport.start()
 
             topics = list(self._declared_topics)
+            newly_learned_peers: List[PeerAddr] = []  # for the NAT punch burst below
 
             if self._mode == DiscoveryMode.COM_CORE:
+                # Registration MUST happen on the transport's own socket,
+                # before self._transport.start() hands that socket's recv
+                # loop to the dedicated data thread (two threads reading
+                # the same fd concurrently would race the ack reply
+                # against the data thread's dispatch loop). This also
+                # matters for NAT traversal: when com-core runs with
+                # --nat, it learns each node's real (NAT-mapped) public
+                # endpoint from the request's UDP source port -- correct
+                # only if that's the SAME port the node's data traffic
+                # actually arrives on, i.e. this socket, not a throwaway
+                # one.
                 self_ip = _detect_local_ip_for_peer(self.set_com_core.resolved_ip,
                                                      self.set_com_core.resolved_port)
-                outcome = register_with_com_core(
+                outcome = register_with_com_core_on_socket(
+                    self._transport.sock,
                     self.set_com_core.resolved_ip, self.set_com_core.resolved_port,
                     self_ip, self._transport.local_port, topics)
                 if outcome.ok:
                     with self._peers_lock:
                         for p in outcome.peers:
-                            self._peers.setdefault(p.topic_id, []).append(PeerAddr(p.ip, p.port))
+                            addr = PeerAddr(p.ip, p.port)
+                            self._peers.setdefault(p.topic_id, []).append(addr)
+                            newly_learned_peers.append(addr)
                 # If registration failed after retries, register_with_com_core
                 # already logged an error; proceed with an empty peer table
                 # rather than crashing the node.
+                self._transport.start()
             else:
+                self._transport.start()
                 cfg = MulticastDiscoveryConfig(
                     self_ip=_detect_local_ip_for_peer(
                         ipv4_to_host_order(DEFAULT_MULTICAST_GROUP), DEFAULT_MULTICAST_PORT),
@@ -198,5 +214,19 @@ class RelinkNode:
 
                 self._mcast.set_peer_discovered_callback(on_peer)
                 self._mcast.start()
+
+            # NAT hole punching: fire a small burst of empty datagrams at
+            # every peer learned from this registration. Only matters
+            # (and is only correct) when com-core is run with --nat,
+            # which hands out each peer's real internet-facing endpoint
+            # instead of their self-reported LAN address -- sending a
+            # datagram FROM this node TO that endpoint opens this node's
+            # own NAT's outbound mapping so the peer's (simultaneous)
+            # punch datagram back can get through. Harmless no-op cost
+            # on a plain LAN.
+            for peer in newly_learned_peers:
+                for _ in range(3):
+                    self._transport.publish_raw(NAT_PUNCH_TOPIC_ID, b"", peer)
+                    time.sleep(0.03)
 
             self._started = True

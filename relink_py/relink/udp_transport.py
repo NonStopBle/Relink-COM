@@ -59,6 +59,17 @@ class UdpTransport:
     def local_port(self) -> int:
         return self._local_port
 
+    @property
+    def sock(self) -> socket.socket:
+        """The underlying socket, exposed ONLY so a caller (namely
+        RelinkNode's com-core registration step) can reuse this exact
+        socket for a pre-start() synchronous request/reply, keeping the
+        NAT-mapped source port com-core observes consistent with the
+        port this transport will actually receive data on. Safe to use
+        before start() launches the dedicated data thread; not meant for
+        general use once that thread owns recv from this socket."""
+        return self._sock
+
     def set_topic_handler(self, topic_id: int, callback: RawTopicCallback):
         with self._handlers_lock:
             self._handlers[topic_id] = callback

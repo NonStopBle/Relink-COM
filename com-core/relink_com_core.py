@@ -12,6 +12,16 @@ Wire layout (matches relink/include/relink/register.hpp exactly):
                             + topic_count * "<H"
     RegisterAckHeader     = "<BH"   status(u8) peer_count(u16)
                             + peer_count * RegisterAckPeer("<IHH" ip,port,topic_id)
+
+--nat: NAT traversal / UDP hole punching support, mirrors
+com-core/relink_com_core.cpp's --nat flag exactly (byte-identical
+behavior, same rationale). When set, the OBSERVED UDP source address of
+each registration (the real, NAT-mapped endpoint) is used instead of the
+self-reported node_ip/node_port in the payload, which is typically a
+private LAN address useless to a peer on a different network. Opening
+the actual NAT hole additionally requires each RelinkNode client to send
+a punch-packet burst to every peer it learns about -- see
+relink/node.py's _ensure_started().
 """
 import socket
 import struct
@@ -49,10 +59,12 @@ def main():
     port = DEFAULT_PORT
     if "--port" in sys.argv:
         port = int(sys.argv[sys.argv.index("--port") + 1])
+    nat_mode = "--nat" in sys.argv
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.bind(("0.0.0.0", port))
-    print(f"relink-com-core (Python) listening on 0.0.0.0:{port}", flush=True)
+    suffix = " (NAT traversal enabled)" if nat_mode else ""
+    print(f"relink-com-core (Python) listening on 0.0.0.0:{port}{suffix}", flush=True)
 
     table = {}  # topic_id -> set of (ip, port)
 
@@ -63,7 +75,21 @@ def main():
             print("relink-com-core: dropped malformed RegisterRequest", file=sys.stderr, flush=True)
             continue
         node_ip, node_port, topics = decoded
-        self_entry = (node_ip, node_port)
+
+        if nat_mode:
+            # addr is (ip_str, port) as observed by the OS -- the real,
+            # NAT-mapped endpoint, not whatever private address the node
+            # self-reported in the payload. inet_aton returns network-
+            # order (big-endian) bytes, so unpack with ">I" -- "<I" here
+            # would silently byte-reverse the address (127.0.0.1 becomes
+            # 1.0.0.127), the same host-order convention used everywhere
+            # else in this codebase (see relink/register.hpp's
+            # ipv4_to_host_order / the ">I" pack just below for the
+            # reverse direction).
+            observed_ip = struct.unpack(">I", socket.inet_aton(addr[0]))[0]
+            self_entry = (observed_ip, addr[1])
+        else:
+            self_entry = (node_ip, node_port)
 
         for topic in topics:
             table.setdefault(topic, set()).add(self_entry)
@@ -78,12 +104,14 @@ def main():
         ack = encode_register_ack(0, peers)
         sock.sendto(ack, addr)
 
-        # node_ip is stored host-byte-order (see relink/register.hpp /
-        # ipv4_to_host_order) -- pack big-endian to get network order for
-        # inet_ntoa, regardless of this machine's own endianness.
-        ip_str = socket.inet_ntoa(struct.pack(">I", node_ip))
-        print(f"relink-com-core: registered {ip_str}:{node_port} "
-              f"({len(topics)} topics), replied with {len(peers)} peers", flush=True)
+        # self_entry's ip is stored host-byte-order (see
+        # relink/register.hpp / ipv4_to_host_order) -- pack big-endian to
+        # get network order for inet_ntoa, regardless of this machine's
+        # own endianness.
+        ip_str = socket.inet_ntoa(struct.pack(">I", self_entry[0]))
+        observed_suffix = " [observed]" if nat_mode else ""
+        print(f"relink-com-core: registered {ip_str}:{self_entry[1]} "
+              f"({len(topics)} topics){observed_suffix}, replied with {len(peers)} peers", flush=True)
 
 
 if __name__ == "__main__":

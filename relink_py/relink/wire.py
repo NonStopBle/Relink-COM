@@ -22,6 +22,14 @@ STOP_BYTE = 0x0A   # '\n'
 FLAG_SECURE = 0x01
 FLAG_CHECKSUM = 0x02
 
+# Reserved topic id used only for NAT hole-punching keepalive datagrams
+# (see RelinkNode._ensure_started()'s NAT punch burst) -- never
+# advertise/subscribe a real topic on this id. A punch datagram is a
+# normal ReLink frame with an empty payload; since no handler is ever
+# registered for this topic, UdpTransport's existing "no subscriber ->
+# drop" path silently discards it on arrival.
+NAT_PUNCH_TOPIC_ID = 0xFFFF
+
 # Safe UDP payload budget -- matches relink/include/relink/frame.hpp exactly.
 MAX_PAYLOAD_BYTES = 1400
 
