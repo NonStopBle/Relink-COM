@@ -101,27 +101,38 @@ public:
     explicit ImageReassembler(CompleteCallback cb) : on_complete_(std::move(cb)) {}
 
     void on_chunk(const ImageChunk& chunk) {
+        on_chunk_raw(chunk.frame_id, chunk.chunk_index, chunk.chunk_count,
+                     chunk.data, chunk.chunk_bytes);
+    }
+
+    // Same reassembly logic as on_chunk(), but takes the chunk's fields
+    // and a data pointer directly instead of a full ImageChunk -- used
+    // by RelinkNode::subscribe_image()'s zero-copy receive path, which
+    // parses the compact wire format directly out of the raw recv
+    // buffer rather than materializing an ImageChunk first.
+    void on_chunk_raw(uint32_t frame_id, uint16_t chunk_index, uint16_t chunk_count,
+                       const uint8_t* data, uint16_t chunk_bytes) {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (chunk.frame_id != current_frame_id_ || !in_progress_) {
-            current_frame_id_ = chunk.frame_id;
+        if (frame_id != current_frame_id_ || !in_progress_) {
+            current_frame_id_ = frame_id;
             in_progress_ = true;
-            received_.assign(chunk.chunk_count, false);
-            buffer_.assign(size_t(chunk.chunk_count) * kImageChunkDataBytes, 0);
+            received_.assign(chunk_count, false);
+            buffer_.assign(size_t(chunk_count) * kImageChunkDataBytes, 0);
             received_count_ = 0;
         }
-        if (chunk.chunk_index >= received_.size() || received_[chunk.chunk_index]) return;
+        if (chunk_index >= received_.size() || received_[chunk_index]) return;
 
-        std::memcpy(buffer_.data() + size_t(chunk.chunk_index) * kImageChunkDataBytes,
-                    chunk.data, chunk.chunk_bytes);
-        received_[chunk.chunk_index] = true;
+        std::memcpy(buffer_.data() + size_t(chunk_index) * kImageChunkDataBytes,
+                    data, chunk_bytes);
+        received_[chunk_index] = true;
         ++received_count_;
-        if (chunk.chunk_index == chunk.chunk_count - 1) {
-            last_chunk_bytes_ = chunk.chunk_bytes;
+        if (chunk_index == chunk_count - 1) {
+            last_chunk_bytes_ = chunk_bytes;
         }
 
-        if (received_count_ == chunk.chunk_count) {
-            size_t total = (chunk.chunk_count > 1)
-                ? size_t(chunk.chunk_count - 1) * kImageChunkDataBytes + last_chunk_bytes_
+        if (received_count_ == chunk_count) {
+            size_t total = (chunk_count > 1)
+                ? size_t(chunk_count - 1) * kImageChunkDataBytes + last_chunk_bytes_
                 : last_chunk_bytes_;
             std::vector<uint8_t> image(buffer_.begin(), buffer_.begin() + total);
             in_progress_ = false;

@@ -7,6 +7,7 @@ argument rather than a template parameter)."""
 import ctypes
 import enum
 import socket
+import struct
 import threading
 import time
 from typing import Callable, Dict, List, Optional, Set, Type
@@ -19,7 +20,10 @@ from .multicast_discovery import (
     DEFAULT_MULTICAST_GROUP, DEFAULT_MULTICAST_PORT,
 )
 from .register import COM_CORE_DEFAULT_PORT
-from .image import ImageChunk, encode_image_chunks, ImageReassembler
+from .image import (
+    ImageChunk, encode_image_chunks, ImageReassembler, ImageTooLargeError,
+    MAX_IMAGE_BYTES, IMAGE_CHUNK_DATA_BYTES, IMAGE_CHUNK_HEADER_BYTES,
+)
 
 
 class DiscoveryMode(enum.Enum):
@@ -107,6 +111,8 @@ class RelinkNode:
                   secure: bool = False, checksum: bool = False):
         if not is_wire_type(msg_type):
             raise TypeError(f"{msg_type} must be a ctypes.Structure subclass with _pack_ = 1")
+        if msg_type is ImageChunk:
+            self._transport.enable_large_buffers()
         self._declared_topics.add(topic_id)
 
     # --- subscribe: receiver-side topic declaration + typed callback,
@@ -153,19 +159,38 @@ class RelinkNode:
         in order. frame_id lets the receiver match chunks belonging to
         the same image and is auto-incremented per topic if not given.
         Raises ImageTooLargeError if data exceeds the max representable
-        image size -- rejected loudly, never silently truncated."""
+        image size -- rejected loudly, never silently truncated.
+
+        Zero-copy send path: unlike encode_image_chunks() (still
+        available for the pure encode/reassemble unit tests and anyone
+        building their own transport), this never builds an
+        intermediate ImageChunk -- each chunk's small header and a
+        `memoryview` slice of `data` are handed straight to
+        UdpTransport.publish_scattered()'s socket.sendmsg(), so the
+        chunk's actual pixel/compressed bytes are never copied at the
+        Python level before being handed to the kernel."""
+        if len(data) > MAX_IMAGE_BYTES:
+            raise ImageTooLargeError(f"{len(data)} bytes exceeds the max representable image size "
+                                      f"({MAX_IMAGE_BYTES} bytes, limited by chunk_count being a uint16)")
         if frame_id is None:
             with self._peers_lock:
                 frame_id = self._next_image_frame_id.get(topic_id, 0)
                 self._next_image_frame_id[topic_id] = (frame_id + 1) & 0xFFFFFFFF
 
+        self._ensure_started()
+        with self._peers_lock:
+            peers = list(self._peers.get(topic_id, []))
+
+        chunk_count = max(1, (len(data) + IMAGE_CHUNK_DATA_BYTES - 1) // IMAGE_CHUNK_DATA_BYTES)
+        view = memoryview(data)
         all_ok = True
-
-        def send_chunk(chunk: ImageChunk):
-            nonlocal all_ok
-            all_ok = self.publish(topic_id, chunk) and all_ok
-
-        encode_image_chunks(frame_id, data, send_chunk)
+        for i in range(chunk_count):
+            offset = i * IMAGE_CHUNK_DATA_BYTES
+            piece = view[offset:offset + IMAGE_CHUNK_DATA_BYTES]
+            header = struct.pack("<IHHH", frame_id, i, chunk_count, len(piece))
+            for peer in peers:
+                ok = self._transport.publish_scattered(topic_id, header, piece, peer)
+                all_ok = ok and all_ok
         return all_ok
 
     def subscribe_image(self, topic_id: int, callback: Callable[[int, bytes], None]):
@@ -186,8 +211,27 @@ class RelinkNode:
         eventually collapsed once the backlog outran the buffer. If your
         work is slow, hand it off to your own worker thread/queue
         instead of doing it here."""
+        self._transport.enable_large_buffers()
         reassembler = ImageReassembler(callback)
-        self.subscribe(topic_id, ImageChunk, reassembler.on_chunk)
+        self._declared_topics.add(topic_id)
+
+        # Zero-copy receive path: publish_image() sends the compact wire
+        # format (10-byte header + only the valid data bytes, not padded
+        # to IMAGE_CHUNK_DATA_BYTES), so this parses that directly
+        # instead of going through subscribe(..., ImageChunk, ...)
+        # (which requires payload_len == ctypes.sizeof(ImageChunk)
+        # exactly and would reject every partial last chunk).
+        def raw_handler(payload: bytes):
+            if len(payload) < IMAGE_CHUNK_HEADER_BYTES:
+                return
+            frame_id, chunk_index, chunk_count, chunk_bytes = struct.unpack(
+                "<IHHH", payload[:IMAGE_CHUNK_HEADER_BYTES])
+            data = payload[IMAGE_CHUNK_HEADER_BYTES:]
+            if chunk_bytes != len(data):
+                return  # mismatch: drop, never misinterpret bytes
+            reassembler.on_chunk_raw(frame_id, chunk_index, chunk_count, data)
+
+        self._transport.set_topic_handler(topic_id, raw_handler)
 
     def spin_once(self):
         self._ensure_started()

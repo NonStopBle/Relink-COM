@@ -28,6 +28,7 @@
 #include <string>
 
 #include <sys/socket.h>
+#include <sys/uio.h>
 #include <sched.h>
 #include <pthread.h>
 #include <netinet/in.h>
@@ -69,33 +70,19 @@ public:
         tv.tv_usec = 50 * 1000; // 50ms poll interval for stop responsiveness
         ::setsockopt(sock_, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
-        // This is the ONE socket the node uses for every topic, not
-        // just Image -- so this sizing affects all traffic, though only
-        // Image's several-hundred-chunk bursts are big enough to notice.
-        //
-        // A multi-chunk Image burst (advertise_image/publish_image) can
-        // land hundreds of datagrams back-to-back faster than a single
-        // recvfrom()+dispatch() cycle can drain them; Linux's default
-        // SO_RCVBUF (often ~212KB) overflows well before a 640x480 raw
-        // frame's ~664 chunks are drained, silently dropping the tail of
-        // the burst (a dropped chunk drops the whole image, per Image's
-        // no-retransmission design). Request a larger buffer so a full
-        // burst fits in the kernel queue; best-effort only -- if the OS
-        // clamps it (e.g. net.core.rmem_max), that's fine, this is
-        // strictly better than the default, never worse.
-        //
-        // Sized to the lowest value that measured reliably (not maxed
-        // out at an arbitrary 4MB+): a 20-frame, 5 FPS, 640x480 raw
-        // burst (664 chunks/frame, ~930KB/frame) delivered 20/20 at
-        // 768KB-1MB repeatedly, but dropped 1/20 at 256-512KB. A bigger
-        // buffer isn't free -- it only masks drops for a subscriber that
-        // keeps up; a genuinely slow callback still accumulates latency
-        // and eventually drops regardless of buffer size (see
-        // subscribe_image's docs), so there's no reason to over-buffer
-        // beyond what a keeping-up subscriber actually needs.
-        int bufsize = 1024 * 1024;
-        ::setsockopt(sock_, SOL_SOCKET, SO_RCVBUF, &bufsize, sizeof(bufsize));
-        ::setsockopt(sock_, SOL_SOCKET, SO_SNDBUF, &bufsize, sizeof(bufsize));
+        // Only enlarge the buffer if this node actually uses Image (set
+        // via enable_large_buffers(), called by advertise<ImageChunk>/
+        // subscribe<ImageChunk> before this bind() runs) -- a plain
+        // small-message node (the common, latency-sensitive case this
+        // library is built for, measured ~3x faster than ROS2 Humble)
+        // keeps the OS default buffer untouched. A bigger buffer is not
+        // free: it's more memory reserved per socket and, under a
+        // sustained overload, more queued backlog before a drop finally
+        // happens (i.e. worse latency, not better) -- so it's only
+        // requested for the one message type (several-hundred-chunk
+        // Image bursts) that has been measured to actually need it. See
+        // enable_large_buffers() below for the sizing rationale.
+        if (want_large_buffers_) apply_large_buffers();
 
         struct sockaddr_in addr{};
         addr.sin_family = AF_INET;
@@ -115,6 +102,24 @@ public:
     }
 
     uint16_t local_port() const { return local_port_; }
+
+    // Opts this node's socket into a larger send/receive buffer, sized
+    // to the lowest value that measured reliably for a multi-hundred-
+    // chunk Image burst (not maxed out at an arbitrary large number): a
+    // 20-frame, 5 FPS, 640x480 raw burst (664 chunks/frame, ~930KB/
+    // frame) delivered 20/20 at 768KB-1MB repeatedly, but dropped 1/20
+    // at 256-512KB. Call before bind() (advertise<ImageChunk>/
+    // subscribe<ImageChunk> do this automatically); safe to call after
+    // bind() too, applying immediately. A bigger buffer only masks
+    // drops for a subscriber that keeps up -- a genuinely slow callback
+    // still accumulates latency and eventually drops regardless of
+    // buffer size (see subscribe_image's docs), so this is deliberately
+    // NOT applied to every node by default, only ones that opt in by
+    // using Image.
+    void enable_large_buffers() {
+        want_large_buffers_ = true;
+        if (sock_ >= 0) apply_large_buffers();
+    }
 
     // Exposes the underlying socket fd, needed ONLY so callers (namely
     // RelinkNode's com-core registration step) can reuse this exact
@@ -158,6 +163,60 @@ public:
         return sent == static_cast<ssize_t>(frame_len);
     }
 
+    // Zero-copy variant for large-blob types like Image: publish_raw()
+    // above always memcpy's the whole payload into send_buf_ before
+    // sendto(), which for Image means copying the caller's chunk data
+    // twice (once into an ImageChunk struct, once into send_buf_) for
+    // every one of a several-hundred-chunk burst. This instead uses
+    // sendmsg() with a scatter-gather iovec list so `extra_header` (a
+    // small fixed struct, e.g. Image's 10-byte chunk header) and `data`
+    // (the caller's actual buffer, e.g. a camera frame slice) are handed
+    // to the kernel directly -- no userspace copy of either, only the
+    // 9 fixed framing bytes ('#' + 7-byte header + '\n') are ever
+    // assembled locally.
+    bool publish_scattered(uint16_t topic_id, const void* extra_header, size_t extra_header_len,
+                            const void* data, size_t data_len, const PeerAddr& peer) {
+        size_t payload_len = extra_header_len + data_len;
+        if (payload_len > kMaxPayloadBytes) return false;
+
+        uint16_t seq = seq_counter_.fetch_add(1, std::memory_order_relaxed);
+        RelinkHeader header{};
+        header.topic_id = topic_id;
+        header.seq_num = seq;
+        header.payload_len = static_cast<uint16_t>(payload_len);
+        header.flags = 0;
+
+        uint8_t start = kStartByte;
+        uint8_t stop = kStopByte;
+
+        struct iovec iov[5];
+        int n = 0;
+        iov[n].iov_base = &start; iov[n].iov_len = 1; ++n;
+        iov[n].iov_base = &header; iov[n].iov_len = sizeof(header); ++n;
+        if (extra_header_len > 0) {
+            iov[n].iov_base = const_cast<void*>(extra_header); iov[n].iov_len = extra_header_len; ++n;
+        }
+        if (data_len > 0) {
+            iov[n].iov_base = const_cast<void*>(data); iov[n].iov_len = data_len; ++n;
+        }
+        iov[n].iov_base = &stop; iov[n].iov_len = 1; ++n;
+
+        struct sockaddr_in dest{};
+        dest.sin_family = AF_INET;
+        dest.sin_addr.s_addr = htonl(peer.ip_host_order);
+        dest.sin_port = htons(peer.port);
+
+        struct msghdr msg{};
+        msg.msg_name = &dest;
+        msg.msg_namelen = sizeof(dest);
+        msg.msg_iov = iov;
+        msg.msg_iovlen = n;
+
+        size_t frame_len = 1 + sizeof(header) + payload_len + 1;
+        ssize_t sent = ::sendmsg(sock_, &msg, 0);
+        return sent == static_cast<ssize_t>(frame_len);
+    }
+
     // Starts the dedicated data thread (recv loop + dispatch). Per spec,
     // this thread must never share responsibilities with discovery.
     //
@@ -195,6 +254,12 @@ public:
     }
 
 private:
+    void apply_large_buffers() {
+        int bufsize = 1024 * 1024;
+        ::setsockopt(sock_, SOL_SOCKET, SO_RCVBUF, &bufsize, sizeof(bufsize));
+        ::setsockopt(sock_, SOL_SOCKET, SO_SNDBUF, &bufsize, sizeof(bufsize));
+    }
+
     void close_socket() {
         if (sock_ >= 0) {
             ::close(sock_);
@@ -254,6 +319,7 @@ private:
     }
 
     int sock_ = -1;
+    bool want_large_buffers_ = false;
     uint16_t local_port_ = 0;
     std::atomic<bool> running_{false};
     std::thread thread_;

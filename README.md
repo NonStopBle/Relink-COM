@@ -90,23 +90,33 @@ instead of multicast) that works around that.
   `subscribe_image`) for messages bigger than one UDP datagram —
   automatically chunks to the MTU maximum on send and reassembles on
   receive, no hand-rolled chunking needed (see `camera_stream` in All
-  examples below). Every node also requests a 1MB socket send/receive
-  buffer (best-effort, silently falls back to the OS default if it's
-  refused) so a several-hundred-chunk burst has room to sit in the
-  kernel queue instead of overflowing and silently dropping the tail of
-  the image. **This buffer trades drops for latency, not a free win**:
-  it only helps with short bursts a fast subscriber will drain in time.
-  Measured with a subscriber callback that takes 50ms/frame (a
-  realistic JPEG-decode-and-process cost) against a sender producing
-  faster than that, per-frame latency grew linearly (54ms, 104ms,
-  153ms, ...) and delivery still eventually collapsed once the backlog
-  exceeded the buffer — a bigger buffer only postpones that, it doesn't
-  fix a subscriber that's slower than the publish rate. Since
-  subscriber callbacks run inline on ReLink's one data thread (see
-  Dedicated data thread below), the actual fix for a slow consumer is
-  to keep `subscribe_image`'s callback fast — hand heavy work
-  (decoding, disk I/O, ML inference) off to your own worker thread/queue
-  instead of doing it inside the callback.
+  examples below). Two optimizations, both scoped to Image only so a
+  plain small-message node (this library's actual target — measured
+  ~3x faster than ROS2 Humble, see Benchmarks) is never affected:
+  - **Zero-copy chunk send/receive**: a chunk's data is handed straight
+    to the kernel (`sendmsg()`/`socket.sendmsg()` scatter-gather in C++
+    and Python) instead of being copied into an intermediate struct
+    first — only the 10-byte chunk header and 7-byte wire header are
+    ever assembled locally, the caller's actual bytes are never
+    duplicated in userspace on the way out or in.
+  - A **larger socket send/receive buffer** (1MB, requested only by a
+    node that calls `advertise_image`/`subscribe_image` — best-effort,
+    silently falls back to the OS default if refused) so a several-
+    hundred-chunk burst has room to sit in the kernel queue instead of
+    overflowing and silently dropping the tail of the image. **This
+    buffer trades drops for latency, not a free win**: it only helps
+    with short bursts a fast subscriber will drain in time. Measured
+    with a subscriber callback that takes 50ms/frame (a realistic
+    JPEG-decode-and-process cost) against a sender producing faster
+    than that, per-frame latency grew linearly (54ms, 104ms, 153ms,
+    ...) and delivery still eventually collapsed once the backlog
+    exceeded the buffer — a bigger buffer only postpones that, it
+    doesn't fix a subscriber that's slower than the publish rate. Since
+    subscriber callbacks run inline on ReLink's one data thread (see
+    Dedicated data thread below), the actual fix for a slow consumer is
+    to keep `subscribe_image`'s callback fast — hand heavy work
+    (decoding, disk I/O, ML inference) off to your own worker
+    thread/queue instead of doing it inside the callback.
 - **Dedicated data thread**, zero heap allocation and zero locking in the
   benchmarked hot path, with opt-in CPU pinning and `SCHED_FIFO` for
   real-time tail-latency control.

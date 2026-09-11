@@ -45,6 +45,32 @@ class UdpTransport:
         self._handlers: Dict[int, RawTopicCallback] = {}
         self._seq = 0
         self._seq_lock = threading.Lock()
+        self._want_large_buffers = False
+
+    def enable_large_buffers(self):
+        """Opts this node's socket into a larger send/receive buffer.
+        Only advertise(..., ImageChunk)/subscribe(..., ImageChunk) call
+        this -- a plain small-message node (the common, latency-
+        sensitive case this library is built for, measured ~3x faster
+        than ROS2 Humble) keeps the OS default buffer untouched. A
+        bigger buffer is not free: more memory reserved per socket and,
+        under sustained overload, more queued backlog before a drop
+        finally happens (worse latency, not better) -- so it's only
+        requested for the one message type actually measured to need
+        it. Sized to the lowest value that measured reliably: a
+        20-frame, 5 FPS, 640x480 raw burst (664 chunks/frame, ~930KB/
+        frame) delivered 20/20 at 512KB-1MB repeatedly. Safe to call
+        before or after bind()."""
+        self._want_large_buffers = True
+        if self._sock is not None:
+            self._apply_large_buffers()
+
+    def _apply_large_buffers(self):
+        try:
+            self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1024 * 1024)
+            self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1024 * 1024)
+        except OSError:
+            pass
 
     def bind(self, port: int = 0):
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -52,33 +78,11 @@ class UdpTransport:
         # promptly instead of blocking forever -- same rationale as the
         # C++ side's SO_RCVTIMEO.
         self._sock.settimeout(0.05)
-        # This is the ONE socket the node uses for every topic, not just
-        # Image -- so this sizing affects all traffic, though only
-        # Image's several-hundred-chunk bursts are big enough to notice.
-        #
-        # A multi-chunk Image burst (advertise_image/publish_image) can
-        # land hundreds of datagrams back-to-back faster than Python's
-        # per-chunk recv+dispatch overhead can drain them; the OS default
-        # SO_RCVBUF overflows well before a several-hundred-chunk burst is
-        # drained, silently dropping the tail (a dropped chunk drops the
-        # whole image -- Image never retransmits). Request a larger
-        # buffer so a full burst fits in the kernel queue; best-effort --
-        # if the OS clamps it, that's fine, this is strictly better than
-        # the default, never worse.
-        #
-        # Sized to the lowest value that measured reliably (not maxed
-        # out at an arbitrary 4MB+): a 20-frame, 5 FPS, 640x480 raw burst
-        # (664 chunks/frame, ~930KB/frame) delivered 20/20 at 512KB-1MB
-        # repeatedly. A bigger buffer isn't free -- it only masks drops
-        # for a subscriber that keeps up; a genuinely slow callback still
-        # accumulates latency and eventually drops regardless of buffer
-        # size (see subscribe_image's docstring), so there's no reason to
-        # over-buffer beyond what a keeping-up subscriber actually needs.
-        try:
-            self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1024 * 1024)
-            self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1024 * 1024)
-        except OSError:
-            pass
+        # This is the ONE socket the node uses for every topic; see
+        # enable_large_buffers() above for why this is opt-in, not
+        # applied unconditionally to every node.
+        if self._want_large_buffers:
+            self._apply_large_buffers()
         self._sock.bind(("0.0.0.0", port))
         self._local_port = self._sock.getsockname()[1]
 
@@ -112,6 +116,41 @@ class UdpTransport:
         try:
             self._sock.sendto(frame, (host_order_to_ipv4(peer.ip_host_order), peer.port))
             return True
+        except OSError:
+            return False
+
+    def publish_scattered(self, topic_id: int, extra_header: bytes,
+                           data, peer: PeerAddr) -> bool:
+        """Zero-copy variant for large-blob types like Image: publish_raw()
+        above builds one joined bytes object (start + header + payload +
+        stop) before sending, which for Image means an extra Python-level
+        copy of the caller's chunk data on top of the encode/dispatch
+        overhead already inherent to the interpreter. This uses
+        socket.sendmsg() with a scatter-gather buffer list instead, so
+        `data` (the caller's own buffer, e.g. a `memoryview` slice of a
+        camera frame -- pass one to avoid a `bytes` slice copy too) is
+        handed to the kernel directly alongside the small fixed framing
+        pieces, without ever being concatenated into one object."""
+        payload_len = len(extra_header) + len(data)
+        from .frame import MAX_PAYLOAD_BYTES
+        from .wire import RelinkHeader, START_BYTE, STOP_BYTE
+        if payload_len > MAX_PAYLOAD_BYTES:
+            return False
+        with self._seq_lock:
+            seq = self._seq
+            self._seq = (self._seq + 1) & 0xFFFF
+        header = bytes(RelinkHeader(topic_id=topic_id, seq_num=seq,
+                                     payload_len=payload_len, flags=0))
+        buffers = [bytes([START_BYTE]), header]
+        if extra_header:
+            buffers.append(extra_header)
+        if len(data):
+            buffers.append(data)
+        buffers.append(bytes([STOP_BYTE]))
+        try:
+            sent = self._sock.sendmsg(buffers, [], 0,
+                                       (host_order_to_ipv4(peer.ip_host_order), peer.port))
+            return sent == 1 + len(header) + payload_len + 1
         except OSError:
             return False
 

@@ -72,6 +72,9 @@ public:
     void advertise(uint16_t topic_id, bool /*secure*/ = false, bool /*checksum*/ = false) {
         static_assert(std::is_trivially_copyable<T>::value,
                       "advertise<T>: T must be trivially copyable");
+        if constexpr (std::is_same<T, ImageChunk>::value) {
+            transport_.enable_large_buffers();
+        }
         std::lock_guard<std::mutex> lock(state_mutex_);
         declared_topics_.insert(topic_id);
     }
@@ -82,6 +85,9 @@ public:
     void subscribe(uint16_t topic_id, Callback callback, bool /*secure*/ = false) {
         static_assert(std::is_trivially_copyable<T>::value,
                       "subscribe<T>: T must be trivially copyable");
+        if constexpr (std::is_same<T, ImageChunk>::value) {
+            transport_.enable_large_buffers();
+        }
         {
             std::lock_guard<std::mutex> lock(state_mutex_);
             declared_topics_.insert(topic_id);
@@ -132,17 +138,57 @@ public:
     // overflow uint16_t) -- rejected loudly, per ReLink's "never
     // silently truncate" rule, same as publish<T> rejecting an oversized
     // fixed message.
+    // Zero-copy send path: unlike encode_image_chunks() (still used by
+    // the pure encode/reassemble unit tests and available for anyone
+    // building their own transport), this never copies the caller's
+    // image bytes into an intermediate ImageChunk struct -- each
+    // chunk's small header and the caller's own data slice are handed
+    // straight to the kernel via UdpTransport::publish_scattered()'s
+    // sendmsg() scatter-gather, so a several-hundred-chunk burst costs
+    // one userspace copy fewer per chunk than going through publish<T>.
     bool publish_image(uint16_t topic_id, const uint8_t* data, size_t len,
                         uint32_t frame_id = kAutoFrameId) {
+        if (len > kMaxImageBytes) return false;
         if (frame_id == kAutoFrameId) {
             std::lock_guard<std::mutex> lock(state_mutex_);
             frame_id = next_image_frame_id_[topic_id]++;
         }
+        ensure_started();
+
+        std::vector<PeerAddr> peers;
+        {
+            std::lock_guard<std::mutex> lock(state_mutex_);
+            auto it = peers_.find(topic_id);
+            if (it != peers_.end()) peers = it->second;
+        }
+
+        uint16_t chunk_count = static_cast<uint16_t>(
+            (len + kImageChunkDataBytes - 1) / kImageChunkDataBytes);
+        if (chunk_count == 0) chunk_count = 1; // empty image is still one chunk
+
         bool all_ok = true;
-        auto result = encode_image_chunks(frame_id, data, len, [&](const ImageChunk& chunk) {
-            all_ok = publish<ImageChunk>(topic_id, chunk) && all_ok;
-        });
-        return result == ImageEncodeResult::Ok && all_ok;
+        for (uint16_t i = 0; i < chunk_count; ++i) {
+#pragma pack(push, 1)
+            struct ChunkHeader {
+                uint32_t frame_id;
+                uint16_t chunk_index;
+                uint16_t chunk_count;
+                uint16_t chunk_bytes;
+            };
+#pragma pack(pop)
+            static_assert(sizeof(ChunkHeader) == kImageChunkHeaderBytes,
+                          "ChunkHeader must exactly match the wire chunk header layout");
+            ChunkHeader chdr{frame_id, i, chunk_count, 0};
+            size_t offset = size_t(i) * kImageChunkDataBytes;
+            size_t n = std::min(kImageChunkDataBytes, len - offset);
+            chdr.chunk_bytes = static_cast<uint16_t>(n);
+
+            for (const auto& peer : peers) {
+                all_ok = transport_.publish_scattered(topic_id, &chdr, sizeof(chdr),
+                                                        data + offset, n, peer) && all_ok;
+            }
+        }
+        return all_ok;
     }
 
     // Subscribes to a topic of Image chunks; `callback` fires once per
@@ -164,6 +210,7 @@ public:
     // of doing it here.
     template <typename Callback>
     void subscribe_image(uint16_t topic_id, Callback callback) {
+        transport_.enable_large_buffers();
         auto reassembler = std::make_shared<ImageReassembler>(
             [callback](uint32_t frame_id, const std::vector<uint8_t>& image) {
                 callback(frame_id, image);
@@ -171,9 +218,26 @@ public:
         {
             std::lock_guard<std::mutex> lock(state_mutex_);
             image_reassemblers_.push_back(reassembler); // keep alive for node lifetime
+            declared_topics_.insert(topic_id);
         }
-        subscribe<ImageChunk>(topic_id, [reassembler](const ImageChunk& chunk) {
-            reassembler->on_chunk(chunk);
+        // Zero-copy receive path: publish_image() sends the compact
+        // wire format (10-byte header + only the valid data bytes, not
+        // padded to kImageChunkDataBytes), so this parses that directly
+        // out of the raw recv buffer instead of going through
+        // subscribe<ImageChunk>() (which requires payload_len ==
+        // sizeof(ImageChunk) exactly and would reject every partial
+        // last chunk).
+        transport_.set_topic_handler(topic_id, [reassembler](const uint8_t* payload, size_t len) {
+            if (len < kImageChunkHeaderBytes) return;
+            uint32_t frame_id; uint16_t chunk_index, chunk_count, chunk_bytes;
+            std::memcpy(&frame_id, payload, sizeof(frame_id));
+            std::memcpy(&chunk_index, payload + 4, sizeof(chunk_index));
+            std::memcpy(&chunk_count, payload + 6, sizeof(chunk_count));
+            std::memcpy(&chunk_bytes, payload + 8, sizeof(chunk_bytes));
+            const uint8_t* data = payload + kImageChunkHeaderBytes;
+            size_t data_len = len - kImageChunkHeaderBytes;
+            if (chunk_bytes != data_len) return; // mismatch: drop, never misinterpret bytes
+            reassembler->on_chunk_raw(frame_id, chunk_index, chunk_count, data, chunk_bytes);
         });
     }
 

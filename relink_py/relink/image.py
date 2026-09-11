@@ -86,18 +86,29 @@ class ImageReassembler:
         self._chunk_count = 0
 
     def on_chunk(self, chunk: ImageChunk):
-        with self._lock:
-            if chunk.frame_id != self._current_frame_id:
-                self._current_frame_id = chunk.frame_id
-                self._pieces = {}
-                self._chunk_count = chunk.chunk_count
+        self.on_chunk_raw(chunk.frame_id, chunk.chunk_index, chunk.chunk_count,
+                           bytes(chunk.data[:chunk.chunk_bytes]))
 
-            if chunk.chunk_index in self._pieces:
+    def on_chunk_raw(self, frame_id: int, chunk_index: int, chunk_count: int, data: bytes):
+        """Same reassembly logic as on_chunk(), but takes the chunk's
+        fields directly instead of a full ImageChunk -- used by
+        RelinkNode.subscribe_image()'s zero-copy receive path, which
+        parses the compact wire format directly rather than building an
+        ImageChunk (whose fixed-size `data` field would otherwise force
+        a copy up to IMAGE_CHUNK_DATA_BYTES for every chunk, including
+        partial ones)."""
+        with self._lock:
+            if frame_id != self._current_frame_id:
+                self._current_frame_id = frame_id
+                self._pieces = {}
+                self._chunk_count = chunk_count
+
+            if chunk_index in self._pieces:
                 return
-            self._pieces[chunk.chunk_index] = bytes(chunk.data[:chunk.chunk_bytes])
+            self._pieces[chunk_index] = bytes(data)
 
             if len(self._pieces) == self._chunk_count:
                 buf = b"".join(self._pieces[i] for i in range(self._chunk_count))
-                frame_id = self._current_frame_id
+                fid = self._current_frame_id
                 self._current_frame_id = None  # force a reset before the next frame
-                self._on_complete(frame_id, buf)
+                self._on_complete(fid, buf)
