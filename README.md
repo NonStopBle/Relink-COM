@@ -176,7 +176,6 @@ thread:
 | avg latency | 169 µs | 504 µs |
 | p99 latency | 297 µs | 989 µs |
 | **worst-case latency** | **388 µs** | 3703 µs |
-| sustained rate | ~5900 Hz | ~1985 Hz |
 | 1ms budget | **PASS** | FAIL |
 
 Baseline (no CPU pinning/`SCHED_FIFO`) worst-case was ~2.9ms — pinning
@@ -184,6 +183,19 @@ the data thread to a dedicated core and giving it real-time scheduling
 priority is what gets it under budget. These numbers were measured on
 loopback on a single dev machine, not real wired LAN with two physical
 nodes — directionally strong, not a certified LAN result.
+
+The `sustained rate` row from earlier versions of this table (~5900 Hz
+/ ~1985 Hz) has been removed: it was computed as `1e6 / avg_latency_us`
+in the benchmark harness, which inverts one-way latency and calls it a
+rate -- a different quantity, not an actual measured throughput (it
+gets a *bigger*, not smaller, the *lower* latency gets, which is
+backwards). The harness (`relink_benchmark.cpp`) has been fixed to
+report a real received rate (message count over wall-clock span)
+instead, but the old table numbers above were never re-measured with
+the corrected metric, so they're omitted here rather than left
+standing as if they meant something they didn't. The publisher in both
+benchmarks sends at a fixed, constant 1000Hz regardless of latency --
+that was never in question.
 
 ## Repository layout
 
