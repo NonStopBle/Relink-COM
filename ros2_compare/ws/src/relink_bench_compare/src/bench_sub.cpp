@@ -29,6 +29,8 @@ int main(int argc, char** argv) {
 
     std::vector<double> latencies_us;
     latencies_us.reserve(70000);
+    uint64_t first_recv_time = 0;
+    uint64_t last_recv_time = 0;
 
     // Deep queue depth so the 1000Hz publish rate never overflows the
     // subscription queue and silently drops messages before the callback
@@ -41,6 +43,8 @@ int main(int argc, char** argv) {
             uint64_t send_time = 0;
             std::memcpy(&send_time, msg->data.data(), sizeof(send_time));
             latencies_us.push_back(double(recv_time - send_time));
+            if (first_recv_time == 0) first_recv_time = recv_time;
+            last_recv_time = recv_time;
         });
 
     std::printf("subscriber: listening on bench_topic, press Ctrl+C when the publisher finishes...\n");
@@ -89,8 +93,15 @@ int main(int argc, char** argv) {
         std::printf("\nFAIL: worst-case %.1fus exceeds the %.0fus budget\n", worst, BUDGET_US);
     }
 
-    double effective_hz = 1'000'000.0 / avg;
-    std::printf("effective sustained rate (by avg latency): ~%.0f Hz\n", effective_hz);
+    // Actual received rate from message count over wall-clock span, not
+    // 1e6/avg_latency -- see relink_benchmark.cpp's run_subscriber() for
+    // why that inverted-latency metric is a different, misleading
+    // quantity, not an actual measured rate.
+    double span_sec = double(last_recv_time - first_recv_time) / 1'000'000.0;
+    if (span_sec > 0.0 && n > 1) {
+        double received_hz = double(n - 1) / span_sec;
+        std::printf("received rate: ~%.0f Hz (%zu messages over %.1fs)\n", received_hz, n, span_sec);
+    }
 
     rclcpp::shutdown();
     return 0;

@@ -83,6 +83,9 @@ static void run_subscriber(RelinkNode& node) {
     std::vector<double> latencies_us;
     latencies_us.reserve(70000);  // ~60s at 1000Hz plus margin
 
+    uint64_t first_recv_time = 0;
+    uint64_t last_recv_time = 0;
+
     node.subscribe<BenchMsg>(TOPIC_BENCH, [&](const BenchMsg& msg) {
         uint64_t recv_time = now_us();
         // NOTE: this assumes clocks are reasonably synced between the two
@@ -92,6 +95,8 @@ static void run_subscriber(RelinkNode& node) {
         // instead and adjust the harness accordingly.
         double latency_us = double(recv_time - msg.send_time_us);
         latencies_us.push_back(latency_us);
+        if (first_recv_time == 0) first_recv_time = recv_time;
+        last_recv_time = recv_time;
     });
 
     std::printf("subscriber: listening on TOPIC_BENCH, press Ctrl+C when "
@@ -138,11 +143,20 @@ static void run_subscriber(RelinkNode& node) {
                     worst, BUDGET_US);
     }
 
-    // Effective sustained rate actually achieved, for cross-reference
-    // against the spec's "1000Hz is the floor, not the ceiling" note.
-    double effective_hz = 1'000'000.0 / avg;
-    std::printf("effective sustained rate (by avg latency): ~%.0f Hz\n",
-                effective_hz);
+    // Actual received rate: message count divided by the wall-clock span
+    // between the first and last receive, NOT 1e6/avg_latency -- that
+    // inverts one-way latency and calls it a rate, which is a different
+    // quantity entirely (it grows the *lower* latency gets, and would
+    // report a huge bogus number for a single very-fast message). The
+    // publisher paces at a fixed 1000Hz regardless of latency; this
+    // number is how close the subscriber's actual delivery rate came to
+    // that, not a measure of how "fast" the system is.
+    double span_sec = double(last_recv_time - first_recv_time) / 1'000'000.0;
+    if (span_sec > 0.0 && n > 1) {
+        double received_hz = double(n - 1) / span_sec;
+        std::printf("received rate: ~%.0f Hz (%zu messages over %.1fs)\n",
+                    received_hz, n, span_sec);
+    }
 }
 
 int main(int argc, char** argv) {
