@@ -69,17 +69,31 @@ public:
         tv.tv_usec = 50 * 1000; // 50ms poll interval for stop responsiveness
         ::setsockopt(sock_, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
+        // This is the ONE socket the node uses for every topic, not
+        // just Image -- so this sizing affects all traffic, though only
+        // Image's several-hundred-chunk bursts are big enough to notice.
+        //
         // A multi-chunk Image burst (advertise_image/publish_image) can
         // land hundreds of datagrams back-to-back faster than a single
         // recvfrom()+dispatch() cycle can drain them; Linux's default
         // SO_RCVBUF (often ~212KB) overflows well before a 640x480 raw
         // frame's ~664 chunks are drained, silently dropping the tail of
         // the burst (a dropped chunk drops the whole image, per Image's
-        // no-retransmission design). Request a much larger buffer so a
-        // full burst fits in the kernel queue; best-effort only -- if the
-        // OS clamps it (e.g. net.core.rmem_max), that's fine, this is
+        // no-retransmission design). Request a larger buffer so a full
+        // burst fits in the kernel queue; best-effort only -- if the OS
+        // clamps it (e.g. net.core.rmem_max), that's fine, this is
         // strictly better than the default, never worse.
-        int bufsize = 4 * 1024 * 1024;
+        //
+        // Sized to the lowest value that measured reliably (not maxed
+        // out at an arbitrary 4MB+): a 20-frame, 5 FPS, 640x480 raw
+        // burst (664 chunks/frame, ~930KB/frame) delivered 20/20 at
+        // 768KB-1MB repeatedly, but dropped 1/20 at 256-512KB. A bigger
+        // buffer isn't free -- it only masks drops for a subscriber that
+        // keeps up; a genuinely slow callback still accumulates latency
+        // and eventually drops regardless of buffer size (see
+        // subscribe_image's docs), so there's no reason to over-buffer
+        // beyond what a keeping-up subscriber actually needs.
+        int bufsize = 1024 * 1024;
         ::setsockopt(sock_, SOL_SOCKET, SO_RCVBUF, &bufsize, sizeof(bufsize));
         ::setsockopt(sock_, SOL_SOCKET, SO_SNDBUF, &bufsize, sizeof(bufsize));
 

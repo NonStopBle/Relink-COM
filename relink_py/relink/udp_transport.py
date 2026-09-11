@@ -52,18 +52,31 @@ class UdpTransport:
         # promptly instead of blocking forever -- same rationale as the
         # C++ side's SO_RCVTIMEO.
         self._sock.settimeout(0.05)
+        # This is the ONE socket the node uses for every topic, not just
+        # Image -- so this sizing affects all traffic, though only
+        # Image's several-hundred-chunk bursts are big enough to notice.
+        #
         # A multi-chunk Image burst (advertise_image/publish_image) can
         # land hundreds of datagrams back-to-back faster than Python's
         # per-chunk recv+dispatch overhead can drain them; the OS default
         # SO_RCVBUF overflows well before a several-hundred-chunk burst is
         # drained, silently dropping the tail (a dropped chunk drops the
-        # whole image -- Image never retransmits). Request a much larger
+        # whole image -- Image never retransmits). Request a larger
         # buffer so a full burst fits in the kernel queue; best-effort --
         # if the OS clamps it, that's fine, this is strictly better than
         # the default, never worse.
+        #
+        # Sized to the lowest value that measured reliably (not maxed
+        # out at an arbitrary 4MB+): a 20-frame, 5 FPS, 640x480 raw burst
+        # (664 chunks/frame, ~930KB/frame) delivered 20/20 at 512KB-1MB
+        # repeatedly. A bigger buffer isn't free -- it only masks drops
+        # for a subscriber that keeps up; a genuinely slow callback still
+        # accumulates latency and eventually drops regardless of buffer
+        # size (see subscribe_image's docstring), so there's no reason to
+        # over-buffer beyond what a keeping-up subscriber actually needs.
         try:
-            self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024)
-            self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4 * 1024 * 1024)
+            self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1024 * 1024)
+            self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1024 * 1024)
         except OSError:
             pass
         self._sock.bind(("0.0.0.0", port))
