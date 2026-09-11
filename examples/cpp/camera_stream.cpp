@@ -19,30 +19,23 @@
 // something bigger than one datagram.
 //
 // Tested end-to-end (real camera, real chunked pub/sub) at 320x240
-// (225 raw chunks/frame) and 640x480 (900 raw chunks/frame): the C++
-// data thread's per-chunk overhead is low enough to keep up with a
-// 225-900-chunk-per-frame burst at ~5 FPS, so raw delivered 46/47 and
-// 55/57 frames across two runs (~96-98%) -- compressed delivered 100%
-// both times. A dropped chunk still drops the whole image (no
-// retransmission), so raw's reliability WILL degrade at a high enough
-// resolution/frame rate or under real network loss (a real LAN, unlike
-// this loopback test, drops packets); compressed (2-3 chunks/frame) is
-// far less exposed to that risk regardless, since losing one of 2-3 is
-// much less likely than losing one of hundreds. Use image_compressed
-// for anything resembling real-time video, especially over WiFi or a
-// busier network than this test used. On your own machine with a real
-// 1080p+ webcam this same code will negotiate whatever resolution the
-// hardware actually supports (cv::VideoCapture::set() is a request, not
-// a guarantee) -- raw chunk counts scale directly with resolution.
-//
-// Language matters here too: the Python binding (examples/camera_stream.py)
-// measured 0/20 raw frames delivered at these same resolutions under the
-// same conditions, versus ~100% for compressed -- Python's per-chunk
-// interpreter overhead can't keep up with a several-hundred-chunk burst
-// the way C++ can. This matches the Python binding's own documented
-// scope (interoperability/non-hot-path use, not a second implementation
-// racing C++ for performance) -- if you need raw image streaming from
-// Python, compress first.
+// (166 raw chunks/frame) and 640x480 (664 raw chunks/frame) at ~5 FPS:
+// both image_raw and image_compressed delivered 100% across every
+// resolution this test camera supports, in both C++ and Python. That
+// relies on RelinkNode requesting a 4MB socket send/receive buffer by
+// default (see relink/include/relink/udp_transport.hpp) -- without it,
+// a several-hundred-chunk burst can overflow the OS's default buffer
+// (often ~212KB on Linux) faster than recv+dispatch can drain it,
+// silently dropping the tail of the image (a dropped chunk drops the
+// WHOLE image -- Image never retransmits). Even with the larger buffer,
+// prefer image_compressed for anything resembling real-time video,
+// especially over WiFi or a busier network than loopback: real packet
+// loss on a real network still hits a several-hundred-chunk raw frame
+// far harder than a 2-3-chunk compressed one. On your own machine with
+// a real 1080p+ webcam this same code will negotiate whatever
+// resolution the hardware actually supports (cv::VideoCapture::set() is
+// a request, not a guarantee) -- raw chunk counts scale directly with
+// resolution.
 //
 // Build (one line -- OpenCV's linker flags must come AFTER the source
 // file, or you'll get "undefined reference" errors from the linker):

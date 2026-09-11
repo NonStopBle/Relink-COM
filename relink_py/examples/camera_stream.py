@@ -19,25 +19,23 @@ reassembles them on the other end, the documented way to send something
 bigger than one datagram.
 
 Tested end-to-end (real camera, real chunked pub/sub) at 320x240
-(225 raw chunks/frame) and 640x480 (900 raw chunks/frame), two runs
-each: raw delivered 0/20 frames total; compressed delivered ~19/20.
-Sending hundreds of chunks per frame back-to-back overflows the
-receiver's UDP socket buffer faster than Python's per-chunk overhead
-(encode/decode/dispatch through the interpreter) can drain it -- the
-kernel silently drops the excess, and since a dropped chunk drops the
-WHOLE image (no retransmission), raw image streaming from Python is
-effectively unusable at these chunk counts. This is a real, measured
-difference from the C++ binding (examples/cpp/camera_stream.cpp), which
-handled the same raw bursts at ~96-98% reliability under identical
-conditions -- C++'s lower per-chunk overhead keeps up where Python's
-can't. This matches the Python binding's own documented scope
-(interoperability/non-hot-path use, not a second implementation racing
-C++ for performance, see relink_py/README.md). Use image_compressed from
-Python -- always, not just "for real-time video." On your own machine
-with a real 1080p+ webcam this same code will negotiate whatever
-resolution the hardware actually supports (cv2.VideoCapture.set() is a
-request, not a guarantee) -- raw chunk counts scale directly with
-resolution, so this gets worse, not better, at higher resolutions.
+(166 raw chunks/frame) and 640x480 (664 raw chunks/frame) at ~5 FPS:
+both image_raw and image_compressed delivered 100% across every
+resolution this test camera supports. That relies on RelinkNode
+requesting a 4MB socket send/receive buffer by default (see
+relink/udp_transport.py) -- without it, a several-hundred-chunk burst
+can overflow the OS's default buffer (often ~212KB on Linux) faster
+than Python's per-chunk overhead (encode/decode/dispatch through the
+interpreter) can drain it, silently dropping the tail of the image (a
+dropped chunk drops the WHOLE image -- Image never retransmits). Even
+with the larger buffer, prefer image_compressed for anything real-time,
+especially over WiFi or a busier network than loopback -- real packet
+loss still hits a several-hundred-chunk raw frame far harder than a
+2-3-chunk compressed one, and Python's per-chunk overhead leaves less
+margin than C++'s. On your own machine with a real 1080p+ webcam this
+same code will negotiate whatever resolution the hardware actually
+supports (cv2.VideoCapture.set() is a request, not a guarantee) -- raw
+chunk counts scale directly with resolution.
 
 Run:
     python3 examples/camera_stream.py pub        # opens camera 0, streams both topics

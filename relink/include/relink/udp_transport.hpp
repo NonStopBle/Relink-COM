@@ -69,6 +69,20 @@ public:
         tv.tv_usec = 50 * 1000; // 50ms poll interval for stop responsiveness
         ::setsockopt(sock_, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
+        // A multi-chunk Image burst (advertise_image/publish_image) can
+        // land hundreds of datagrams back-to-back faster than a single
+        // recvfrom()+dispatch() cycle can drain them; Linux's default
+        // SO_RCVBUF (often ~212KB) overflows well before a 640x480 raw
+        // frame's ~664 chunks are drained, silently dropping the tail of
+        // the burst (a dropped chunk drops the whole image, per Image's
+        // no-retransmission design). Request a much larger buffer so a
+        // full burst fits in the kernel queue; best-effort only -- if the
+        // OS clamps it (e.g. net.core.rmem_max), that's fine, this is
+        // strictly better than the default, never worse.
+        int bufsize = 4 * 1024 * 1024;
+        ::setsockopt(sock_, SOL_SOCKET, SO_RCVBUF, &bufsize, sizeof(bufsize));
+        ::setsockopt(sock_, SOL_SOCKET, SO_SNDBUF, &bufsize, sizeof(bufsize));
+
         struct sockaddr_in addr{};
         addr.sin_family = AF_INET;
         addr.sin_addr.s_addr = INADDR_ANY;

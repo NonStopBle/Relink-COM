@@ -52,6 +52,20 @@ class UdpTransport:
         # promptly instead of blocking forever -- same rationale as the
         # C++ side's SO_RCVTIMEO.
         self._sock.settimeout(0.05)
+        # A multi-chunk Image burst (advertise_image/publish_image) can
+        # land hundreds of datagrams back-to-back faster than Python's
+        # per-chunk recv+dispatch overhead can drain them; the OS default
+        # SO_RCVBUF overflows well before a several-hundred-chunk burst is
+        # drained, silently dropping the tail (a dropped chunk drops the
+        # whole image -- Image never retransmits). Request a much larger
+        # buffer so a full burst fits in the kernel queue; best-effort --
+        # if the OS clamps it, that's fine, this is strictly better than
+        # the default, never worse.
+        try:
+            self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024)
+            self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4 * 1024 * 1024)
+        except OSError:
+            pass
         self._sock.bind(("0.0.0.0", port))
         self._local_port = self._sock.getsockname()[1]
 
