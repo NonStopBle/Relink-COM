@@ -7,9 +7,10 @@ Two processes: run with argv[1] == "pub" or "sub".
 """
 import ctypes
 import sys
+import os
 import time
 
-sys.path.insert(0, "..")
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 from relink import RelinkNode, Int32
 
 TOPIC_COUNTER = 300

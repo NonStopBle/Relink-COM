@@ -45,6 +45,28 @@ a from-scratch reimplementation of the same bytes, not a wrapper around
 the C++ library. Any language that can open a UDP socket and pack a
 fixed struct can speak ReLink.
 
+## Zero to one
+
+The fastest way to see it work: run the same tiny program twice (two
+terminals, or two computers on the same network) and watch them find
+each other and start talking, with no daemon, no config file, and no
+manual IP address to type in.
+
+| Step | Do this | Why |
+|---|---|---|
+| **1** | `git clone https://github.com/NonStopBle/Relink-COM.git && cd Relink-COM` | Get the code. |
+| **2** | Pick a language: **C++** or **Python**. Both talk the exact same protocol, so it doesn't matter which — you can even mix them. | ReLink isn't tied to one language. |
+| **3** | **C++**: `g++ -std=c++17 -I relink/include -pthread examples/cpp/hello_relink.cpp -o hello_relink`<br>**Python**: nothing to build — it's plain stdlib. | C++ needs a compile step; Python doesn't. |
+| **4** | Open **two terminal windows**. In each one, run the same program:<br>**C++**: `./hello_relink`<br>**Python**: `python3 relink_py/examples/hello_relink.py` | Each copy is both a sender and a receiver. |
+| **5** | Watch both windows. Within a second or two, each one prints `sent: N (to 1 peer(s))` and `received: N` — they found each other automatically over the network (multicast) and are exchanging a counter, once a second, in both directions. | This is discovery + pub/sub working, live. |
+| **6** | Open `relink_py/examples/hello_relink.py` or `examples/cpp/hello_relink.cpp` and read it — it's under 60 lines. Change `TOPIC_HELLO`, the message type, or what happens when a message arrives, and you're writing your own ReLink node. | The whole API surface is: `advertise`, `subscribe`, `publish`, `spin`. |
+
+If step 5 never prints `received:` on either side, the two copies most
+likely aren't on the same network segment, or something on the network
+is blocking UDP multicast (some WiFi routers and most cloud VPCs do) —
+see **Discovery modes** below for the alternative (a small daemon
+instead of multicast) that works around that.
+
 ## Features
 
 - **UDP by default**, fixed 7-byte header, `'#' ... '\n'` framed, no
@@ -71,7 +93,48 @@ fixed struct can speak ReLink.
   a C++ publisher and a Python subscriber (or vice versa) talk normally,
   over either discovery mode.
 
-## Performance
+## Discovery modes — which one do I use?
+
+Every node picks exactly one, explicitly:
+
+```cpp
+// Mode A: a small daemon both sides can reach. Works everywhere,
+// including networks that block multicast (most WiFi, most cloud VPCs).
+node.set_com_core.ip("10.0.0.5");
+
+// Mode B: no daemon needed, nodes find each other via multicast.
+// Simplest to start with, but needs a network that allows multicast.
+node.use_multicast_discovery();
+```
+
+Same choice in Python: `node.set_com_core.ip(...)` or
+`node.use_multicast_discovery()`.
+
+If you're not sure which to use: try mode B (`hello_relink`, above)
+first since it needs nothing extra to run. If it doesn't work on your
+network, switch to mode A — start the daemon once (`./relink-com-core`
+or `python3 com-core/relink_com_core.py`), then point every node at its
+IP address.
+
+## All examples
+
+Every example below is a complete, runnable program — not a snippet.
+Each one exists in both C++ (`examples/cpp/`) and Python
+(`relink_py/examples/`).
+
+| Example | What it shows | Run it |
+|---|---|---|
+| **`hello_relink`** | The simplest possible ReLink program. One file, no arguments, runs the same way on both ends — each copy is both a publisher and a subscriber, looping forever, sending a counter once a second. Start here. | `./hello_relink` / `python3 hello_relink.py` (run twice) |
+| **`comcore_pubsub`** | Mode A (daemon) discovery, a custom message type (`ImuReading`, several `float`s + a timestamp) alongside a default type (`Float32`), one process as publisher and one as subscriber. | `./comcore_pubsub pub <daemon_ip>` and `... sub <daemon_ip>` in separate terminals, with the daemon already running |
+| **`multicast_pubsub`** | The same pub/sub shape as `comcore_pubsub`, but mode B (no daemon) — shows the two discovery modes are interchangeable from the application's point of view. | `./multicast_pubsub pub` and `... sub` |
+| **`camera_stream`** | A real webcam streamed over ReLink two ways at once — `image_raw` (uncompressed) and `image_compressed` (JPEG) — to show *why* you'd compress: a raw frame needs hundreds of small messages (ReLink doesn't fragment large messages for you, so the example splits/reassembles the image itself, in ordinary application code), while a compressed frame needs 2-3. In real testing, the compressed stream delivered 12/12 frames; the raw stream delivered 1/12 — more messages per frame means more chances to lose one, and a lost chunk loses the whole frame. **Requires OpenCV, which you install yourself** (`pip install opencv-python`, or `sudo apt install libopencv-dev` for C++) — it is not a ReLink dependency. | `./camera_stream pub` and `... sub` |
+
+There's also a performance test harness (`relink_benchmark.cpp` at the
+repo root) used to produce the numbers in the Benchmarks section below —
+worth reading once you're comfortable with the basics, not a starting
+point.
+
+## Benchmarks
 
 Measured over 60s sustained at 1000Hz with a ~40-byte payload
 (`ImuReading`-sized), with CPU pinning + `SCHED_FIFO` applied to the data
@@ -85,20 +148,15 @@ thread:
 | sustained rate | ~5900 Hz | ~1985 Hz |
 | 1ms budget | **PASS** | FAIL |
 
-Baseline (no CPU pinning/`SCHED_FIFO`) worst-case was ~2.9ms — the
-optimizations above are what get it under budget; see
-`relink-com-spec.md`'s Lean-optimization section for the full technique
-list and ordering. These numbers were measured on loopback on a single
-dev machine, not real wired LAN with two physical nodes, which is the
-spec's actual hard-pass condition — directionally strong, not a
-certified LAN result.
+Baseline (no CPU pinning/`SCHED_FIFO`) worst-case was ~2.9ms — pinning
+the data thread to a dedicated core and giving it real-time scheduling
+priority is what gets it under budget. These numbers were measured on
+loopback on a single dev machine, not real wired LAN with two physical
+nodes — directionally strong, not a certified LAN result.
 
 ## Repository layout
 
 ```
-relink-com-spec.md         full wire-format + design spec (source of truth)
-relink_com_implement.md    build-order summary
-
 relink/include/relink/     C++ library (header-only)
   wire.hpp                   byte-exact structs: RelinkHeader, BeaconPacket, default types
   ring_buffer.hpp            fixed-capacity, drop-oldest-on-overflow
@@ -115,10 +173,10 @@ com-core/
 relink_py/relink/          Python library (stdlib-only: ctypes + socket + struct)
   (mirrors the C++ layer-for-layer, see relink_py/README.md)
 
-examples/cpp/               C++ usage examples
-relink_py/examples/         Python usage examples
-tests/, relink_py/tests/    unit tests + two-process correctness tests, both languages
-ros2_compare/                ROS2 Humble comparison benchmark package
+examples/cpp/                C++ usage examples (see "All examples" above)
+relink_py/examples/          Python usage examples (see "All examples" above)
+tests/, relink_py/tests/     unit tests + two-process correctness tests, both languages
+ros2_compare/                 ROS2 Humble comparison benchmark package
 ```
 
 ## Quick start — C++
@@ -136,9 +194,8 @@ node.subscribe<Float32>(101, [](const Float32& msg) { /* ... */ });
 node.spin();
 ```
 
-Build against `relink/include/` (header-only). See `examples/cpp/` and
-the root `relink_example.cpp` / `relink_benchmark.cpp` for full
-publisher/subscriber programs.
+Build against `relink/include/` (header-only). See `examples/cpp/` above
+for full publisher/subscriber programs.
 
 ## Quick start — Python
 
@@ -156,10 +213,10 @@ node.spin()
 ```
 
 No install step — pure stdlib. See `relink_py/README.md` and
-`relink_py/examples/` for full programs, including custom
+`relink_py/examples/` above for full programs, including custom
 `ctypes.Structure` message types.
 
-## Running com-core
+## Running com-core (mode A discovery daemon)
 
 ```
 # C++
@@ -169,7 +226,8 @@ No install step — pure stdlib. See `relink_py/README.md` and
 python3 com-core/relink_com_core.py --port 8445 [--nat]
 ```
 
-Either build works with either language's nodes — that's the point.
+Either build works with either language's nodes. `--nat` enables UDP
+NAT traversal (see Features above) for nodes on separate networks.
 
 ## Testing
 
@@ -190,14 +248,15 @@ sockets, not just in theory.
 
 ## Status
 
-v1 core (steps 1-11 of the build order) complete: wire format, ring
-buffer, UDP transport, both discovery modes, the public API, correctness
-tests, the 1000Hz benchmark (passing with CPU pinning + `SCHED_FIFO`),
-a ROS2 comparison, discovery stress tests (boot storm, power-cycle,
-simulated network drop), a Python binding, and NAT traversal.
+Core is complete and tested: wire format, ring buffer, UDP transport,
+both discovery modes, the public API, correctness tests, the 1000Hz
+benchmark (passing with CPU pinning + `SCHED_FIFO`), a ROS2 comparison,
+discovery stress tests (boot storm, power-cycle, simulated network
+drop), a Python binding, and NAT traversal.
 
-**Explicitly out of scope for v1** (see `relink-com-spec.md`'s deferred
-list): TCP reliable transport, AES-256-GCM encryption (`secure=true`,
-API shape decided but unimplemented), message fragmentation beyond one
-UDP datagram's MTU budget, and automatic multi-language codegen (bindings
-are hand-written per language, deliberately).
+**Explicitly out of scope for now**: TCP reliable transport, AES-256-GCM
+encryption (`secure=true`, API shape decided but unimplemented), message
+fragmentation beyond one UDP datagram's MTU budget (see `camera_stream`
+above for the recommended workaround pattern), and automatic
+multi-language codegen (bindings are hand-written per language,
+deliberately).

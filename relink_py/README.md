@@ -1,10 +1,13 @@
 # ReLink -- Python binding
 
-Independent Python re-implementation of the wire protocol documented in
-`relink-com-spec.md`, stdlib only (`ctypes` + `socket` + `struct`), not a
-wrapper around the C++ library (`relink/`). Proven wire-compatible with
-the C++ node in both directions and over both discovery modes -- see
-`tests/two_process_pub.py` / `tests/two_process_sub.py`.
+Independent Python re-implementation of ReLink's wire protocol, stdlib
+only (`ctypes` + `socket` + `struct`), not a wrapper around the C++
+library (`relink/`). Proven wire-compatible with the C++ node in both
+directions and over both discovery modes -- see `tests/two_process_pub.py`
+/ `tests/two_process_sub.py`.
+
+New here? See the root `README.md`'s **Zero to one** walkthrough --
+`examples/hello_relink.py` is the fastest way to see it work.
 
 ## Abstract -- why this exists
 
@@ -100,11 +103,20 @@ works.
 
 ## Examples
 
-- `examples/comcore_pubsub.py` -- mode A, mirrors `relink_example.cpp`
-- `examples/multicast_pubsub.py` -- mode B
+See the root `README.md`'s **All examples** table for what each one
+shows; the Python versions live here:
 
-Run as two processes: `python3 comcore_pubsub.py pub <com_core_ip>` and
-`python3 comcore_pubsub.py sub <com_core_ip>`.
+- `examples/hello_relink.py` -- start here: one file, no arguments, run
+  it twice and watch two copies find each other and exchange messages
+- `examples/comcore_pubsub.py` -- mode A (daemon), custom + default type
+- `examples/multicast_pubsub.py` -- mode B (no daemon)
+- `examples/camera_stream.py` -- a real webcam streamed as both raw and
+  JPEG-compressed, demonstrating why you'd chunk + compress a large
+  message; requires OpenCV, which you install yourself (`pip install
+  opencv-python`) -- it is not a ReLink dependency
+
+Run the pub/sub examples as two processes: `python3 comcore_pubsub.py
+pub <com_core_ip>` and `python3 comcore_pubsub.py sub <com_core_ip>`.
 
 ## Tests
 

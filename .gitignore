@@ -13,3 +13,6 @@ __pycache__/
 # Compiled binaries / editor cruft
 *.o
 *.out
+
+# Internal design spec -- not part of the public-facing repo
+relink-com-spec.md
