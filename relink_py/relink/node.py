@@ -19,6 +19,7 @@ from .multicast_discovery import (
     DEFAULT_MULTICAST_GROUP, DEFAULT_MULTICAST_PORT,
 )
 from .register import COM_CORE_DEFAULT_PORT
+from .image import ImageChunk, encode_image_chunks, ImageReassembler
 
 
 class DiscoveryMode(enum.Enum):
@@ -81,6 +82,7 @@ class RelinkNode:
         self._declared_topics: Set[int] = set()
         self._peers_lock = threading.Lock()
         self._peers: Dict[int, List[PeerAddr]] = {}
+        self._next_image_frame_id: Dict[int, int] = {}
 
         self._transport = UdpTransport()
         self._mcast: Optional[MulticastDiscovery] = None
@@ -133,6 +135,48 @@ class RelinkNode:
         for peer in peers:
             all_ok = self._transport.publish_raw(topic_id, payload, peer) and all_ok
         return all_ok
+
+    # --- Image: a library-provided large-blob type, automatically
+    # chunked to the MTU maximum on send and reassembled on receive.
+    # See image.py -- built entirely on the same advertise/subscribe/
+    # publish machinery above, one ordinary ImageChunk message per
+    # datagram, not a new wire mechanism. Not JPEG/PNG-specific: carries
+    # whatever bytes you give it. ---
+
+    def advertise_image(self, topic_id: int):
+        """Equivalent to advertise(topic_id, ImageChunk) -- a clearer
+        name for this use case."""
+        self.advertise(topic_id, ImageChunk)
+
+    def publish_image(self, topic_id: int, data: bytes, frame_id: int = None) -> bool:
+        """Splits data into MTU-maximized chunks and publishes each one
+        in order. frame_id lets the receiver match chunks belonging to
+        the same image and is auto-incremented per topic if not given.
+        Raises ImageTooLargeError if data exceeds the max representable
+        image size -- rejected loudly, never silently truncated."""
+        if frame_id is None:
+            with self._peers_lock:
+                frame_id = self._next_image_frame_id.get(topic_id, 0)
+                self._next_image_frame_id[topic_id] = (frame_id + 1) & 0xFFFFFFFF
+
+        all_ok = True
+
+        def send_chunk(chunk: ImageChunk):
+            nonlocal all_ok
+            all_ok = self.publish(topic_id, chunk) and all_ok
+
+        encode_image_chunks(frame_id, data, send_chunk)
+        return all_ok
+
+    def subscribe_image(self, topic_id: int, callback: Callable[[int, bytes], None]):
+        """Subscribes to a topic of Image chunks; callback(frame_id,
+        data) fires once per COMPLETE image (not once per chunk). An
+        image whose chunks arrive incompletely before the next one
+        starts is silently dropped -- no retransmission, matching
+        ReLink's UDP design throughout (see image.py's ImageReassembler
+        and examples/camera_stream.py's measured reliability numbers)."""
+        reassembler = ImageReassembler(callback)
+        self.subscribe(topic_id, ImageChunk, reassembler.on_chunk)
 
     def spin_once(self):
         self._ensure_started()

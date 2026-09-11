@@ -86,6 +86,11 @@ instead of multicast) that works around that.
   rendezvous point, handing out each node's real (NAT-mapped) endpoint
   instead of its private LAN address, paired with client-side hole
   punching — lets nodes across separate networks/NATs find each other.
+- **Built-in `Image` type** (`advertise_image` / `publish_image` /
+  `subscribe_image`) for messages bigger than one UDP datagram —
+  automatically chunks to the MTU maximum on send and reassembles on
+  receive, no hand-rolled chunking needed (see `camera_stream` in All
+  examples below).
 - **Dedicated data thread**, zero heap allocation and zero locking in the
   benchmarked hot path, with opt-in CPU pinning and `SCHED_FIFO` for
   real-time tail-latency control.
@@ -127,7 +132,7 @@ Each one exists in both C++ (`examples/cpp/`) and Python
 | **`hello_relink`** | The simplest possible ReLink program. One file, no arguments, runs the same way on both ends — each copy is both a publisher and a subscriber, looping forever, sending a counter once a second. Start here. | `./hello_relink` / `python3 hello_relink.py` (run twice) |
 | **`comcore_pubsub`** | Mode A (daemon) discovery, a custom message type (`ImuReading`, several `float`s + a timestamp) alongside a default type (`Float32`), one process as publisher and one as subscriber. | `./comcore_pubsub pub <daemon_ip>` and `... sub <daemon_ip>` in separate terminals, with the daemon already running |
 | **`multicast_pubsub`** | The same pub/sub shape as `comcore_pubsub`, but mode B (no daemon) — shows the two discovery modes are interchangeable from the application's point of view. | `./multicast_pubsub pub` and `... sub` |
-| **`camera_stream`** | A real webcam streamed over ReLink two ways at once — `image_raw` (uncompressed) and `image_compressed` (JPEG) — to show *why* you'd compress: a raw frame needs hundreds of small messages (ReLink doesn't fragment large messages for you, so the example splits/reassembles the image itself, in ordinary application code), while a compressed frame needs 2-3. In real testing, the compressed stream delivered 12/12 frames; the raw stream delivered 1/12 — more messages per frame means more chances to lose one, and a lost chunk loses the whole frame. **Requires OpenCV, which you install yourself** (`pip install opencv-python`, or `sudo apt install libopencv-dev` for C++) — it is not a ReLink dependency. | `./camera_stream pub` and `... sub` |
+| **`camera_stream`** | A real webcam streamed over ReLink two ways at once, using the built-in `Image` type (`advertise_image`/`publish_image`/`subscribe_image` — see Features below) — `image_raw` (uncompressed, hundreds of MTU-sized chunks per frame) and `image_compressed` (JPEG, 2-3 chunks per frame). In real testing, C++ delivered raw frames ~96-98% reliably and compressed ~100%; Python delivered compressed ~100% but raw effectively 0% — Python's per-chunk interpreter overhead can't keep up with a several-hundred-chunk burst the way C++ can, so **always compress before sending from Python**. **Requires OpenCV, which you install yourself** (`pip install opencv-python`, or `sudo apt install libopencv-dev` for C++) — it is not a ReLink dependency. | `./camera_stream pub` and `... sub` |
 
 There's also a performance test harness (`relink_benchmark.cpp` at the
 repo root) used to produce the numbers in the Benchmarks section below —

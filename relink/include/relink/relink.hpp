@@ -9,6 +9,7 @@
 #include "relink/udp_transport.hpp"
 #include "relink/com_core_client.hpp"
 #include "relink/multicast_discovery.hpp"
+#include "relink/image.hpp"
 #include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
@@ -111,6 +112,58 @@ public:
             all_ok = transport_.publish_raw(topic_id, &value, sizeof(T), peer) && all_ok;
         }
         return all_ok;
+    }
+
+    // --- Image: a library-provided large-blob type, automatically
+    // chunked to the MTU maximum on send and reassembled on receive.
+    // See image.hpp -- built entirely on the same publish<T>/subscribe<T>
+    // machinery above, one ordinary ImageChunk message per datagram, not
+    // a new wire mechanism. Not JPEG/PNG-specific: carries whatever
+    // bytes you give it. ---
+
+    // advertise_image is just advertise<ImageChunk> under a clearer name
+    // for this use case -- both are equivalent to call.
+    void advertise_image(uint16_t topic_id) { advertise<ImageChunk>(topic_id); }
+
+    // Splits data/len into MTU-maximized chunks and publishes each one
+    // in order. frame_id lets the receiver match chunks belonging to the
+    // same image and is auto-incremented per topic if not supplied.
+    // Returns false if `len` exceeds kMaxImageBytes (chunk_count would
+    // overflow uint16_t) -- rejected loudly, per ReLink's "never
+    // silently truncate" rule, same as publish<T> rejecting an oversized
+    // fixed message.
+    bool publish_image(uint16_t topic_id, const uint8_t* data, size_t len,
+                        uint32_t frame_id = kAutoFrameId) {
+        if (frame_id == kAutoFrameId) {
+            std::lock_guard<std::mutex> lock(state_mutex_);
+            frame_id = next_image_frame_id_[topic_id]++;
+        }
+        bool all_ok = true;
+        auto result = encode_image_chunks(frame_id, data, len, [&](const ImageChunk& chunk) {
+            all_ok = publish<ImageChunk>(topic_id, chunk) && all_ok;
+        });
+        return result == ImageEncodeResult::Ok && all_ok;
+    }
+
+    // Subscribes to a topic of Image chunks; `callback` fires once per
+    // COMPLETE image (not once per chunk) with the reassembled bytes. An
+    // image whose chunks arrive incompletely before the next one starts
+    // is silently dropped -- no retransmission, matching ReLink's UDP
+    // design throughout (see image.hpp's ImageReassembler and
+    // examples/cpp/camera_stream.cpp's measured reliability numbers).
+    template <typename Callback>
+    void subscribe_image(uint16_t topic_id, Callback callback) {
+        auto reassembler = std::make_shared<ImageReassembler>(
+            [callback](uint32_t frame_id, const std::vector<uint8_t>& image) {
+                callback(frame_id, image);
+            });
+        {
+            std::lock_guard<std::mutex> lock(state_mutex_);
+            image_reassemblers_.push_back(reassembler); // keep alive for node lifetime
+        }
+        subscribe<ImageChunk>(topic_id, [reassembler](const ImageChunk& chunk) {
+            reassembler->on_chunk(chunk);
+        });
     }
 
     // Runs discovery/data setup if not already done, then returns
@@ -303,10 +356,14 @@ private:
         return local_ip;
     }
 
+    static constexpr uint32_t kAutoFrameId = 0xFFFFFFFF;
+
     std::mutex state_mutex_;
     DiscoveryMode mode_ = DiscoveryMode::None;
     std::unordered_set<uint16_t> declared_topics_;
     std::unordered_map<uint16_t, std::vector<PeerAddr>> peers_;
+    std::unordered_map<uint16_t, uint32_t> next_image_frame_id_;
+    std::vector<std::shared_ptr<ImageReassembler>> image_reassemblers_;
 
     std::mutex start_mutex_;
     bool started_ = false;
