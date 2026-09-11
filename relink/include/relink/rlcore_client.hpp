@@ -1,16 +1,16 @@
-// Step 4: com-core client-side registration with retry-with-backoff, per
+// Step 4: rlcore client-side registration with retry-with-backoff, per
 // relink-com-spec.md: "Retry with backoff if no ACK arrives (e.g. 3
 // retries, exponential backoff, then give up and log an error)".
 //
-// NAT traversal note: register_with_com_core_on_socket() sends the
+// NAT traversal note: register_with_rlcore_on_socket() sends the
 // RegisterRequest on the SAME socket the caller will use for data
-// traffic. This matters once com-core is run with --nat: it observes
+// traffic. This matters once rlcore is run with --nat: it observes
 // the request's UDP source port to learn each node's real internet-
 // facing (NAT-mapped) endpoint. That observed port is only meaningful
 // if it's the same socket/port the node's data transport is bound to --
 // registering from a throwaway socket (the old behavior, kept below for
 // standalone/CLI use where NAT traversal isn't needed) would teach
-// com-core the wrong port to hand out to peers.
+// rlcore the wrong port to hand out to peers.
 
 #pragma once
 
@@ -34,18 +34,18 @@ struct RegisterOutcome {
     std::vector<RegisterAckPeer> peers;
 };
 
-// Sends a RegisterRequest to com-core at (server_ip_host_order,
+// Sends a RegisterRequest to rlcore at (server_ip_host_order,
 // server_port) using the given already-bound socket `sock`, retrying
 // with exponential backoff if no ACK arrives within `timeout_ms`.
 // Temporarily adjusts SO_RCVTIMEO on `sock` for the duration of each
 // attempt (restored to whatever the caller had before, since the caller
 // -- typically UdpTransport, still pre-start() at this point -- owns the
 // socket's lifetime and its own timeout policy afterward).
-inline RegisterOutcome register_with_com_core_on_socket(
+inline RegisterOutcome register_with_rlcore_on_socket(
     int sock,
     uint32_t server_ip_host_order, uint16_t server_port,
     uint32_t self_ip_host_order, uint16_t self_data_port,
-    const uint16_t* topic_ids, uint16_t topic_count,
+    const uint32_t* topic_ids, uint16_t topic_count,
     int max_retries = 3, int timeout_ms = 500) {
     RegisterOutcome outcome;
 
@@ -97,12 +97,12 @@ inline RegisterOutcome register_with_com_core_on_socket(
         }
 
         // timeout or bad response: exponential backoff before next try
-        std::fprintf(stderr, "register_with_com_core: attempt %d/%d timed out, retrying...\n",
+        std::fprintf(stderr, "register_with_rlcore: attempt %d/%d timed out, retrying...\n",
                      attempt + 1, max_retries);
         backoff_ms *= 2;
     }
 
-    std::fprintf(stderr, "register_with_com_core: giving up after %d attempts\n", max_retries);
+    std::fprintf(stderr, "register_with_rlcore: giving up after %d attempts\n", max_retries);
     return outcome; // ok=false
 }
 
@@ -110,14 +110,14 @@ inline RegisterOutcome register_with_com_core_on_socket(
 // standalone/test use (see tests/register_client_cli.cpp) where NAT
 // traversal isn't in play, but RelinkNode uses the socket-reusing
 // variant above so the observed registration port matches the data port.
-inline RegisterOutcome register_with_com_core(
+inline RegisterOutcome register_with_rlcore(
     uint32_t server_ip_host_order, uint16_t server_port,
     uint32_t self_ip_host_order, uint16_t self_data_port,
-    const uint16_t* topic_ids, uint16_t topic_count,
+    const uint32_t* topic_ids, uint16_t topic_count,
     int max_retries = 3, int timeout_ms = 500) {
     int sock = ::socket(AF_INET, SOCK_DGRAM, 0);
-    if (sock < 0) throw std::runtime_error("register_with_com_core: socket() failed");
-    RegisterOutcome outcome = register_with_com_core_on_socket(
+    if (sock < 0) throw std::runtime_error("register_with_rlcore: socket() failed");
+    RegisterOutcome outcome = register_with_rlcore_on_socket(
         sock, server_ip_host_order, server_port, self_ip_host_order, self_data_port,
         topic_ids, topic_count, max_retries, timeout_ms);
     ::close(sock);

@@ -1,5 +1,5 @@
 // Step 7: two-process correctness test -- subscriber side.
-// usage: two_process_sub <comcore|multicast> [comcore_ip] <topic_id> <expected_count> <timeout_sec>
+// usage: two_process_sub <rlcore|multicast> [rlcore_ip] <topic_id> <expected_count> <timeout_sec>
 //
 // Subscribes on `topic_id` with zero manually-configured peer address,
 // waits up to timeout_sec for `expected_count` distinct Int32 values
@@ -17,16 +17,16 @@
 
 int main(int argc, char** argv) {
     if (argc < 5) {
-        std::fprintf(stderr, "usage: %s <comcore|multicast> [comcore_ip] <topic_id> <expected_count> <timeout_sec>\n", argv[0]);
+        std::fprintf(stderr, "usage: %s <rlcore|multicast> [rlcore_ip] <topic_id> <expected_count> <timeout_sec>\n", argv[0]);
         return 2;
     }
 
     RelinkNode node;
     int argi = 1;
     std::string mode = argv[argi++];
-    if (mode == "comcore") {
+    if (mode == "rlcore") {
         std::string ip = argv[argi++];
-        node.set_com_core.ip(ip);
+        node.set_rlcore.ip(ip);
     } else if (mode == "multicast") {
         node.use_multicast_discovery();
     } else {

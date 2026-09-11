@@ -1,6 +1,6 @@
 // ReLink-com usage example -- publisher + subscriber, mode B (multicast,
 // no daemon). Same shape as relink_example.cpp (at the repo root, mode A)
-// but with node.use_multicast_discovery() instead of set_com_core, to
+// but with node.use_multicast_discovery() instead of set_rlcore, to
 // show both discovery modes have the same downstream API.
 //
 // Two processes: run with argv[1] == "pub" or "sub".

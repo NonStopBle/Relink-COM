@@ -1,5 +1,5 @@
 // Step 6: the public ReLink API -- RelinkNode, wiring together the ring
-// buffer (step 2), UDP data thread (step 3), com-core client (step 4),
+// buffer (step 2), UDP data thread (step 3), rlcore client (step 4),
 // and multicast discovery (step 5) behind the templated
 // advertise/subscribe/publish<T> surface shown in relink_example.cpp.
 
@@ -7,9 +7,10 @@
 
 #include "relink/wire.hpp"
 #include "relink/udp_transport.hpp"
-#include "relink/com_core_client.hpp"
+#include "relink/rlcore_client.hpp"
 #include "relink/multicast_discovery.hpp"
 #include "relink/image.hpp"
+#include "relink/topic_hash.hpp"
 #include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
@@ -26,50 +27,123 @@
 
 namespace relink {
 
-enum class DiscoveryMode { None, ComCore, Multicast };
+enum class DiscoveryMode { None, RlCore, Multicast };
 
 class RelinkNode {
 public:
     // --- mode A config sub-object, per spec: separate ip()/port()
     // setters, port has a default, mode selection happens at the ip()
     // call itself (the setter call, not deferred to spin()/start()). ---
-    class ComCoreConfig {
+    class RlCoreConfig {
     public:
-        explicit ComCoreConfig(RelinkNode& owner) : owner_(owner) {}
+        explicit RlCoreConfig(RelinkNode& owner) : owner_(owner) {}
 
         void ip(const std::string& addr) {
-            owner_.select_mode(DiscoveryMode::ComCore);
-            com_core_ip_ = ipv4_to_host_order(addr);
+            owner_.select_mode(DiscoveryMode::RlCore);
+            rlcore_ip_ = ipv4_to_host_order(addr);
             ip_set_ = true;
         }
 
-        void port(uint16_t p = kComCoreDefaultPort) {
-            com_core_port_ = p;
+        void port(uint16_t p = kRlCoreDefaultPort) {
+            rlcore_port_ = p;
         }
 
         bool ip_is_set() const { return ip_set_; }
-        uint32_t resolved_ip() const { return com_core_ip_; }
-        uint16_t resolved_port() const { return com_core_port_; }
+        uint32_t resolved_ip() const { return rlcore_ip_; }
+        uint16_t resolved_port() const { return rlcore_port_; }
 
     private:
         RelinkNode& owner_;
         bool ip_set_ = false;
-        uint32_t com_core_ip_ = 0;
-        uint16_t com_core_port_ = kComCoreDefaultPort;
+        uint32_t rlcore_ip_ = 0;
+        uint16_t rlcore_port_ = kRlCoreDefaultPort;
     };
 
-    RelinkNode() : set_com_core(*this) {}
+    RelinkNode() : set_rlcore(*this) {}
 
-    ComCoreConfig set_com_core;
+    RlCoreConfig set_rlcore;
 
     // --- mode B, mutually exclusive with mode A (per spec) ---
     void use_multicast_discovery() {
         select_mode(DiscoveryMode::Multicast);
     }
 
+    // --- named topics: hash a human-readable topic name down to the
+    // uint32_t that actually goes on the wire. One-way (FNV-1a) -- there
+    // is no length limit on `name` since it is never itself transmitted,
+    // but see topic_hash.hpp for why this can't be losslessly inverted.
+    // "Decoding" an id back to a name only works locally, via the
+    // registry this call populates (topic_name_for()), and only for
+    // names this process itself has advertised/subscribed/published.
+    //
+    // Throws on a genuine hash collision (two different names landing on
+    // the same 32-bit id) or if the name hashes to the reserved NAT-punch
+    // id -- both are astronomically unlikely for realistic topic counts,
+    // but must never be silently ignored per ReLink's "never
+    // misinterpret bytes" rule.
+    uint32_t topic_id_for(const std::string& name) {
+        uint32_t id = fnv1a32(name);
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        if (id == kNatPunchTopicId) {
+            throw std::runtime_error("ReLink: topic name \"" + name +
+                "\" hashes to the reserved NAT-punch topic id -- pick a different name");
+        }
+        auto it = topic_names_.find(id);
+        if (it != topic_names_.end()) {
+            if (it->second != name) {
+                throw std::runtime_error("ReLink: topic hash collision between \"" +
+                    it->second + "\" and \"" + name + "\" (both hash to " + std::to_string(id) + ")");
+            }
+        } else {
+            topic_names_.emplace(id, name);
+        }
+        return id;
+    }
+
+    // Reverse lookup into this process's own registry (built only from
+    // names it has itself resolved via topic_id_for/the string
+    // overloads below) -- empty string if this id was never named here.
+    std::string topic_name_for(uint32_t topic_id) {
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        auto it = topic_names_.find(topic_id);
+        return it != topic_names_.end() ? it->second : std::string();
+    }
+
+    // One entry describing a topic this node has declared (via
+    // advertise/subscribe, including the *_image variants), for
+    // rltopic_list() below.
+    struct RlTopicInfo {
+        uint32_t topic_id;
+        std::string name; // empty if this topic was declared by numeric
+                            // id directly (topic_id_for() was never
+                            // called for it, so no name is known locally)
+    };
+
+    // Lists every topic this node has advertised or subscribed to so
+    // far, with its human name when known (from the string-based
+    // advertise/subscribe/publish overloads) -- a debugging/introspection
+    // aid, not part of the wire protocol. Does NOT list topics only
+    // known as a remote peer's publish target (see peers_for_topic()
+    // for that); this is specifically "what has THIS node declared."
+    std::vector<RlTopicInfo> rltopic_list() {
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        std::vector<RlTopicInfo> out;
+        out.reserve(declared_topics_.size());
+        for (uint32_t id : declared_topics_) {
+            auto it = topic_names_.find(id);
+            out.push_back(RlTopicInfo{id, it != topic_names_.end() ? it->second : std::string()});
+        }
+        return out;
+    }
+
     // --- advertise: publisher-side topic declaration ---
     template <typename T>
-    void advertise(uint16_t topic_id, bool /*secure*/ = false, bool /*checksum*/ = false) {
+    void advertise(const std::string& name, bool secure = false, bool checksum = false) {
+        advertise<T>(topic_id_for(name), secure, checksum);
+    }
+
+    template <typename T>
+    void advertise(uint32_t topic_id, bool /*secure*/ = false, bool /*checksum*/ = false) {
         static_assert(std::is_trivially_copyable<T>::value,
                       "advertise<T>: T must be trivially copyable");
         if constexpr (std::is_same<T, ImageChunk>::value) {
@@ -82,7 +156,12 @@ public:
     // --- subscribe: receiver-side topic declaration + typed callback,
     // invoked inline on the data thread per spec's v1 threading design ---
     template <typename T, typename Callback>
-    void subscribe(uint16_t topic_id, Callback callback, bool /*secure*/ = false) {
+    void subscribe(const std::string& name, Callback callback, bool secure = false) {
+        subscribe<T>(topic_id_for(name), std::move(callback), secure);
+    }
+
+    template <typename T, typename Callback>
+    void subscribe(uint32_t topic_id, Callback callback, bool /*secure*/ = false) {
         static_assert(std::is_trivially_copyable<T>::value,
                       "subscribe<T>: T must be trivially copyable");
         if constexpr (std::is_same<T, ImageChunk>::value) {
@@ -102,7 +181,12 @@ public:
 
     // --- publish: sends to every currently-known peer for this topic ---
     template <typename T>
-    bool publish(uint16_t topic_id, const T& value) {
+    bool publish(const std::string& name, const T& value) {
+        return publish<T>(topic_id_for(name), value);
+    }
+
+    template <typename T>
+    bool publish(uint32_t topic_id, const T& value) {
         static_assert(std::is_trivially_copyable<T>::value,
                       "publish<T>: T must be trivially copyable");
         ensure_started();
@@ -129,7 +213,8 @@ public:
 
     // advertise_image is just advertise<ImageChunk> under a clearer name
     // for this use case -- both are equivalent to call.
-    void advertise_image(uint16_t topic_id) { advertise<ImageChunk>(topic_id); }
+    void advertise_image(const std::string& name) { advertise_image(topic_id_for(name)); }
+    void advertise_image(uint32_t topic_id) { advertise<ImageChunk>(topic_id); }
 
     // Splits data/len into MTU-maximized chunks and publishes each one
     // in order. frame_id lets the receiver match chunks belonging to the
@@ -146,7 +231,12 @@ public:
     // straight to the kernel via UdpTransport::publish_scattered()'s
     // sendmsg() scatter-gather, so a several-hundred-chunk burst costs
     // one userspace copy fewer per chunk than going through publish<T>.
-    bool publish_image(uint16_t topic_id, const uint8_t* data, size_t len,
+    bool publish_image(const std::string& name, const uint8_t* data, size_t len,
+                        uint32_t frame_id = kAutoFrameId) {
+        return publish_image(topic_id_for(name), data, len, frame_id);
+    }
+
+    bool publish_image(uint32_t topic_id, const uint8_t* data, size_t len,
                         uint32_t frame_id = kAutoFrameId) {
         if (len > kMaxImageBytes) return false;
         if (frame_id == kAutoFrameId) {
@@ -209,7 +299,12 @@ public:
     // work is slow, hand it off to your own worker thread/queue instead
     // of doing it here.
     template <typename Callback>
-    void subscribe_image(uint16_t topic_id, Callback callback) {
+    void subscribe_image(const std::string& name, Callback callback) {
+        subscribe_image(topic_id_for(name), std::move(callback));
+    }
+
+    template <typename Callback>
+    void subscribe_image(uint32_t topic_id, Callback callback) {
         transport_.enable_large_buffers();
         auto reassembler = std::make_shared<ImageReassembler>(
             [callback](uint32_t frame_id, const std::vector<uint8_t>& image) {
@@ -281,14 +376,14 @@ public:
     }
 
     // Snapshot of currently-known peers for a topic (test/debug use).
-    std::vector<PeerAddr> peers_for_topic(uint16_t topic_id) {
+    std::vector<PeerAddr> peers_for_topic(uint32_t topic_id) {
         std::lock_guard<std::mutex> lock(state_mutex_);
         auto it = peers_.find(topic_id);
         return it != peers_.end() ? it->second : std::vector<PeerAddr>{};
     }
 
 private:
-    friend class ComCoreConfig;
+    friend class RlCoreConfig;
 
     void select_mode(DiscoveryMode requested) {
         std::lock_guard<std::mutex> lock(state_mutex_);
@@ -311,16 +406,16 @@ private:
         }
         if (mode == DiscoveryMode::None) {
             throw std::runtime_error(
-                "no discovery method configured -- call set_com_core.ip(...) or "
+                "no discovery method configured -- call set_rlcore.ip(...) or "
                 "use_multicast_discovery() before spin()/publish()/subscribe traffic");
         }
-        if (mode == DiscoveryMode::ComCore && !set_com_core.ip_is_set()) {
-            throw std::runtime_error("com-core IP not set -- call set_com_core.ip(...)");
+        if (mode == DiscoveryMode::RlCore && !set_rlcore.ip_is_set()) {
+            throw std::runtime_error("rlcore IP not set -- call set_rlcore.ip(...)");
         }
 
         transport_.bind(0);
 
-        std::vector<uint16_t> topics;
+        std::vector<uint32_t> topics;
         {
             std::lock_guard<std::mutex> lock2(state_mutex_);
             topics.assign(declared_topics_.begin(), declared_topics_.end());
@@ -328,23 +423,23 @@ private:
 
         std::vector<PeerAddr> newly_learned_peers; // for the NAT punch burst below
 
-        if (mode == DiscoveryMode::ComCore) {
+        if (mode == DiscoveryMode::RlCore) {
             // Registration MUST happen on transport_'s own socket, before
             // transport_.start() hands that socket's recv loop to the
             // dedicated data thread (two threads calling recvfrom() on
             // the same fd concurrently would race the ack reply against
             // the data thread's recv_and_dispatch). This also has a
-            // second purpose beyond avoiding that race: when com-core is
+            // second purpose beyond avoiding that race: when rlcore is
             // run with --nat, it learns each node's real (NAT-mapped)
             // public endpoint from the register request's UDP source
             // port -- that's only useful/correct if it's the SAME port
             // the node's data traffic actually arrives on, i.e. this
             // socket, not a throwaway one.
-            uint32_t self_ip = detect_local_ip_for_peer(set_com_core.resolved_ip(),
-                                                         set_com_core.resolved_port());
-            auto outcome = register_with_com_core_on_socket(
+            uint32_t self_ip = detect_local_ip_for_peer(set_rlcore.resolved_ip(),
+                                                         set_rlcore.resolved_port());
+            auto outcome = register_with_rlcore_on_socket(
                 transport_.native_handle(),
-                set_com_core.resolved_ip(), set_com_core.resolved_port(),
+                set_rlcore.resolved_ip(), set_rlcore.resolved_port(),
                 self_ip, transport_.local_port(),
                 topics.data(), static_cast<uint16_t>(topics.size()));
             if (outcome.ok) {
@@ -355,7 +450,7 @@ private:
                     newly_learned_peers.push_back(addr);
                 }
             }
-            // If registration failed after retries, register_with_com_core
+            // If registration failed after retries, register_with_rlcore
             // already logged an error; proceed with an empty peer table
             // rather than crashing the node (spec: never hang forever).
         } else {
@@ -367,7 +462,7 @@ private:
             cfg.self_data_port = transport_.local_port();
             cfg.local_topics = topics;
             mcast_ = std::make_unique<MulticastDiscovery>(cfg);
-            mcast_->set_peer_discovered_callback([this](uint16_t topic, const PeerInfo& p) {
+            mcast_->set_peer_discovered_callback([this](uint32_t topic, const PeerInfo& p) {
                 std::lock_guard<std::mutex> lock2(state_mutex_);
                 peers_[topic].push_back(PeerAddr{p.ip, p.port});
             });
@@ -390,7 +485,7 @@ private:
 
         // NAT hole punching: fire a small burst of empty datagrams at
         // every peer learned from this registration. This only matters
-        // (and is only correct) when com-core is run with --nat, which
+        // (and is only correct) when rlcore is run with --nat, which
         // makes it hand out each peer's real internet-facing endpoint
         // instead of their self-reported LAN address -- sending a
         // datagram FROM this node TO that endpoint opens this node's own
@@ -435,9 +530,10 @@ private:
 
     std::mutex state_mutex_;
     DiscoveryMode mode_ = DiscoveryMode::None;
-    std::unordered_set<uint16_t> declared_topics_;
-    std::unordered_map<uint16_t, std::vector<PeerAddr>> peers_;
-    std::unordered_map<uint16_t, uint32_t> next_image_frame_id_;
+    std::unordered_set<uint32_t> declared_topics_;
+    std::unordered_map<uint32_t, std::vector<PeerAddr>> peers_;
+    std::unordered_map<uint32_t, uint32_t> next_image_frame_id_;
+    std::unordered_map<uint32_t, std::string> topic_names_;
     std::vector<std::shared_ptr<ImageReassembler>> image_reassemblers_;
 
     std::mutex start_mutex_;

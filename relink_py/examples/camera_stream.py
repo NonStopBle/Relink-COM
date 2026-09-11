@@ -128,12 +128,12 @@ def run_subscriber(node: RelinkNode):
 
 def main():
     if len(sys.argv) < 2:
-        print(f"usage: {sys.argv[0]} [pub|sub] [com_core_ip]", file=sys.stderr)
+        print(f"usage: {sys.argv[0]} [pub|sub] [rlcore_ip]", file=sys.stderr)
         return 1
 
     node = RelinkNode()
     if len(sys.argv) > 2:
-        node.set_com_core.ip(sys.argv[2])
+        node.set_rlcore.ip(sys.argv[2])
     else:
         node.use_multicast_discovery()
 

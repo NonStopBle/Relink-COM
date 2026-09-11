@@ -1,10 +1,10 @@
-// Small CLI used for cross-language interop testing of com-core: sends a
-// RegisterRequest to a given com-core address/port with a given fake
+// Small CLI used for cross-language interop testing of rlcore: sends a
+// RegisterRequest to a given rlcore address/port with a given fake
 // self ip:port and topic list, prints the resulting peers (or failure).
 //
 // usage: register_client_cli <server_ip> <server_port> <self_ip> <self_port> <topic_id> [more topic_ids...]
 
-#include "relink/com_core_client.hpp"
+#include "relink/rlcore_client.hpp"
 #include "relink/udp_transport.hpp" // for ipv4_to_host_order
 #include <cstdio>
 #include <cstdlib>
@@ -22,10 +22,10 @@ int main(int argc, char** argv) {
     uint32_t self_ip = ipv4_to_host_order(argv[3]);
     uint16_t self_port = static_cast<uint16_t>(std::atoi(argv[4]));
 
-    std::vector<uint16_t> topics;
-    for (int i = 5; i < argc; ++i) topics.push_back(static_cast<uint16_t>(std::atoi(argv[i])));
+    std::vector<uint32_t> topics;
+    for (int i = 5; i < argc; ++i) topics.push_back(static_cast<uint32_t>(std::atoi(argv[i])));
 
-    auto outcome = register_with_com_core(server_ip, server_port, self_ip, self_port,
+    auto outcome = register_with_rlcore(server_ip, server_port, self_ip, self_port,
                                            topics.data(), static_cast<uint16_t>(topics.size()));
     if (!outcome.ok) {
         std::printf("REGISTER_FAILED\n");

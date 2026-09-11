@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""relink-com-core (Python build) -- small standalone registration daemon,
-per relink-com-spec.md "Mode A: relink-com-core" section.
+"""relink-rlcore (Python build) -- small standalone registration daemon,
+per relink-com-spec.md "Mode A: relink-rlcore" section.
 
 Must produce byte-identical RegisterRequest/RegisterAck wire packets to
-the C++ build (com-core/relink_com_core.cpp) -- same struct layout,
+the C++ build (rlcore/relink_rlcore.cpp) -- same struct layout,
 little-endian, no framework beyond the standard library (socket + struct),
 per the spec's "no heavy serialization" rule applied to every language.
 
@@ -14,7 +14,7 @@ Wire layout (matches relink/include/relink/register.hpp exactly):
                             + peer_count * RegisterAckPeer("<IHH" ip,port,topic_id)
 
 --nat: NAT traversal / UDP hole punching support, mirrors
-com-core/relink_com_core.cpp's --nat flag exactly (byte-identical
+rlcore/relink_rlcore.cpp's --nat flag exactly (byte-identical
 behavior, same rationale). When set, the OBSERVED UDP source address of
 each registration (the real, NAT-mapped endpoint) is used instead of the
 self-reported node_ip/node_port in the payload, which is typically a
@@ -64,7 +64,7 @@ def main():
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.bind(("0.0.0.0", port))
     suffix = " (NAT traversal enabled)" if nat_mode else ""
-    print(f"relink-com-core (Python) listening on 0.0.0.0:{port}{suffix}", flush=True)
+    print(f"relink-rlcore (Python) listening on 0.0.0.0:{port}{suffix}", flush=True)
 
     table = {}  # topic_id -> set of (ip, port)
 
@@ -72,7 +72,7 @@ def main():
         data, addr = sock.recvfrom(2048)
         decoded = decode_register_request(data)
         if decoded is None:
-            print("relink-com-core: dropped malformed RegisterRequest", file=sys.stderr, flush=True)
+            print("relink-rlcore: dropped malformed RegisterRequest", file=sys.stderr, flush=True)
             continue
         node_ip, node_port, topics = decoded
 
@@ -110,7 +110,7 @@ def main():
         # own endianness.
         ip_str = socket.inet_ntoa(struct.pack(">I", self_entry[0]))
         observed_suffix = " [observed]" if nat_mode else ""
-        print(f"relink-com-core: registered {ip_str}:{self_entry[1]} "
+        print(f"relink-rlcore: registered {ip_str}:{self_entry[1]} "
               f"({len(topics)} topics){observed_suffix}, replied with {len(peers)} peers", flush=True)
 
 

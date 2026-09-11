@@ -1,7 +1,7 @@
 // Real cross-machine NAT hole-punching test. Unlike RelinkNode's normal
 // one-shot registration, this test registers TWICE (with a pause in
 // between) so BOTH sides have a chance to learn about each other via
-// com-core's one-shot ack (com-core doesn't push updates to earlier
+// rlcore's one-shot ack (rlcore doesn't push updates to earlier
 // registrants) -- this mirrors what a periodic re-registration policy
 // would give you in production, deliberately done manually here to keep
 // RelinkNode itself unchanged.
@@ -13,10 +13,10 @@
 // the other side's real data too -- so a successful round trip is a
 // genuine proof, not just a registration-level check.
 //
-// usage: nat_punch_test <a|b> <com_core_public_ip> [com_core_port]
+// usage: nat_punch_test <a|b> <rlcore_public_ip> [rlcore_port]
 
 #include "relink/register.hpp"
-#include "relink/com_core_client.hpp"
+#include "relink/rlcore_client.hpp"
 #include "relink/udp_transport.hpp"
 #include <cstdio>
 #include <cstdlib>
@@ -31,12 +31,12 @@ enum : uint16_t { TOPIC_PUNCH_TEST = 999 };
 
 int main(int argc, char** argv) {
     if (argc < 3) {
-        std::fprintf(stderr, "usage: %s <a|b> <com_core_public_ip> [com_core_port]\n", argv[0]);
+        std::fprintf(stderr, "usage: %s <a|b> <rlcore_public_ip> [rlcore_port]\n", argv[0]);
         return 2;
     }
     std::string role = argv[1];
-    uint32_t com_core_ip = ipv4_to_host_order(argv[2]);
-    uint16_t com_core_port = (argc > 3) ? static_cast<uint16_t>(std::atoi(argv[3])) : kComCoreDefaultPort;
+    uint32_t rlcore_ip = ipv4_to_host_order(argv[2]);
+    uint16_t rlcore_port = (argc > 3) ? static_cast<uint16_t>(std::atoi(argv[3])) : kRlCoreDefaultPort;
 
     UdpTransport transport;
     transport.bind(0);
@@ -50,14 +50,14 @@ int main(int argc, char** argv) {
     transport.start();
 
     // NOTE: self_ip here is only used as the SELF-REPORTED fallback --
-    // when com-core is run with --nat, it ignores this and uses the
+    // when rlcore is run with --nat, it ignores this and uses the
     // observed UDP source address instead, which is the whole point.
-    uint16_t topics[1] = {TOPIC_PUNCH_TEST};
+    uint32_t topics[1] = {TOPIC_PUNCH_TEST};
 
-    std::printf("[%s] registering (attempt 1/2) with com-core at %s:%u...\n",
-                role.c_str(), argv[2], com_core_port);
-    auto outcome1 = register_with_com_core_on_socket(
-        transport.native_handle(), com_core_ip, com_core_port,
+    std::printf("[%s] registering (attempt 1/2) with rlcore at %s:%u...\n",
+                role.c_str(), argv[2], rlcore_port);
+    auto outcome1 = register_with_rlcore_on_socket(
+        transport.native_handle(), rlcore_ip, rlcore_port,
         0 /* self_ip unused server-side in --nat mode */, transport.local_port(),
         topics, 1);
     std::printf("[%s] attempt 1: ok=%d peers=%zu\n", role.c_str(), outcome1.ok, outcome1.peers.size());
@@ -66,8 +66,8 @@ int main(int argc, char** argv) {
     std::this_thread::sleep_for(std::chrono::seconds(3));
 
     std::printf("[%s] registering (attempt 2/2)...\n", role.c_str());
-    auto outcome2 = register_with_com_core_on_socket(
-        transport.native_handle(), com_core_ip, com_core_port,
+    auto outcome2 = register_with_rlcore_on_socket(
+        transport.native_handle(), rlcore_ip, rlcore_port,
         0, transport.local_port(), topics, 1);
     std::printf("[%s] attempt 2: ok=%d peers=%zu\n", role.c_str(), outcome2.ok, outcome2.peers.size());
 
@@ -76,7 +76,7 @@ int main(int argc, char** argv) {
     for (const auto& p : outcome2.peers) peers.push_back(PeerAddr{p.ip, p.port});
 
     if (peers.empty()) {
-        std::printf("[%s] FAIL: no peer learned from com-core -- cannot test punching\n", role.c_str());
+        std::printf("[%s] FAIL: no peer learned from rlcore -- cannot test punching\n", role.c_str());
         transport.stop();
         return 1;
     }

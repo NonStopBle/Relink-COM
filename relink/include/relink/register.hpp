@@ -1,13 +1,13 @@
 // Step 4: RegisterRequest / RegisterAck wire encode/decode — mode A
-// (com-core) discovery protocol, per relink-com-spec.md "Mode A" section.
+// (rlcore) discovery protocol, per relink-com-spec.md "Mode A" section.
 //
 // Pure byte-level functions only (no sockets) so the exact same logic
 // can be verified against a Python implementation byte-for-byte in
-// tests, and so the com-core daemon and the node-side client can share
+// tests, and so the rlcore daemon and the node-side client can share
 // this header without pulling in socket code.
 //
 // Wire layout (all little-endian, matching wire.hpp's *Header structs):
-//   RegisterRequest = RegisterRequestHeader(8B) + topic_count * uint16_t
+//   RegisterRequest = RegisterRequestHeader(8B) + topic_count * uint32_t
 //   RegisterAck     = RegisterAckHeader(3B) + peer_count * RegisterAckPeer(8B)
 
 #pragma once
@@ -20,7 +20,7 @@
 
 namespace relink {
 
-inline constexpr uint16_t kComCoreDefaultPort = 8445;
+inline constexpr uint16_t kRlCoreDefaultPort = 8445;
 inline constexpr size_t kMaxRegisterTopics = 128; // sanity cap, v1 fixed-size buffers
 
 enum class RegisterEncodeResult { Ok, TooManyTopics, BufferTooSmall };
@@ -30,11 +30,11 @@ enum class RegisterDecodeResult { Ok, TooShort, LengthMismatch };
 
 inline RegisterEncodeResult encode_register_request(
     uint32_t node_ip, uint16_t node_port,
-    const uint16_t* topic_ids, uint16_t topic_count,
+    const uint32_t* topic_ids, uint16_t topic_count,
     uint8_t* out, size_t out_capacity, size_t* out_len) {
     if (topic_count > kMaxRegisterTopics) return RegisterEncodeResult::TooManyTopics;
 
-    const size_t needed = sizeof(RegisterRequestHeader) + size_t(topic_count) * sizeof(uint16_t);
+    const size_t needed = sizeof(RegisterRequestHeader) + size_t(topic_count) * sizeof(uint32_t);
     if (out_capacity < needed) return RegisterEncodeResult::BufferTooSmall;
 
     RegisterRequestHeader hdr{};
@@ -46,7 +46,7 @@ inline RegisterEncodeResult encode_register_request(
     std::memcpy(out + off, &hdr, sizeof(hdr));
     off += sizeof(hdr);
     for (uint16_t i = 0; i < topic_count; ++i) {
-        uint16_t t = topic_ids[i];
+        uint32_t t = topic_ids[i];
         std::memcpy(out + off, &t, sizeof(t));
         off += sizeof(t);
     }
@@ -58,7 +58,7 @@ struct DecodedRegisterRequest {
     uint32_t node_ip;
     uint16_t node_port;
     uint16_t topic_count;
-    const uint8_t* topic_ids_raw; // topic_count * uint16_t, little-endian, in-buffer
+    const uint8_t* topic_ids_raw; // topic_count * uint32_t, little-endian, in-buffer
 };
 
 inline RegisterDecodeResult decode_register_request(const uint8_t* buf, size_t len,
@@ -66,7 +66,7 @@ inline RegisterDecodeResult decode_register_request(const uint8_t* buf, size_t l
     if (len < sizeof(RegisterRequestHeader)) return RegisterDecodeResult::TooShort;
     RegisterRequestHeader hdr{};
     std::memcpy(&hdr, buf, sizeof(hdr));
-    const size_t needed = sizeof(hdr) + size_t(hdr.topic_count) * sizeof(uint16_t);
+    const size_t needed = sizeof(hdr) + size_t(hdr.topic_count) * sizeof(uint32_t);
     if (len != needed) return RegisterDecodeResult::LengthMismatch;
 
     out->node_ip = hdr.node_ip;
@@ -76,9 +76,9 @@ inline RegisterDecodeResult decode_register_request(const uint8_t* buf, size_t l
     return RegisterDecodeResult::Ok;
 }
 
-inline uint16_t register_request_topic_at(const DecodedRegisterRequest& req, size_t i) {
-    uint16_t v;
-    std::memcpy(&v, req.topic_ids_raw + i * sizeof(uint16_t), sizeof(v));
+inline uint32_t register_request_topic_at(const DecodedRegisterRequest& req, size_t i) {
+    uint32_t v;
+    std::memcpy(&v, req.topic_ids_raw + i * sizeof(uint32_t), sizeof(v));
     return v;
 }
 

@@ -93,9 +93,9 @@ class UdpTransport:
     @property
     def sock(self) -> socket.socket:
         """The underlying socket, exposed ONLY so a caller (namely
-        RelinkNode's com-core registration step) can reuse this exact
+        RelinkNode's rlcore registration step) can reuse this exact
         socket for a pre-start() synchronous request/reply, keeping the
-        NAT-mapped source port com-core observes consistent with the
+        NAT-mapped source port rlcore observes consistent with the
         port this transport will actually receive data on. Safe to use
         before start() launches the dedicated data thread; not meant for
         general use once that thread owns recv from this socket."""

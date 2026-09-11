@@ -167,7 +167,7 @@ int main(int argc, char** argv) {
     std::signal(SIGINT, on_sigint);
 
     RelinkNode node;
-    node.set_com_core.ip("10.0.0.5");  // port defaults to 8445
+    node.set_rlcore.ip("10.0.0.5");  // port defaults to 8445
 
     if (std::strcmp(argv[1], "pub") == 0) {
         run_publisher(node);

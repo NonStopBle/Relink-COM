@@ -15,12 +15,12 @@ static int g_failures = 0;
 int main() {
     // --- RegisterRequest round trip ---
     {
-        uint16_t topics[3] = {100, 101, 200};
+        uint32_t topics[3] = {100, 101, 200};
         uint8_t buf[256];
         size_t len = 0;
         auto er = encode_register_request(0x0A000005, 5555, topics, 3, buf, sizeof(buf), &len);
         CHECK(er == RegisterEncodeResult::Ok);
-        CHECK(len == sizeof(RegisterRequestHeader) + 3 * sizeof(uint16_t));
+        CHECK(len == sizeof(RegisterRequestHeader) + 3 * sizeof(uint32_t));
 
         DecodedRegisterRequest dreq{};
         auto dr = decode_register_request(buf, len, &dreq);
@@ -75,7 +75,7 @@ int main() {
     {
         uint8_t buf[64];
         size_t len = 0;
-        uint16_t topics[1] = {5};
+        uint32_t topics[1] = {5};
         encode_register_request(1, 2, topics, 1, buf, sizeof(buf), &len);
         DecodedRegisterRequest dreq{};
         CHECK(decode_register_request(buf, len - 1, &dreq) == RegisterDecodeResult::LengthMismatch);

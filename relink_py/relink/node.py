@@ -1,5 +1,5 @@
 """The public ReLink API -- RelinkNode, mirrors relink/include/relink/relink.hpp.
-Wires together the UDP data thread, com-core client, and multicast
+Wires together the UDP data thread, rlcore client, and multicast
 discovery behind the same advertise/subscribe/publish<T> surface shown in
 the C++ examples, adapted to Python idiom (pass the wire type as an
 argument rather than a template parameter)."""
@@ -10,16 +10,17 @@ import socket
 import struct
 import threading
 import time
-from typing import Callable, Dict, List, Optional, Set, Type
+from typing import Callable, Dict, List, Optional, Set, Type, Union
 
 from .wire import is_wire_type, NAT_PUNCH_TOPIC_ID
+from .topic_hash import fnv1a32
 from .udp_transport import UdpTransport, PeerAddr, ipv4_to_host_order
-from .com_core_client import register_with_com_core_on_socket
+from .rlcore_client import register_with_rlcore_on_socket
 from .multicast_discovery import (
     MulticastDiscovery, MulticastDiscoveryConfig,
     DEFAULT_MULTICAST_GROUP, DEFAULT_MULTICAST_PORT,
 )
-from .register import COM_CORE_DEFAULT_PORT
+from .register import RLCORE_DEFAULT_PORT
 from .image import (
     ImageChunk, encode_image_chunks, ImageReassembler, ImageTooLargeError,
     MAX_IMAGE_BYTES, IMAGE_CHUNK_DATA_BYTES, IMAGE_CHUNK_HEADER_BYTES,
@@ -28,7 +29,7 @@ from .image import (
 
 class DiscoveryMode(enum.Enum):
     NONE = 0
-    COM_CORE = 1
+    RLCORE = 1
     MULTICAST = 2
 
 
@@ -47,8 +48,8 @@ def _detect_local_ip_for_peer(peer_ip_host_order: int, peer_port: int) -> int:
         s.close()
 
 
-class _ComCoreConfig:
-    """set_com_core sub-object: separate ip()/port() setters, port has a
+class _RlCoreConfig:
+    """set_rlcore sub-object: separate ip()/port() setters, port has a
     default, mode selection happens at the ip() call itself (not deferred
     to spin()/start())."""
 
@@ -56,14 +57,14 @@ class _ComCoreConfig:
         self._owner = owner
         self._ip_set = False
         self._ip = 0
-        self._port = COM_CORE_DEFAULT_PORT
+        self._port = RLCORE_DEFAULT_PORT
 
     def ip(self, addr: str):
-        self._owner._select_mode(DiscoveryMode.COM_CORE)
+        self._owner._select_mode(DiscoveryMode.RLCORE)
         self._ip = ipv4_to_host_order(addr)
         self._ip_set = True
 
-    def port(self, p: int = COM_CORE_DEFAULT_PORT):
+    def port(self, p: int = RLCORE_DEFAULT_PORT):
         self._port = p
 
     @property
@@ -81,12 +82,13 @@ class _ComCoreConfig:
 
 class RelinkNode:
     def __init__(self):
-        self.set_com_core = _ComCoreConfig(self)
+        self.set_rlcore = _RlCoreConfig(self)
         self._mode = DiscoveryMode.NONE
         self._declared_topics: Set[int] = set()
         self._peers_lock = threading.Lock()
         self._peers: Dict[int, List[PeerAddr]] = {}
         self._next_image_frame_id: Dict[int, int] = {}
+        self._topic_names: Dict[int, str] = {}
 
         self._transport = UdpTransport()
         self._mcast: Optional[MulticastDiscovery] = None
@@ -106,9 +108,50 @@ class RelinkNode:
                 "exclusive discovery mode on the same node")
         self._mode = requested
 
+    # --- named topics: hash a human-readable topic name down to the
+    # uint32 that actually goes on the wire. One-way (FNV-1a) -- see
+    # topic_hash.py for why this can't be losslessly inverted.
+    # "Decoding" an id back to a name only works locally via the
+    # registry this populates (topic_name_for()), for names this
+    # process itself has advertised/subscribed/published.
+    def _topic_id_for(self, topic: Union[int, str]) -> int:
+        if not isinstance(topic, str):
+            return topic
+        topic_id = fnv1a32(topic)
+        if topic_id == NAT_PUNCH_TOPIC_ID:
+            raise RuntimeError(
+                f'topic name "{topic}" hashes to the reserved NAT-punch topic id -- '
+                "pick a different name")
+        existing = self._topic_names.get(topic_id)
+        if existing is not None:
+            if existing != topic:
+                raise RuntimeError(
+                    f'topic hash collision between "{existing}" and "{topic}" '
+                    f"(both hash to {topic_id})")
+        else:
+            self._topic_names[topic_id] = topic
+        return topic_id
+
+    def topic_name_for(self, topic_id: int) -> str:
+        """Reverse lookup into this process's own registry -- empty
+        string if this id was never named here."""
+        return self._topic_names.get(topic_id, "")
+
+    def rltopic_list(self) -> List[Dict[str, object]]:
+        """Lists every topic this node has advertised or subscribed to
+        so far, with its human name when known -- a debugging/
+        introspection aid, not part of the wire protocol. Each entry is
+        {"topic_id": int, "name": str} (name is "" if this topic was
+        declared by numeric id directly)."""
+        return [
+            {"topic_id": tid, "name": self._topic_names.get(tid, "")}
+            for tid in sorted(self._declared_topics)
+        ]
+
     # --- advertise: publisher-side topic declaration ---
-    def advertise(self, topic_id: int, msg_type: Type[ctypes.Structure],
+    def advertise(self, topic: Union[int, str], msg_type: Type[ctypes.Structure],
                   secure: bool = False, checksum: bool = False):
+        topic_id = self._topic_id_for(topic)
         if not is_wire_type(msg_type):
             raise TypeError(f"{msg_type} must be a ctypes.Structure subclass with _pack_ = 1")
         if msg_type is ImageChunk:
@@ -117,8 +160,9 @@ class RelinkNode:
 
     # --- subscribe: receiver-side topic declaration + typed callback,
     # invoked inline on the data thread, per spec's v1 threading design ---
-    def subscribe(self, topic_id: int, msg_type: Type[ctypes.Structure],
+    def subscribe(self, topic: Union[int, str], msg_type: Type[ctypes.Structure],
                   callback: Callable[[ctypes.Structure], None], secure: bool = False):
+        topic_id = self._topic_id_for(topic)
         if not is_wire_type(msg_type):
             raise TypeError(f"{msg_type} must be a ctypes.Structure subclass with _pack_ = 1")
         self._declared_topics.add(topic_id)
@@ -132,7 +176,8 @@ class RelinkNode:
         self._transport.set_topic_handler(topic_id, raw_handler)
 
     # --- publish: sends to every currently-known peer for this topic ---
-    def publish(self, topic_id: int, value: ctypes.Structure) -> bool:
+    def publish(self, topic: Union[int, str], value: ctypes.Structure) -> bool:
+        topic_id = self._topic_id_for(topic)
         self._ensure_started()
         with self._peers_lock:
             peers = list(self._peers.get(topic_id, []))
@@ -149,12 +194,12 @@ class RelinkNode:
     # datagram, not a new wire mechanism. Not JPEG/PNG-specific: carries
     # whatever bytes you give it. ---
 
-    def advertise_image(self, topic_id: int):
-        """Equivalent to advertise(topic_id, ImageChunk) -- a clearer
+    def advertise_image(self, topic: Union[int, str]):
+        """Equivalent to advertise(topic, ImageChunk) -- a clearer
         name for this use case."""
-        self.advertise(topic_id, ImageChunk)
+        self.advertise(topic, ImageChunk)
 
-    def publish_image(self, topic_id: int, data: bytes, frame_id: int = None) -> bool:
+    def publish_image(self, topic: Union[int, str], data: bytes, frame_id: int = None) -> bool:
         """Splits data into MTU-maximized chunks and publishes each one
         in order. frame_id lets the receiver match chunks belonging to
         the same image and is auto-incremented per topic if not given.
@@ -169,6 +214,7 @@ class RelinkNode:
         UdpTransport.publish_scattered()'s socket.sendmsg(), so the
         chunk's actual pixel/compressed bytes are never copied at the
         Python level before being handed to the kernel."""
+        topic_id = self._topic_id_for(topic)
         if len(data) > MAX_IMAGE_BYTES:
             raise ImageTooLargeError(f"{len(data)} bytes exceeds the max representable image size "
                                       f"({MAX_IMAGE_BYTES} bytes, limited by chunk_count being a uint16)")
@@ -193,7 +239,7 @@ class RelinkNode:
                 all_ok = ok and all_ok
         return all_ok
 
-    def subscribe_image(self, topic_id: int, callback: Callable[[int, bytes], None]):
+    def subscribe_image(self, topic: Union[int, str], callback: Callable[[int, bytes], None]):
         """Subscribes to a topic of Image chunks; callback(frame_id,
         data) fires once per COMPLETE image (not once per chunk). An
         image whose chunks arrive incompletely before the next one
@@ -211,6 +257,7 @@ class RelinkNode:
         eventually collapsed once the backlog outran the buffer. If your
         work is slow, hand it off to your own worker thread/queue
         instead of doing it here."""
+        topic_id = self._topic_id_for(topic)
         self._transport.enable_large_buffers()
         reassembler = ImageReassembler(callback)
         self._declared_topics.add(topic_id)
@@ -259,33 +306,33 @@ class RelinkNode:
 
             if self._mode == DiscoveryMode.NONE:
                 raise RuntimeError(
-                    "no discovery method configured -- call set_com_core.ip(...) or "
+                    "no discovery method configured -- call set_rlcore.ip(...) or "
                     "use_multicast_discovery() before spin()/publish()/subscribe traffic")
-            if self._mode == DiscoveryMode.COM_CORE and not self.set_com_core.ip_is_set:
-                raise RuntimeError("com-core IP not set -- call set_com_core.ip(...)")
+            if self._mode == DiscoveryMode.RLCORE and not self.set_rlcore.ip_is_set:
+                raise RuntimeError("rlcore IP not set -- call set_rlcore.ip(...)")
 
             self._transport.bind(0)
 
             topics = list(self._declared_topics)
             newly_learned_peers: List[PeerAddr] = []  # for the NAT punch burst below
 
-            if self._mode == DiscoveryMode.COM_CORE:
+            if self._mode == DiscoveryMode.RLCORE:
                 # Registration MUST happen on the transport's own socket,
                 # before self._transport.start() hands that socket's recv
                 # loop to the dedicated data thread (two threads reading
                 # the same fd concurrently would race the ack reply
                 # against the data thread's dispatch loop). This also
-                # matters for NAT traversal: when com-core runs with
+                # matters for NAT traversal: when rlcore runs with
                 # --nat, it learns each node's real (NAT-mapped) public
                 # endpoint from the request's UDP source port -- correct
                 # only if that's the SAME port the node's data traffic
                 # actually arrives on, i.e. this socket, not a throwaway
                 # one.
-                self_ip = _detect_local_ip_for_peer(self.set_com_core.resolved_ip,
-                                                     self.set_com_core.resolved_port)
-                outcome = register_with_com_core_on_socket(
+                self_ip = _detect_local_ip_for_peer(self.set_rlcore.resolved_ip,
+                                                     self.set_rlcore.resolved_port)
+                outcome = register_with_rlcore_on_socket(
                     self._transport.sock,
-                    self.set_com_core.resolved_ip, self.set_com_core.resolved_port,
+                    self.set_rlcore.resolved_ip, self.set_rlcore.resolved_port,
                     self_ip, self._transport.local_port, topics)
                 if outcome.ok:
                     with self._peers_lock:
@@ -293,7 +340,7 @@ class RelinkNode:
                             addr = PeerAddr(p.ip, p.port)
                             self._peers.setdefault(p.topic_id, []).append(addr)
                             newly_learned_peers.append(addr)
-                # If registration failed after retries, register_with_com_core
+                # If registration failed after retries, register_with_rlcore
                 # already logged an error; proceed with an empty peer table
                 # rather than crashing the node.
                 self._transport.start()
@@ -316,7 +363,7 @@ class RelinkNode:
 
             # NAT hole punching: fire a small burst of empty datagrams at
             # every peer learned from this registration. Only matters
-            # (and is only correct) when com-core is run with --nat,
+            # (and is only correct) when rlcore is run with --nat,
             # which hands out each peer's real internet-facing endpoint
             # instead of their self-reported LAN address -- sending a
             # datagram FROM this node TO that endpoint opens this node's

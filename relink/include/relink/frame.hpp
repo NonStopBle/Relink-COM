@@ -50,7 +50,7 @@ struct DecodedFrame {
 // to the number of bytes actually written. Rejects (does not truncate or
 // silently fragment) any payload larger than kMaxPayloadBytes, per spec:
 // "reject with a clear error if the message is too large."
-inline EncodeResult encode_frame(uint16_t topic_id, uint16_t seq_num,
+inline EncodeResult encode_frame(uint32_t topic_id, uint16_t seq_num,
                                   const void* payload, size_t payload_len,
                                   uint8_t* out, size_t out_capacity,
                                   size_t* out_len) {

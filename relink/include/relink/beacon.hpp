@@ -5,7 +5,7 @@
 //
 // Wire layout (little-endian, matches wire.hpp's BeaconPacketHeader):
 //   BeaconPacket = BeaconPacketHeader(8B: node_ip, node_port, topic_count)
-//                  + topic_count * uint16_t topic_ids
+//                  + topic_count * uint32_t topic_ids
 
 #pragma once
 
@@ -23,11 +23,11 @@ enum class BeaconDecodeResult { Ok, TooShort, LengthMismatch };
 
 inline BeaconEncodeResult encode_beacon_packet(
     uint32_t node_ip, uint16_t node_port,
-    const uint16_t* topic_ids, uint16_t topic_count,
+    const uint32_t* topic_ids, uint16_t topic_count,
     uint8_t* out, size_t out_capacity, size_t* out_len) {
     if (topic_count > kMaxBeaconTopics) return BeaconEncodeResult::TooManyTopics;
 
-    const size_t needed = sizeof(BeaconPacketHeader) + size_t(topic_count) * sizeof(uint16_t);
+    const size_t needed = sizeof(BeaconPacketHeader) + size_t(topic_count) * sizeof(uint32_t);
     if (out_capacity < needed) return BeaconEncodeResult::BufferTooSmall;
 
     BeaconPacketHeader hdr{};
@@ -39,7 +39,7 @@ inline BeaconEncodeResult encode_beacon_packet(
     std::memcpy(out + off, &hdr, sizeof(hdr));
     off += sizeof(hdr);
     for (uint16_t i = 0; i < topic_count; ++i) {
-        uint16_t t = topic_ids[i];
+        uint32_t t = topic_ids[i];
         std::memcpy(out + off, &t, sizeof(t));
         off += sizeof(t);
     }
@@ -58,7 +58,7 @@ inline BeaconDecodeResult decode_beacon_packet(const uint8_t* buf, size_t len, D
     if (len < sizeof(BeaconPacketHeader)) return BeaconDecodeResult::TooShort;
     BeaconPacketHeader hdr{};
     std::memcpy(&hdr, buf, sizeof(hdr));
-    const size_t needed = sizeof(hdr) + size_t(hdr.topic_count) * sizeof(uint16_t);
+    const size_t needed = sizeof(hdr) + size_t(hdr.topic_count) * sizeof(uint32_t);
     if (len != needed) return BeaconDecodeResult::LengthMismatch;
 
     out->node_ip = hdr.node_ip;
@@ -68,9 +68,9 @@ inline BeaconDecodeResult decode_beacon_packet(const uint8_t* buf, size_t len, D
     return BeaconDecodeResult::Ok;
 }
 
-inline uint16_t beacon_topic_at(const DecodedBeacon& b, size_t i) {
-    uint16_t v;
-    std::memcpy(&v, b.topic_ids_raw + i * sizeof(uint16_t), sizeof(v));
+inline uint32_t beacon_topic_at(const DecodedBeacon& b, size_t i) {
+    uint32_t v;
+    std::memcpy(&v, b.topic_ids_raw + i * sizeof(uint32_t), sizeof(v));
     return v;
 }
 

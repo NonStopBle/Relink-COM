@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """ReLink usage example -- publisher + subscriber, mode B (multicast,
-no daemon). Same shape as comcore_pubsub.py but with
-node.use_multicast_discovery() instead of set_com_core.
+no daemon). Same shape as rlcore_pubsub.py but with
+node.use_multicast_discovery() instead of set_rlcore.
 
 Two processes: run with argv[1] == "pub" or "sub".
 """

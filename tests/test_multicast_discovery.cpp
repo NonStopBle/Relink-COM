@@ -1,7 +1,7 @@
 // Step 5 real-socket test: two MulticastDiscovery instances (loopback
 // multicast, IP_MULTICAST_LOOP) exchanging real beacon packets.
 // Confirms: overlap -> peer stored, no overlap -> discarded, no self-
-// peering, and that the outcome matches what mode A (com-core) already
+// peering, and that the outcome matches what mode A (rlcore) already
 // proved in test step 4 for the same two-node/topic scenario.
 
 #include "relink/multicast_discovery.hpp"
@@ -25,7 +25,7 @@ int main() {
     const uint32_t loopback = ipv4_to_host_order("127.0.0.1");
 
     // Node A: publishes/subscribes topic 100 and 101 (mirrors the
-    // com-core interop test's node at port 9001, topics 100/101).
+    // rlcore interop test's node at port 9001, topics 100/101).
     MulticastDiscoveryConfig cfg_a;
     cfg_a.self_ip = loopback;
     cfg_a.self_data_port = 9001;
@@ -35,7 +35,7 @@ int main() {
     cfg_a.reannounce_min_ms = 300;
     cfg_a.reannounce_max_ms = 500;
 
-    // Node B: topics 100 and 200 (mirrors com-core test's node at
+    // Node B: topics 100 and 200 (mirrors rlcore test's node at
     // port 9002) -- topic 100 overlaps with A, topic 200/101 do not.
     MulticastDiscoveryConfig cfg_b;
     cfg_b.self_ip = loopback;

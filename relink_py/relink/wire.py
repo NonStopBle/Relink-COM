@@ -28,24 +28,24 @@ FLAG_CHECKSUM = 0x02
 # normal ReLink frame with an empty payload; since no handler is ever
 # registered for this topic, UdpTransport's existing "no subscriber ->
 # drop" path silently discards it on arrival.
-NAT_PUNCH_TOPIC_ID = 0xFFFF
+NAT_PUNCH_TOPIC_ID = 0xFFFFFFFF
 
 # Safe UDP payload budget -- matches relink/include/relink/frame.hpp exactly.
 MAX_PAYLOAD_BYTES = 1400
 
 
 class RelinkHeader(ctypes.LittleEndianStructure):
-    """7 bytes on the wire: topic_id, seq_num, payload_len, flags."""
+    """9 bytes on the wire: topic_id, seq_num, payload_len, flags."""
     _pack_ = 1
     _fields_ = [
-        ("topic_id", ctypes.c_uint16),
+        ("topic_id", ctypes.c_uint32),
         ("seq_num", ctypes.c_uint16),
         ("payload_len", ctypes.c_uint16),
         ("flags", ctypes.c_uint8),
     ]
 
 
-assert ctypes.sizeof(RelinkHeader) == 7, "RelinkHeader must be exactly 7 bytes on the wire"
+assert ctypes.sizeof(RelinkHeader) == 9, "RelinkHeader must be exactly 9 bytes on the wire"
 
 
 class SecureExt(ctypes.LittleEndianStructure):
@@ -105,11 +105,11 @@ class RegisterAckPeer(ctypes.LittleEndianStructure):
     _fields_ = [
         ("ip", ctypes.c_uint32),
         ("port", ctypes.c_uint16),
-        ("topic_id", ctypes.c_uint16),
+        ("topic_id", ctypes.c_uint32),
     ]
 
 
-assert ctypes.sizeof(RegisterAckPeer) == 8
+assert ctypes.sizeof(RegisterAckPeer) == 10
 
 
 class MultiArrayHeader(ctypes.LittleEndianStructure):

@@ -1,6 +1,6 @@
-"""RegisterRequest / RegisterAck wire encode/decode -- mode A (com-core)
+"""RegisterRequest / RegisterAck wire encode/decode -- mode A (rlcore)
 discovery protocol. Mirrors relink/include/relink/register.hpp and must
-stay byte-identical to com-core/relink_com_core.py's own encoding (that
+stay byte-identical to rlcore/relink_rlcore.py's own encoding (that
 file predates this package and already proved C++/Python interop at the
 daemon level; this module is the equivalent codec for a full node-side
 Python binding, kept in lockstep with it deliberately)."""
@@ -8,20 +8,20 @@ Python binding, kept in lockstep with it deliberately)."""
 import struct
 from typing import List, NamedTuple
 
-COM_CORE_DEFAULT_PORT = 8445
+RLCORE_DEFAULT_PORT = 8445
 
 _REQ_HEADER_FMT = "<IHH"   # node_ip, node_port, topic_count
 _REQ_HEADER_LEN = struct.calcsize(_REQ_HEADER_FMT)
 _ACK_HEADER_FMT = "<BH"    # status, peer_count
 _ACK_HEADER_LEN = struct.calcsize(_ACK_HEADER_FMT)
-_PEER_FMT = "<IHH"         # ip, port, topic_id
+_PEER_FMT = "<IHI"         # ip, port, topic_id
 _PEER_LEN = struct.calcsize(_PEER_FMT)
 
 
 def encode_register_request(node_ip: int, node_port: int, topic_ids: List[int]) -> bytes:
     out = struct.pack(_REQ_HEADER_FMT, node_ip, node_port, len(topic_ids))
     if topic_ids:
-        out += struct.pack("<%dH" % len(topic_ids), *topic_ids)
+        out += struct.pack("<%dI" % len(topic_ids), *topic_ids)
     return out
 
 
@@ -35,10 +35,10 @@ def decode_register_request(buf: bytes) -> DecodedRegisterRequest:
     if len(buf) < _REQ_HEADER_LEN:
         raise ValueError("RegisterRequest too short")
     node_ip, node_port, topic_count = struct.unpack_from(_REQ_HEADER_FMT, buf, 0)
-    expected = _REQ_HEADER_LEN + topic_count * 2
+    expected = _REQ_HEADER_LEN + topic_count * 4
     if len(buf) != expected:
         raise ValueError("RegisterRequest length mismatch")
-    topics = list(struct.unpack_from("<%dH" % topic_count, buf, _REQ_HEADER_LEN)) if topic_count else []
+    topics = list(struct.unpack_from("<%dI" % topic_count, buf, _REQ_HEADER_LEN)) if topic_count else []
     return DecodedRegisterRequest(node_ip, node_port, topics)
 
 

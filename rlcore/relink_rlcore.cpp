@@ -1,5 +1,5 @@
-// relink-com-core (C++ build) — small standalone registration daemon,
-// per relink-com-spec.md "Mode A: relink-com-core" section.
+// relink-rlcore (C++ build) — small standalone registration daemon,
+// per relink-com-spec.md "Mode A: relink-rlcore" section.
 //
 // Listens on 0.0.0.0:<port> (default 8445, overridable with --port),
 // receives RegisterRequest packets, updates an in-memory topic->peer
@@ -7,7 +7,7 @@
 // peers for the requester's topics. Never touches the per-message data
 // path -- this is bootstrap-only.
 //
-// --nat: NAT traversal / UDP hole punching support. When set, com-core
+// --nat: NAT traversal / UDP hole punching support. When set, rlcore
 // substitutes each registrant's OBSERVED UDP source address (ip:port as
 // seen after any NAT the registrant is behind) for the self-reported
 // node_ip/node_port in the request payload, and hands THAT out to peers
@@ -18,7 +18,7 @@
 // RelinkNode client additionally sends a small burst of "punch" packets
 // to every peer it learns about (see relink.hpp's ensure_started()),
 // so both sides' NAT mappings open at roughly the same time (classic
-// simultaneous-open UDP hole punching, with com-core acting as the
+// simultaneous-open UDP hole punching, with rlcore acting as the
 // rendezvous/signaling point, same role a STUN/TURN-adjacent server
 // plays elsewhere). Without --nat (the default), the self-reported
 // address is used unchanged, correct for same-LAN deployments where a
@@ -49,7 +49,7 @@ struct PeerEntry {
 };
 
 int main(int argc, char** argv) {
-    uint16_t port = kComCoreDefaultPort;
+    uint16_t port = kRlCoreDefaultPort;
     bool nat_mode = false;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--port") == 0 && i + 1 < argc) {
@@ -71,7 +71,7 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    std::printf("relink-com-core (C++) listening on 0.0.0.0:%u%s\n", port,
+    std::printf("relink-rlcore (C++) listening on 0.0.0.0:%u%s\n", port,
                 nat_mode ? " (NAT traversal enabled)" : "");
 
     // topic_id -> set of peers registered for it
@@ -89,7 +89,7 @@ int main(int argc, char** argv) {
 
         DecodedRegisterRequest req{};
         if (decode_register_request(recv_buf, static_cast<size_t>(n), &req) != RegisterDecodeResult::Ok) {
-            std::fprintf(stderr, "relink-com-core: dropped malformed RegisterRequest\n");
+            std::fprintf(stderr, "relink-rlcore: dropped malformed RegisterRequest\n");
             continue;
         }
 
@@ -127,7 +127,7 @@ int main(int argc, char** argv) {
         auto er = encode_register_ack(0, peers.data(), static_cast<uint16_t>(peers.size()),
                                        send_buf, sizeof(send_buf), &out_len);
         if (er != RegisterEncodeResult::Ok) {
-            std::fprintf(stderr, "relink-com-core: failed to encode ack (too many peers?)\n");
+            std::fprintf(stderr, "relink-rlcore: failed to encode ack (too many peers?)\n");
             continue;
         }
 
@@ -136,7 +136,7 @@ int main(int argc, char** argv) {
 
         struct in_addr ia{};
         ia.s_addr = htonl(self.ip);
-        std::printf("relink-com-core: registered %s:%u (%u topics)%s, replied with %zu peers\n",
+        std::printf("relink-rlcore: registered %s:%u (%u topics)%s, replied with %zu peers\n",
                     inet_ntoa(ia), self.port, req.topic_count,
                     nat_mode ? " [observed]" : "", peers.size());
     }

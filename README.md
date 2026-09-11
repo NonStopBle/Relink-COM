@@ -69,20 +69,33 @@ instead of multicast) that works around that.
 
 ## Features
 
-- **UDP by default**, fixed 7-byte header, `'#' ... '\n'` framed, no
+- **UDP by default**, fixed 9-byte header, `'#' ... '\n'` framed, no
   scanning for delimiters inside the payload.
+- **Named topics**: `advertise`/`subscribe`/`publish` (and the `_image`
+  variants) accept a human-readable string (`"/relink/camera/front"`)
+  instead of a hand-assigned numeric id — ReLink hashes it (FNV-1a) down
+  to the `uint32_t` that actually goes on the wire, so both sides just
+  need to type the same string, no shared header/constant required.
+  This is a one-way hash, not a reversible encoding (packing an
+  arbitrary-length name losslessly into 4 bytes isn't possible past
+  ~6 characters) — each node keeps a local name registry
+  (`topic_name_for()`/`rltopic_list()`) built from its own calls, for
+  debugging, and throws loudly on a genuine hash collision or a name
+  landing on the reserved NAT-punch id, rather than silently misrouting.
+  A numeric id still works exactly as before if you'd rather assign ids
+  by hand.
 - **std_msgs-style default types** (`Bool`, `Int32`, `Float32`, ...) plus
   user-defined custom types — any trivially-copyable struct (C++
   `#pragma pack(1)` / Python `ctypes.Structure` with `_pack_ = 1`) just
   works, no registration, no schema exchange.
 - **Two mutually-exclusive discovery modes**, chosen explicitly per node:
-  - **Mode A — `relink-com-core`**: a small central daemon (C++ and
+  - **Mode A — `relink-rlcore`**: a small central daemon (C++ and
     Python builds, byte-identical wire behavior), request/ACK
     registration, retry-with-backoff.
   - **Mode B — multicast beacon**: fully decentralized, no daemon,
     jittered startup burst + sparse re-announce (not continuous —
     ReLink's traffic doesn't grow with uptime the way ROS2's does).
-- **UDP NAT traversal** (`relink-com-core --nat`): the daemon acts as a
+- **UDP NAT traversal** (`relink-rlcore --nat`): the daemon acts as a
   rendezvous point, handing out each node's real (NAT-mapped) endpoint
   instead of its private LAN address, paired with client-side hole
   punching — lets nodes across separate networks/NATs find each other.
@@ -96,7 +109,7 @@ instead of multicast) that works around that.
   - **Zero-copy chunk send/receive**: a chunk's data is handed straight
     to the kernel (`sendmsg()`/`socket.sendmsg()` scatter-gather in C++
     and Python) instead of being copied into an intermediate struct
-    first — only the 10-byte chunk header and 7-byte wire header are
+    first — only the 10-byte chunk header and 9-byte wire header are
     ever assembled locally, the caller's actual bytes are never
     duplicated in userspace on the way out or in.
   - A **larger socket send/receive buffer** (1MB, requested only by a
@@ -131,20 +144,20 @@ Every node picks exactly one, explicitly:
 ```cpp
 // Mode A: a small daemon both sides can reach. Works everywhere,
 // including networks that block multicast (most WiFi, most cloud VPCs).
-node.set_com_core.ip("10.0.0.5");
+node.set_rlcore.ip("10.0.0.5");
 
 // Mode B: no daemon needed, nodes find each other via multicast.
 // Simplest to start with, but needs a network that allows multicast.
 node.use_multicast_discovery();
 ```
 
-Same choice in Python: `node.set_com_core.ip(...)` or
+Same choice in Python: `node.set_rlcore.ip(...)` or
 `node.use_multicast_discovery()`.
 
 If you're not sure which to use: try mode B (`hello_relink`, above)
 first since it needs nothing extra to run. If it doesn't work on your
-network, switch to mode A — start the daemon once (`./relink-com-core`
-or `python3 com-core/relink_com_core.py`), then point every node at its
+network, switch to mode A — start the daemon once (`./relink-rlcore`
+or `python3 rlcore/relink_rlcore.py`), then point every node at its
 IP address.
 
 ## All examples
@@ -156,8 +169,8 @@ Each one exists in both C++ (`examples/cpp/`) and Python
 | Example | What it shows | Run it |
 |---|---|---|
 | **`hello_relink`** | The simplest possible ReLink program. One file, no arguments, runs the same way on both ends — each copy is both a publisher and a subscriber, looping forever, sending a counter once a second. Start here. | `./hello_relink` / `python3 hello_relink.py` (run twice) |
-| **`comcore_pubsub`** | Mode A (daemon) discovery, a custom message type (`ImuReading`, several `float`s + a timestamp) alongside a default type (`Float32`), one process as publisher and one as subscriber. | `./comcore_pubsub pub <daemon_ip>` and `... sub <daemon_ip>` in separate terminals, with the daemon already running |
-| **`multicast_pubsub`** | The same pub/sub shape as `comcore_pubsub`, but mode B (no daemon) — shows the two discovery modes are interchangeable from the application's point of view. | `./multicast_pubsub pub` and `... sub` |
+| **`rlcore_pubsub`** | Mode A (daemon) discovery, a custom message type (`ImuReading`, several `float`s + a timestamp) alongside a default type (`Float32`), one process as publisher and one as subscriber. | `./rlcore_pubsub pub <daemon_ip>` and `... sub <daemon_ip>` in separate terminals, with the daemon already running |
+| **`multicast_pubsub`** | The same pub/sub shape as `rlcore_pubsub`, but mode B (no daemon) — shows the two discovery modes are interchangeable from the application's point of view. | `./multicast_pubsub pub` and `... sub` |
 | **`camera_stream`** | A real webcam streamed over ReLink two ways at once, using the built-in `Image` type (`advertise_image`/`publish_image`/`subscribe_image` — see Features below) — `image_raw` (uncompressed, hundreds of MTU-sized chunks per frame) and `image_compressed` (JPEG, 2-3 chunks per frame). Both topics deliver ~100% reliably in both languages once the socket receive/send buffers are sized for a multi-hundred-chunk burst (ReLink requests 1MB buffers by default — see Features below); still, **prefer `image_compressed`** for anything real-time or over a busier network than loopback, since a dropped chunk drops the whole image (no retransmission) and compressed frames expose far fewer chunks to that risk. **Requires OpenCV, which you install yourself** (`pip install opencv-python`, or `sudo apt install libopencv-dev` for C++) — it is not a ReLink dependency. | `./camera_stream pub` and `... sub` |
 
 There's also a performance test harness (`relink_benchmark.cpp` at the
@@ -205,13 +218,13 @@ relink/include/relink/     C++ library (header-only)
   ring_buffer.hpp            fixed-capacity, drop-oldest-on-overflow
   frame.hpp                  pure encode/decode, MTU-budgeted
   udp_transport.hpp          dedicated data thread, CPU pinning, SCHED_FIFO
-  register.hpp / com_core_client.hpp   mode A (com-core) client
+  register.hpp / rlcore_client.hpp   mode A (rlcore) client
   beacon.hpp / multicast_discovery.hpp mode B (multicast) client
   relink.hpp                  RelinkNode -- the public API
 
-com-core/
-  relink_com_core.cpp        registration daemon, C++ build
-  relink_com_core.py         registration daemon, Python build (byte-identical protocol)
+rlcore/
+  relink_rlcore.cpp        registration daemon, C++ build
+  relink_rlcore.py         registration daemon, Python build (byte-identical protocol)
 
 relink_py/relink/          Python library (stdlib-only: ctypes + socket + struct)
   (mirrors the C++ layer-for-layer, see relink_py/README.md)
@@ -228,10 +241,11 @@ ros2_compare/                 ROS2 Humble comparison benchmark package
 #include "relink/relink.hpp"
 
 RelinkNode node;
-node.set_com_core.ip("10.0.0.5");        // mode A; or node.use_multicast_discovery() for mode B
+node.set_rlcore.ip("10.0.0.5");        // mode A; or node.use_multicast_discovery() for mode B
 
-node.advertise<Float32>(100);
-node.publish<Float32>(100, Float32{ .data = 36.6f });
+// Topics can be a name (hashed to a wire id for you) or a hand-assigned number:
+node.advertise<Float32>("/relink/temperature");
+node.publish<Float32>("/relink/temperature", Float32{ .data = 36.6f });
 
 node.subscribe<Float32>(101, [](const Float32& msg) { /* ... */ });
 node.spin();
@@ -246,10 +260,11 @@ for full publisher/subscriber programs.
 from relink import RelinkNode, Float32
 
 node = RelinkNode()
-node.set_com_core.ip("10.0.0.5")         # mode A; or node.use_multicast_discovery() for mode B
+node.set_rlcore.ip("10.0.0.5")         # mode A; or node.use_multicast_discovery() for mode B
 
-node.advertise(100, Float32)
-node.publish(100, Float32(data=36.6))
+# Topics can be a name (hashed to a wire id for you) or a hand-assigned number:
+node.advertise("/relink/temperature", Float32)
+node.publish("/relink/temperature", Float32(data=36.6))
 
 node.subscribe(101, Float32, lambda msg: print(msg.data))
 node.spin()
@@ -259,14 +274,14 @@ No install step — pure stdlib. See `relink_py/README.md` and
 `relink_py/examples/` above for full programs, including custom
 `ctypes.Structure` message types.
 
-## Running com-core (mode A discovery daemon)
+## Running rlcore (mode A discovery daemon)
 
 ```
 # C++
-./relink-com-core --port 8445 [--nat]
+./relink-rlcore --port 8445 [--nat]
 
 # Python
-python3 com-core/relink_com_core.py --port 8445 [--nat]
+python3 rlcore/relink_rlcore.py --port 8445 [--nat]
 ```
 
 Either build works with either language's nodes. `--nat` enables UDP

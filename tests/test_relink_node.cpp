@@ -32,26 +32,26 @@ static int g_failures = 0;
 } while (0)
 
 int main() {
-    // --- mutual exclusivity: com-core first, then multicast -> throw at
+    // --- mutual exclusivity: rlcore first, then multicast -> throw at
     //     the SECOND call, at the call site itself ---
     {
         RelinkNode node;
-        CHECK_NOTHROW(node.set_com_core.ip("127.0.0.1"));
+        CHECK_NOTHROW(node.set_rlcore.ip("127.0.0.1"));
         CHECK_THROWS(node.use_multicast_discovery());
     }
 
-    // --- mutual exclusivity: multicast first, then com-core -> throw ---
+    // --- mutual exclusivity: multicast first, then rlcore -> throw ---
     {
         RelinkNode node;
         CHECK_NOTHROW(node.use_multicast_discovery());
-        CHECK_THROWS(node.set_com_core.ip("127.0.0.1"));
+        CHECK_THROWS(node.set_rlcore.ip("127.0.0.1"));
     }
 
     // --- calling the SAME mode setter twice is fine (not a conflict) ---
     {
         RelinkNode node;
-        CHECK_NOTHROW(node.set_com_core.ip("127.0.0.1"));
-        CHECK_NOTHROW(node.set_com_core.ip("127.0.0.2")); // still ComCore mode, allowed
+        CHECK_NOTHROW(node.set_rlcore.ip("127.0.0.1"));
+        CHECK_NOTHROW(node.set_rlcore.ip("127.0.0.2")); // still RlCore mode, allowed
     }
     {
         RelinkNode node;
@@ -73,14 +73,14 @@ int main() {
     // --- port() set without ip() ever -> fails clearly at start time ---
     {
         RelinkNode node;
-        node.set_com_core.port(9000);
+        node.set_rlcore.port(9000);
         node.advertise<Int32>(100);
         CHECK_THROWS(node.publish<Int32>(100, Int32{42}));
     }
 
     // --- basic wiring sanity: advertise/subscribe/publish compile and
     //     work end-to-end through the real transport against a live
-    //     com-core daemon (spawned separately by the test harness script,
+    //     rlcore daemon (spawned separately by the test harness script,
     //     see the tmux run below) is covered by the two-process test in
     //     step 7; here we just confirm the templated API itself works
     //     with a subscriber wired directly via UdpTransport, without

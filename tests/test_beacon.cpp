@@ -13,12 +13,12 @@ static int g_failures = 0;
 
 int main() {
     {
-        uint16_t topics[2] = {100, 200};
+        uint32_t topics[2] = {100, 200};
         uint8_t buf[64];
         size_t len = 0;
         auto er = encode_beacon_packet(0x0A000005, 5000, topics, 2, buf, sizeof(buf), &len);
         CHECK(er == BeaconEncodeResult::Ok);
-        CHECK(len == sizeof(BeaconPacketHeader) + 2 * sizeof(uint16_t));
+        CHECK(len == sizeof(BeaconPacketHeader) + 2 * sizeof(uint32_t));
 
         DecodedBeacon b{};
         CHECK(decode_beacon_packet(buf, len, &b) == BeaconDecodeResult::Ok);
@@ -40,7 +40,7 @@ int main() {
     {
         uint8_t buf[64];
         size_t len = 0;
-        uint16_t topics[1] = {9};
+        uint32_t topics[1] = {9};
         encode_beacon_packet(1, 2, topics, 1, buf, sizeof(buf), &len);
         DecodedBeacon b{};
         CHECK(decode_beacon_packet(buf, len - 1, &b) == BeaconDecodeResult::LengthMismatch);

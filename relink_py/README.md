@@ -87,7 +87,7 @@ class ImuReading(ctypes.Structure):
     _fields_ = [("accel_x", ctypes.c_float), ("accel_y", ctypes.c_float), ("accel_z", ctypes.c_float)]
 
 node = RelinkNode()
-node.set_com_core.ip("10.0.0.5")          # mode A, or node.use_multicast_discovery() for mode B
+node.set_rlcore.ip("10.0.0.5")          # mode A, or node.use_multicast_discovery() for mode B
 
 node.advertise(100, ImuReading)
 node.publish(100, ImuReading(accel_x=0.1, accel_y=0.2, accel_z=9.81))
@@ -108,15 +108,15 @@ shows; the Python versions live here:
 
 - `examples/hello_relink.py` -- start here: one file, no arguments, run
   it twice and watch two copies find each other and exchange messages
-- `examples/comcore_pubsub.py` -- mode A (daemon), custom + default type
+- `examples/rlcore_pubsub.py` -- mode A (daemon), custom + default type
 - `examples/multicast_pubsub.py` -- mode B (no daemon)
 - `examples/camera_stream.py` -- a real webcam streamed as both raw and
   JPEG-compressed, demonstrating why you'd chunk + compress a large
   message; requires OpenCV, which you install yourself (`pip install
   opencv-python`) -- it is not a ReLink dependency
 
-Run the pub/sub examples as two processes: `python3 comcore_pubsub.py
-pub <com_core_ip>` and `python3 comcore_pubsub.py sub <com_core_ip>`.
+Run the pub/sub examples as two processes: `python3 rlcore_pubsub.py
+pub <rlcore_ip>` and `python3 rlcore_pubsub.py sub <rlcore_ip>`.
 
 ## Tests
 

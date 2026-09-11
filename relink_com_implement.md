@@ -11,7 +11,7 @@ Two reference files exist showing the **target API surface** you're
 building toward — they will not compile until the library exists, but
 they define exactly what `RelinkNode` and friends must support:
 - `relink_example.cpp` — basic publisher/subscriber usage (custom type +
-  default type, com-core discovery)
+  default type, rlcore discovery)
 - `relink_benchmark.cpp` — the performance test harness you'll use to
   validate step 8 below
 
@@ -23,7 +23,7 @@ they define exactly what `RelinkNode` and friends must support:
 - **UDP by default**, fixed small header, `'#' ... '\n'` framed, optional
   checksum and optional AES-256-GCM encryption (both off by default, both
   deferred past the initial build — see below).
-- **Discovery**: two mutually-exclusive modes — `relink-com-core` (a
+- **Discovery**: two mutually-exclusive modes — `relink-rlcore` (a
   small central daemon, build this first) and multicast beacon (fully
   decentralized, build second).
 - **Hard performance requirement**: 1000Hz sustained (≤1ms/message,
@@ -45,7 +45,7 @@ they define exactly what `RelinkNode` and friends must support:
    `checksum=false` only — MTU check against ~1400-1450 byte budget,
    reject oversized messages at `publish()` with a clear error, never
    silently fragment.
-4. **`relink-com-core`**, in **both C++ and Python** (small, isolated
+4. **`relink-rlcore`**, in **both C++ and Python** (small, isolated
    scope — see spec for why this is practical to do twice from day one).
    Default port `8445` both client and daemon side. `RegisterRequest` /
    `RegisterAck`, retry-with-backoff on the client if no ACK. Test a C++
@@ -55,7 +55,7 @@ they define exactly what `RelinkNode` and friends must support:
    3x-retry on startup, sparse 30-60s re-announce, topic-matching on
    receive. Confirm it produces the same peer-table outcome as mode A did
    on the same two-node test.
-6. **Public API**: `node.set_com_core.ip(...)` / `.port(...)`,
+6. **Public API**: `node.set_rlcore.ip(...)` / `.port(...)`,
    `node.use_multicast_discovery()` — **mutually exclusive, enforced at
    the setter call itself**, not deferred to `spin()`. Neither-configured
    is also an error. Track the selected mode as an explicit enum, not by
@@ -65,7 +65,7 @@ they define exactly what `RelinkNode` and friends must support:
    `advertise<T>()`/`subscribe<T>()`/`publish<T>()`, templated,
    `static_assert(std::is_trivially_copyable<T>)`, no fixed type
    registry — any struct meeting the rules just works.
-7. **Correctness test**: two-process pub/sub over com-core, confirm
+7. **Correctness test**: two-process pub/sub over rlcore, confirm
    delivery with zero manual peer config. Include the mutual-exclusivity
    and neither-configured error tests here too.
 8. **Benchmark using `relink_benchmark.cpp`** as the harness (adapt as
@@ -92,7 +92,7 @@ they define exactly what `RelinkNode` and friends must support:
   `SecureExt`/nonce design are decided in the spec (this fixes a nonce-
   reuse bug from an earlier draft — read that section carefully if/when
   you do implement this)
-- Multi-language codegen (hand-written bindings only, beyond com-core's
+- Multi-language codegen (hand-written bindings only, beyond rlcore's
   required C++/Python pair)
 - External raw-socket client tooling beyond the wire format being
   documented
@@ -102,7 +102,7 @@ they define exactly what `RelinkNode` and friends must support:
 - Steps 1-9 above complete and passing.
 - `relink_benchmark.cpp`-style test shows worst-case ≤1ms sustained over
   60s on real wired LAN hardware (not localhost).
-- A C++ node and a Python-run `relink-com-core` can interoperate.
+- A C++ node and a Python-run `relink-rlcore` can interoperate.
 - Both discovery modes produce identical downstream behavior.
 - Zero heap allocation, zero locking in the data-thread hot path when
   `secure=false`/`checksum=false` (the default, benchmarked path).

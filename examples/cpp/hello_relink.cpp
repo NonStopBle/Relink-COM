@@ -17,16 +17,20 @@
 #include <chrono>
 #include <thread>
 
-// Every ReLink topic needs a numeric ID. Pick any number -- both sides
-// just need to agree on it, the same way both ends of the program agree
-// here by using the same constant.
-constexpr uint16_t TOPIC_HELLO = 42;
+// Every ReLink topic needs a wire id, but you don't have to hand-assign
+// a number: give advertise/subscribe/publish a human-readable name
+// instead and ReLink hashes it down to the uint32_t that actually goes
+// on the wire (see RelinkNode::topic_id_for in relink.hpp). Both sides
+// just need to type the same string -- no shared constant/header needed.
+// A numeric id (e.g. `constexpr uint32_t TOPIC_HELLO = 42;`) still works
+// exactly as before if you'd rather assign ids by hand.
+const char* TOPIC_HELLO = "/relink/hello";
 
 int main() {
     RelinkNode node;
 
     // Multicast discovery: zero setup, no daemon to run first. See
-    // comcore_pubsub.cpp for the alternative (a small daemon, useful
+    // rlcore_pubsub.cpp for the alternative (a small daemon, useful
     // when multicast isn't available on your network).
     node.use_multicast_discovery();
 
@@ -37,13 +41,18 @@ int main() {
     });
     node.advertise<Int32>(TOPIC_HELLO);
 
+    // peers_for_topic() still takes the numeric wire id -- resolve the
+    // name once via topic_id_for() (it's idempotent: calling it again
+    // with the same name just returns the same id from the registry).
+    uint32_t topic_id = node.topic_id_for(TOPIC_HELLO);
+
     int counter = 0;
     while (true) {
         node.spin_once();  // services discovery; incoming messages are
                             // delivered on their own thread, no polling
                             // needed for receiving
 
-        size_t peer_count = node.peers_for_topic(TOPIC_HELLO).size();
+        size_t peer_count = node.peers_for_topic(topic_id).size();
         if (peer_count == 0) {
             // No other copy of this program has been found yet. This is
             // normal for the first second or two -- multicast discovery

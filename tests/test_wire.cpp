@@ -23,11 +23,11 @@ static int g_failures = 0;
 
 int main() {
     // --- sizes: no padding introduced anywhere ---
-    CHECK(sizeof(RelinkHeader) == 7);
+    CHECK(sizeof(RelinkHeader) == 9);
     CHECK(sizeof(SecureExt) == 8);
     CHECK(sizeof(RegisterRequestHeader) == 8);
     CHECK(sizeof(RegisterAckHeader) == 3);
-    CHECK(sizeof(RegisterAckPeer) == 8);
+    CHECK(sizeof(RegisterAckPeer) == 10);
     CHECK(sizeof(BeaconPacketHeader) == 8);
     CHECK(sizeof(MultiArrayHeader) == 4);
 
@@ -52,28 +52,29 @@ int main() {
     // --- field offsets match the documented field order exactly ---
     RelinkHeader h{};
     CHECK(offsetof(RelinkHeader, topic_id) == 0);
-    CHECK(offsetof(RelinkHeader, seq_num) == 2);
-    CHECK(offsetof(RelinkHeader, payload_len) == 4);
-    CHECK(offsetof(RelinkHeader, flags) == 6);
+    CHECK(offsetof(RelinkHeader, seq_num) == 4);
+    CHECK(offsetof(RelinkHeader, payload_len) == 6);
+    CHECK(offsetof(RelinkHeader, flags) == 8);
 
     // --- raw byte layout check: build a header, inspect its bytes ---
-    // topic_id=0x1234, seq_num=0x5678, payload_len=0x0009, flags=0x03
-    h.topic_id = 0x1234;
+    // topic_id=0x12345678, seq_num=0x5678, payload_len=0x0009, flags=0x03
+    h.topic_id = 0x12345678;
     h.seq_num = 0x5678;
     h.payload_len = 0x0009;
     h.flags = 0x03;
 
-    uint8_t raw[7];
+    uint8_t raw[9];
     std::memcpy(raw, &h, sizeof(h));
 
     // On a little-endian host (x86/x64/ARM default), the in-memory byte
     // order of a packed struct already matches the little-endian wire
     // format documented in the spec, so memcpy is a valid "encode" step
     // without any byte-swapping needed on these platforms.
-    CHECK(raw[0] == 0x34); CHECK(raw[1] == 0x12); // topic_id LE
-    CHECK(raw[2] == 0x78); CHECK(raw[3] == 0x56); // seq_num LE
-    CHECK(raw[4] == 0x09); CHECK(raw[5] == 0x00); // payload_len LE
-    CHECK(raw[6] == 0x03);                        // flags
+    CHECK(raw[0] == 0x78); CHECK(raw[1] == 0x56); // topic_id LE
+    CHECK(raw[2] == 0x34); CHECK(raw[3] == 0x12); // topic_id LE
+    CHECK(raw[4] == 0x78); CHECK(raw[5] == 0x56); // seq_num LE
+    CHECK(raw[6] == 0x09); CHECK(raw[7] == 0x00); // payload_len LE
+    CHECK(raw[8] == 0x03);                        // flags
 
     // --- flags bit meaning ---
     CHECK(kFlagSecure == 0x01);
@@ -105,9 +106,9 @@ int main() {
     CHECK(offsetof(Int64, data) == 0);
 
     // --- MTU sanity: full plaintext frame overhead is small ---
-    // '#'(1) + header(7) + '\n'(1) = 9 bytes overhead, no secure/checksum
+    // '#'(1) + header(9) + '\n'(1) = 11 bytes overhead, no secure/checksum
     constexpr size_t kPlaintextOverhead = 1 + sizeof(RelinkHeader) + 1;
-    CHECK(kPlaintextOverhead == 9);
+    CHECK(kPlaintextOverhead == 11);
 
     if (g_failures == 0) {
         std::printf("\nALL PASS\n");

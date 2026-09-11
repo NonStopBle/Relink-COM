@@ -43,7 +43,7 @@ def check_throws(fn, desc):
 
 
 # --- wire.py ---
-check(ctypes.sizeof(RelinkHeader) == 7, "RelinkHeader is 7 bytes")
+check(ctypes.sizeof(RelinkHeader) == 9, "RelinkHeader is 9 bytes")
 check(ctypes.sizeof(Float32) == 4, "Float32 is 4 bytes")
 check(is_wire_type(Int32), "Int32 is a valid wire type")
 
@@ -130,18 +130,18 @@ send_tp.stop()
 
 # --- RelinkNode config error paths ---
 node = RelinkNode()
-node.set_com_core.ip("127.0.0.1")
-check_throws(lambda: node.use_multicast_discovery(), "mutual exclusivity: comcore then multicast")
+node.set_rlcore.ip("127.0.0.1")
+check_throws(lambda: node.use_multicast_discovery(), "mutual exclusivity: rlcore then multicast")
 
 node2 = RelinkNode()
 node2.use_multicast_discovery()
-check_throws(lambda: node2.set_com_core.ip("127.0.0.1"), "mutual exclusivity: multicast then comcore")
+check_throws(lambda: node2.set_rlcore.ip("127.0.0.1"), "mutual exclusivity: multicast then rlcore")
 
 node3 = RelinkNode()
 check_throws(lambda: node3.spin_once(), "neither configured -> throws at spin time")
 
 node4 = RelinkNode()
-node4.set_com_core.port(9000)
+node4.set_rlcore.port(9000)
 node4.advertise(100, Int32)
 check_throws(lambda: node4.publish(100, Int32(data=42)), "port without ip -> throws")
 

@@ -32,17 +32,17 @@ inline constexpr uint8_t kFlagSecure   = 0x01; // bit 0
 inline constexpr uint8_t kFlagChecksum = 0x02; // bit 1
 
 // Reserved topic id used only for NAT hole-punching keepalive datagrams
-// (see multicast/com-core NAT traversal support) -- never register a
+// (see multicast/rlcore NAT traversal support) -- never register a
 // real advertise<T>/subscribe<T> on this id. A punch datagram is a
 // normal ReLink frame with an empty payload; since no handler is ever
 // registered for this topic, UdpTransport's existing
 // "no subscriber for this topic -> drop" path silently discards it on
 // arrival, with no special-case receive logic needed.
-inline constexpr uint16_t kNatPunchTopicId = 0xFFFF;
+inline constexpr uint32_t kNatPunchTopicId = 0xFFFFFFFF;
 
 // ---------------------------------------------------------------------
-// RelinkHeader — 7 bytes on the wire, immediately after the start byte.
-//   topic_id    : uint16_t, little-endian
+// RelinkHeader — 9 bytes on the wire, immediately after the start byte.
+//   topic_id    : uint32_t, little-endian
 //   seq_num     : uint16_t, little-endian
 //   payload_len : uint16_t, little-endian — bytes of payload only, not
 //                 counting SecureExt/auth tag/checksum
@@ -50,13 +50,13 @@ inline constexpr uint16_t kNatPunchTopicId = 0xFFFF;
 // ---------------------------------------------------------------------
 #pragma pack(push, 1)
 struct RelinkHeader {
-    uint16_t topic_id;
+    uint32_t topic_id;
     uint16_t seq_num;
     uint16_t payload_len;
     uint8_t  flags;
 };
 #pragma pack(pop)
-static_assert(sizeof(RelinkHeader) == 7, "RelinkHeader must be exactly 7 bytes on the wire");
+static_assert(sizeof(RelinkHeader) == 9, "RelinkHeader must be exactly 9 bytes on the wire");
 static_assert(std::is_trivially_copyable<RelinkHeader>::value, "RelinkHeader must be trivially copyable");
 
 // ---------------------------------------------------------------------
@@ -77,7 +77,7 @@ inline constexpr size_t kAuthTagBytes = 16; // GCM auth tag, present iff secure
 inline constexpr size_t kChecksumBytes = 2; // CRC16, present iff checksum flag set
 
 // ---------------------------------------------------------------------
-// RegisterRequest / RegisterAck — mode A (com-core) discovery packets.
+// RegisterRequest / RegisterAck — mode A (rlcore) discovery packets.
 // Variable-length (topic_ids[]/peers[] are trailing arrays), so these are
 // documented as fixed prefixes here; the wire encoder appends the
 // trailing arrays manually rather than relying on a flexible array
@@ -89,7 +89,7 @@ struct RegisterRequestHeader {
                             // wire encoding below is little-endian like everything else
     uint16_t node_port;
     uint16_t topic_count;
-    // followed by topic_count * uint16_t topic_ids
+    // followed by topic_count * uint32_t topic_ids
 };
 #pragma pack(pop)
 static_assert(sizeof(RegisterRequestHeader) == 8, "RegisterRequestHeader must be exactly 8 bytes");
@@ -107,17 +107,17 @@ static_assert(sizeof(RegisterAckHeader) == 3, "RegisterAckHeader must be exactly
 struct RegisterAckPeer {
     uint32_t ip;
     uint16_t port;
-    uint16_t topic_id;
+    uint32_t topic_id;
 };
 #pragma pack(pop)
-static_assert(sizeof(RegisterAckPeer) == 8, "RegisterAckPeer must be exactly 8 bytes");
+static_assert(sizeof(RegisterAckPeer) == 10, "RegisterAckPeer must be exactly 10 bytes");
 
 // ---------------------------------------------------------------------
 // BeaconPacket — mode B (multicast) discovery packet, fixed prefix.
 //   node_ip      : uint32_t
 //   node_port    : uint16_t
 //   topic_count  : uint16_t
-//   followed by topic_count * uint16_t topic_ids
+//   followed by topic_count * uint32_t topic_ids
 // ---------------------------------------------------------------------
 #pragma pack(push, 1)
 struct BeaconPacketHeader {

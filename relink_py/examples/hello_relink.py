@@ -18,17 +18,21 @@ import time
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 from relink import RelinkNode, Int32
 
-# Every ReLink topic needs a numeric ID. Pick any number -- both sides
-# just need to agree on it, the same way both ends of the program agree
-# here by using the same constant.
-TOPIC_HELLO = 42
+# Every ReLink topic needs a wire id, but you don't have to hand-assign
+# a number: give advertise/subscribe/publish a human-readable name
+# instead and ReLink hashes it down to the uint32 that actually goes on
+# the wire (see RelinkNode._topic_id_for in node.py). Both sides just
+# need to type the same string -- no shared constant/header needed. A
+# numeric id (e.g. `TOPIC_HELLO = 42`) still works exactly as before if
+# you'd rather assign ids by hand.
+TOPIC_HELLO = "/relink/hello"
 
 
 def main():
     node = RelinkNode()
 
     # Multicast discovery: zero setup, no daemon to run first. See
-    # comcore_pubsub.py for the alternative (a small daemon, useful when
+    # rlcore_pubsub.py for the alternative (a small daemon, useful when
     # multicast isn't available on your network).
     node.use_multicast_discovery()
 
@@ -37,13 +41,18 @@ def main():
     node.subscribe(TOPIC_HELLO, Int32, lambda msg: print(f"received: {msg.data}"))
     node.advertise(TOPIC_HELLO, Int32)
 
+    # peers_for_topic() still takes the numeric wire id -- resolve the
+    # name once via _topic_id_for() (idempotent: the same name always
+    # returns the same id from the registry).
+    topic_id = node._topic_id_for(TOPIC_HELLO)
+
     counter = 0
     while True:
         node.spin_once()  # services discovery; incoming messages are
                            # delivered on their own thread, no polling
                            # needed for receiving
 
-        peers = node.peers_for_topic(TOPIC_HELLO)
+        peers = node.peers_for_topic(topic_id)
         if not peers:
             # No other copy of this program has been found yet. This is
             # normal for the first second or two -- multicast discovery

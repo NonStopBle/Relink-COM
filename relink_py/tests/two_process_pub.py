@@ -2,9 +2,9 @@
 """Cross-language interop test -- publisher side, Python. Mirrors
 tests/two_process_pub.cpp exactly (same topic/count/protocol) so it can
 be paired with either the C++ or Python subscriber to prove wire-level
-interop, not just com-core-registration interop.
+interop, not just rlcore-registration interop.
 
-usage: two_process_pub.py <comcore|multicast> [comcore_ip] <topic_id> <count>
+usage: two_process_pub.py <rlcore|multicast> [rlcore_ip] <topic_id> <count>
 """
 import sys
 import time
@@ -15,15 +15,15 @@ from relink import RelinkNode, Int32
 
 def main():
     if len(sys.argv) < 4:
-        print(f"usage: {sys.argv[0]} <comcore|multicast> [comcore_ip] <topic_id> <count>", file=sys.stderr)
+        print(f"usage: {sys.argv[0]} <rlcore|multicast> [rlcore_ip] <topic_id> <count>", file=sys.stderr)
         return 2
 
     node = RelinkNode()
     argi = 1
     mode = sys.argv[argi]; argi += 1
-    if mode == "comcore":
+    if mode == "rlcore":
         ip = sys.argv[argi]; argi += 1
-        node.set_com_core.ip(ip)
+        node.set_rlcore.ip(ip)
     elif mode == "multicast":
         node.use_multicast_discovery()
     else:

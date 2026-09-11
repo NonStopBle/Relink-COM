@@ -44,7 +44,7 @@ struct PeerInfo {
 };
 
 // Callback invoked whenever a topic's peer is discovered or updated.
-using PeerDiscoveredCallback = std::function<void(uint16_t topic_id, const PeerInfo& peer)>;
+using PeerDiscoveredCallback = std::function<void(uint32_t topic_id, const PeerInfo& peer)>;
 
 struct MulticastDiscoveryConfig {
     std::string group_ip = kDefaultMulticastGroup;
@@ -55,7 +55,7 @@ struct MulticastDiscoveryConfig {
 
     // Topics this node publishes OR subscribes to -- beaconed as interest,
     // per spec ("Subscribers beacon their own topic interest too").
-    std::vector<uint16_t> local_topics;
+    std::vector<uint32_t> local_topics;
 
     // Spec defaults: 3x jittered startup burst (0-200ms between sends),
     // then sparse 30-60s re-announce. Tests override these to be fast.
@@ -94,7 +94,7 @@ public:
     }
 
     // Snapshot of the current peer table for one topic (empty if none).
-    std::vector<PeerInfo> peers_for_topic(uint16_t topic_id) {
+    std::vector<PeerInfo> peers_for_topic(uint32_t topic_id) {
         std::lock_guard<std::mutex> lock(table_mutex_);
         std::vector<PeerInfo> result;
         auto it = table_.find(topic_id);
@@ -231,7 +231,7 @@ private:
             if (b.node_ip == cfg_.self_ip && b.node_port == cfg_.self_data_port) continue;
 
             for (uint16_t i = 0; i < b.topic_count; ++i) {
-                uint16_t topic = beacon_topic_at(b, i);
+                uint32_t topic = beacon_topic_at(b, i);
                 if (!local_topics_.count(topic)) continue; // no overlap: discard, keep no state
 
                 PeerInfo peer{b.node_ip, b.node_port};
@@ -250,7 +250,7 @@ private:
     }
 
     MulticastDiscoveryConfig cfg_;
-    std::unordered_set<uint16_t> local_topics_{cfg_.local_topics.begin(), cfg_.local_topics.end()};
+    std::unordered_set<uint32_t> local_topics_{cfg_.local_topics.begin(), cfg_.local_topics.end()};
 
     std::atomic<bool> running_{false};
     int send_sock_ = -1;
@@ -264,7 +264,7 @@ private:
         }
     };
     std::mutex table_mutex_;
-    std::unordered_map<uint16_t, std::unordered_map<std::pair<uint32_t, uint16_t>, bool, PairHash>> table_;
+    std::unordered_map<uint32_t, std::unordered_map<std::pair<uint32_t, uint16_t>, bool, PairHash>> table_;
 
     PeerDiscoveredCallback on_peer_discovered_;
 };

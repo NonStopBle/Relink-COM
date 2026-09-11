@@ -128,12 +128,12 @@ static void run_subscriber(RelinkNode& node) {
 
 int main(int argc, char** argv) {
     if (argc < 2) {
-        std::fprintf(stderr, "usage: %s [pub|sub] [com_core_ip]\n", argv[0]);
+        std::fprintf(stderr, "usage: %s [pub|sub] [rlcore_ip]\n", argv[0]);
         return 1;
     }
     RelinkNode node;
     if (argc > 2) {
-        node.set_com_core.ip(argv[2]);
+        node.set_rlcore.ip(argv[2]);
     } else {
         node.use_multicast_discovery();
     }

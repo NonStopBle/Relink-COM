@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""ReLink usage example -- publisher + subscriber, mode A (com-core).
+"""ReLink usage example -- publisher + subscriber, mode A (rlcore).
 Python equivalent of relink_example.cpp: same topics, same message
 shapes, same discovery mode, to demonstrate the two bindings talk the
 same wire protocol.
@@ -37,14 +37,14 @@ def now_us() -> int:
 
 def main():
     if len(sys.argv) < 2:
-        print(f"usage: {sys.argv[0]} [pub|sub] [com_core_ip]", file=sys.stderr)
+        print(f"usage: {sys.argv[0]} [pub|sub] [rlcore_ip]", file=sys.stderr)
         return 1
     is_publisher = sys.argv[1] == "pub"
-    com_core_ip = sys.argv[2] if len(sys.argv) > 2 else "10.0.0.5"
+    rlcore_ip = sys.argv[2] if len(sys.argv) > 2 else "10.0.0.5"
 
     node = RelinkNode()
-    node.set_com_core.ip(com_core_ip)
-    # node.set_com_core.port(9000)  # only if com-core uses a non-default port
+    node.set_rlcore.ip(rlcore_ip)
+    # node.set_rlcore.port(9000)  # only if rlcore uses a non-default port
 
     if is_publisher:
         node.advertise(TOPIC_IMU, ImuReading)

@@ -1,7 +1,7 @@
 // Step 3 (part 2): raw UDP send/receive core, running on its own
 // dedicated data thread, per relink-com-spec.md's "Threading and core
 // allocation" section. This step builds only the data path
-// (secure=false, checksum=false); discovery (com-core/multicast) is
+// (secure=false, checksum=false); discovery (rlcore/multicast) is
 // steps 4-5, and the templated advertise/subscribe/publish<T> API is
 // step 6. Here the "topic" concept is just a numeric ID with a raw
 // byte-payload callback -- typed dispatch is layered on top later.
@@ -122,9 +122,9 @@ public:
     }
 
     // Exposes the underlying socket fd, needed ONLY so callers (namely
-    // RelinkNode's com-core registration step) can reuse this exact
+    // RelinkNode's rlcore registration step) can reuse this exact
     // socket for a pre-start() synchronous request/reply, keeping the
-    // NAT-mapped source port com-core observes consistent with the port
+    // NAT-mapped source port rlcore observes consistent with the port
     // this transport will actually receive data on. Safe to use before
     // start() launches the dedicated data thread; not meant for general
     // use once the thread is running (it owns recv from that point on).
@@ -135,7 +135,7 @@ public:
     // (v1: no locking needed here since registration happens before the
     // data thread starts, consistent with the spec's "type fixed per
     // topic at registration" design).
-    void set_topic_handler(uint16_t topic_id, RawTopicCallback cb) {
+    void set_topic_handler(uint32_t topic_id, RawTopicCallback cb) {
         std::lock_guard<std::mutex> lock(handlers_mutex_);
         handlers_[topic_id] = std::move(cb);
     }
@@ -143,7 +143,7 @@ public:
     // Send one datagram to `peer`. Returns false (and does not send) if
     // payload_len exceeds the MTU budget -- reject loudly, never
     // silently truncate/fragment, per spec.
-    bool publish_raw(uint16_t topic_id, const void* payload, size_t payload_len,
+    bool publish_raw(uint32_t topic_id, const void* payload, size_t payload_len,
                       const PeerAddr& peer) {
         size_t frame_len = 0;
         uint16_t seq = seq_counter_.fetch_add(1, std::memory_order_relaxed);
@@ -174,7 +174,7 @@ public:
     // to the kernel directly -- no userspace copy of either, only the
     // 9 fixed framing bytes ('#' + 7-byte header + '\n') are ever
     // assembled locally.
-    bool publish_scattered(uint16_t topic_id, const void* extra_header, size_t extra_header_len,
+    bool publish_scattered(uint32_t topic_id, const void* extra_header, size_t extra_header_len,
                             const void* data, size_t data_len, const PeerAddr& peer) {
         size_t payload_len = extra_header_len + data_len;
         if (payload_len > kMaxPayloadBytes) return false;
@@ -329,7 +329,7 @@ private:
     std::atomic<uint16_t> seq_counter_{0};
 
     std::mutex handlers_mutex_;
-    std::unordered_map<uint16_t, RawTopicCallback> handlers_;
+    std::unordered_map<uint32_t, RawTopicCallback> handlers_;
 
     uint8_t send_buf_[kMaxFrameBytes];
     uint8_t recv_buf_[kMaxFrameBytes];

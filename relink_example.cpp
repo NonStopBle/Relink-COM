@@ -1,4 +1,4 @@
-// ReLink-com usage example — publisher + subscriber, mode A (com-core)
+// ReLink-com usage example — publisher + subscriber, mode A (rlcore)
 //
 // This is USAGE code showing how an application would call the ReLink API
 // once it's built per relink-com-spec.md. It is not the library
@@ -45,15 +45,15 @@ int main(int argc, char** argv) {
 
     RelinkNode node;
 
-    // --- discovery config: mode A (com-core), per spec ---
-    // Both processes point at the same com-core instance. Port defaults
-    // to 8445, so it's not set explicitly here unless com-core was
+    // --- discovery config: mode A (rlcore), per spec ---
+    // Both processes point at the same rlcore instance. Port defaults
+    // to 8445, so it's not set explicitly here unless rlcore was
     // started on a different port.
-    node.set_com_core.ip("10.0.0.5");
-    // node.set_com_core.port(9000);  // only if com-core uses a non-default port
+    node.set_rlcore.ip("10.0.0.5");
+    // node.set_rlcore.port(9000);  // only if rlcore uses a non-default port
 
     // NOTE: calling node.use_multicast_discovery() here too would be a
-    // configuration error (mutually exclusive with com-core) — see spec.
+    // configuration error (mutually exclusive with rlcore) — see spec.
 
     if (is_publisher) {
         // --- publisher side ---

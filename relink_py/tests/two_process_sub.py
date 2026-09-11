@@ -2,7 +2,7 @@
 """Cross-language interop test -- subscriber side, Python. Mirrors
 tests/two_process_sub.cpp exactly.
 
-usage: two_process_sub.py <comcore|multicast> [comcore_ip] <topic_id> <expected_count> <timeout_sec>
+usage: two_process_sub.py <rlcore|multicast> [rlcore_ip] <topic_id> <expected_count> <timeout_sec>
 """
 import sys
 import threading
@@ -14,16 +14,16 @@ from relink import RelinkNode, Int32
 
 def main():
     if len(sys.argv) < 5:
-        print(f"usage: {sys.argv[0]} <comcore|multicast> [comcore_ip] <topic_id> <expected_count> <timeout_sec>",
+        print(f"usage: {sys.argv[0]} <rlcore|multicast> [rlcore_ip] <topic_id> <expected_count> <timeout_sec>",
               file=sys.stderr)
         return 2
 
     node = RelinkNode()
     argi = 1
     mode = sys.argv[argi]; argi += 1
-    if mode == "comcore":
+    if mode == "rlcore":
         ip = sys.argv[argi]; argi += 1
-        node.set_com_core.ip(ip)
+        node.set_rlcore.ip(ip)
     elif mode == "multicast":
         node.use_multicast_discovery()
     else:
