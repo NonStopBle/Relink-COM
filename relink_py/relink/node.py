@@ -174,7 +174,18 @@ class RelinkNode:
         image whose chunks arrive incompletely before the next one
         starts is silently dropped -- no retransmission, matching
         ReLink's UDP design throughout (see image.py's ImageReassembler
-        and examples/camera_stream.py's measured reliability numbers)."""
+        and examples/camera_stream.py's measured reliability numbers).
+
+        IMPORTANT: like every subscribe() callback, this runs inline on
+        ReLink's one data thread -- a slow callback (JPEG decode, disk
+        I/O, ML inference) blocks recv() from draining the socket at
+        all. The socket's larger receive buffer (see udp_transport.py)
+        buys some slack for a short burst, but it is NOT a substitute
+        for a fast callback: measured with a 50ms/frame callback against
+        a faster publisher, per-frame latency grew linearly and delivery
+        eventually collapsed once the backlog outran the buffer. If your
+        work is slow, hand it off to your own worker thread/queue
+        instead of doing it here."""
         reassembler = ImageReassembler(callback)
         self.subscribe(topic_id, ImageChunk, reassembler.on_chunk)
 

@@ -94,7 +94,19 @@ instead of multicast) that works around that.
   buffer (best-effort, silently falls back to the OS default if it's
   refused) so a several-hundred-chunk burst has room to sit in the
   kernel queue instead of overflowing and silently dropping the tail of
-  the image.
+  the image. **This buffer trades drops for latency, not a free win**:
+  it only helps with short bursts a fast subscriber will drain in time.
+  Measured with a subscriber callback that takes 50ms/frame (a
+  realistic JPEG-decode-and-process cost) against a sender producing
+  faster than that, per-frame latency grew linearly (54ms, 104ms,
+  153ms, ...) and delivery still eventually collapsed once the backlog
+  exceeded the buffer — a bigger buffer only postpones that, it doesn't
+  fix a subscriber that's slower than the publish rate. Since
+  subscriber callbacks run inline on ReLink's one data thread (see
+  Dedicated data thread below), the actual fix for a slow consumer is
+  to keep `subscribe_image`'s callback fast — hand heavy work
+  (decoding, disk I/O, ML inference) off to your own worker thread/queue
+  instead of doing it inside the callback.
 - **Dedicated data thread**, zero heap allocation and zero locking in the
   benchmarked hot path, with opt-in CPU pinning and `SCHED_FIFO` for
   real-time tail-latency control.

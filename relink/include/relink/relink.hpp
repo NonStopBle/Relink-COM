@@ -151,6 +151,17 @@ public:
     // is silently dropped -- no retransmission, matching ReLink's UDP
     // design throughout (see image.hpp's ImageReassembler and
     // examples/cpp/camera_stream.cpp's measured reliability numbers).
+    //
+    // IMPORTANT: like every subscribe<T>() callback, this runs inline on
+    // ReLink's one data thread -- a slow callback (JPEG decode, disk
+    // I/O, ML inference) blocks recv() from draining the socket at all.
+    // The socket's larger receive buffer (see udp_transport.hpp) buys
+    // some slack for a short burst, but it is NOT a substitute for a
+    // fast callback: measured with a 50ms/frame callback against a
+    // faster publisher, per-frame latency grew linearly and delivery
+    // eventually collapsed once the backlog outran the buffer. If your
+    // work is slow, hand it off to your own worker thread/queue instead
+    // of doing it here.
     template <typename Callback>
     void subscribe_image(uint16_t topic_id, Callback callback) {
         auto reassembler = std::make_shared<ImageReassembler>(
