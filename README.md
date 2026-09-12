@@ -345,6 +345,18 @@ python3 rlcore/relink_rlcore.py --port 8445 [--nat]
 Either build works with either language's nodes — same wire protocol.
 `--nat` enables UDP NAT traversal (Step 13).
 
+Relay fallback (Step 13), only needed when direct hole punching can't
+cross a NAT at all:
+
+```bash
+# C++
+g++ -std=c++17 -O2 -I relink/include -pthread rlcore/relink_relay.cpp -o relink-relay
+./relink-relay [port]   # default 8446
+
+# Python
+python3 rlcore/relink_relay.py [port]
+```
+
 ---
 
 ## Step 10 — All examples
@@ -485,8 +497,43 @@ still delivered zero packets in that direction, and a packet capture on
 the receiving host's own network interface confirmed the inbound side's
 NAT was dropping them before they ever arrived (not a local firewall —
 `ufw` was inactive throughout). No amount of client-side retrying opens
-a path that was never open; that case needs a relay/TURN-style fallback,
-which ReLink does not currently implement.
+a path that was never open; that case needs a relay/TURN-style fallback
+— see below.
+
+**Relay fallback, for NATs punching can't cross at all.** Run
+`relink-relay` (C++, `rlcore/relink_relay.cpp`) or `relink_relay.py`
+(pure Python, no compiler needed) on a host both nodes can reach — the
+same box running `relink-rlcore --nat` works fine. Then call
+`node.set_relay(ip, port = 8446)` on every node that needs it, before
+`spin()`/`publish()` traffic. A relay reaches nodes direct punching
+structurally cannot, because both clients only ever open a NAT mapping
+toward the relay's one fixed `(ip, port)`, never toward each other — the
+relay's replies always come from that exact remote endpoint, which is
+exactly the case every stateful NAT/firewall allows back in (the same
+mechanism that lets `relink-rlcore` itself register successfully from
+behind a NAT).
+
+This is a redundant *second* path, not a detect-failure-then-switch one:
+once enabled, every `publish()` also goes to the relay, and every
+topic's socket also registers with (and is kept alive at) the relay, the
+whole time — direct hole punching keeps running exactly as before. A
+subscriber that receives the same message from both paths silently
+drops the second copy, matched by `seq_num` — a genuine duplicate can
+never be mistaken for a new message, since a `seq_num` is assigned once
+per `publish()` call and never reused. This trades a bit of constant
+relay bandwidth for not needing an ack protocol to detect whether direct
+delivery actually worked.
+
+Performance: the relay never re-encodes a frame — it forwards the exact
+bytes `recvfrom` already put in its buffer, peeking only the `topic_id`
+that's already sitting in `RelinkHeader` at a fixed offset, so a
+forwarded frame decodes on the receiving end identically to a direct one
+(same `seq_num`, same payload). The C++ relay reuses one fixed buffer
+for every forward — no heap allocation on the forwarding path at all.
+`Image` never goes through the relay (like `set_multiplex(false)`, it
+always stays off this path — a several-hundred-chunk burst mirrored
+through a relay would be expensive for little benefit; a dropped Image
+frame is already tolerated, see the troubleshooting table below).
 
 ## Step 14 — Troubleshooting
 
@@ -514,6 +561,7 @@ which ReLink does not currently implement.
 | Mode A discovery (rlcore) | ✅ | ✅ |
 | Mode B discovery (multicast) | ✅ | ✅ |
 | UDP NAT traversal | ✅ | ✅ |
+| Relay fallback (`set_relay`) | ✅ | ✅ |
 | `Image` type (chunk + reassemble) | ✅ | ✅ |
 | Zero-copy image chunk send/recv | ✅ (`sendmsg`) | ✅ (`socket.sendmsg`) |
 | CPU pinning / `SCHED_FIFO` data thread | ✅ | — (not applicable to CPython's threading model) |
@@ -532,10 +580,13 @@ relink/include/relink/     C++ library (header-only)
   register.hpp / rlcore_client.hpp     mode A (rlcore) client
   beacon.hpp / multicast_discovery.hpp  mode B (multicast) client
   relink.hpp                  RelinkNode -- the public API
+  relay_wire.hpp               relay fallback wire helpers (Step 13)
 
 rlcore/
   relink_rlcore.cpp          registration daemon, C++ build
   relink_rlcore.py           registration daemon, Python build (byte-identical protocol)
+  relink_relay.cpp           relay fallback daemon, C++ build (Step 13)
+  relink_relay.py            relay fallback daemon, Python build (byte-identical protocol)
 
 relink_py/relink/           Python library (stdlib-only: ctypes + socket + struct)
   (mirrors the C++ layer-for-layer, see relink_py/README.md)

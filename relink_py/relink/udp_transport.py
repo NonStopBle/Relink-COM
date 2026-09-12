@@ -45,6 +45,8 @@ class UdpTransport:
         self._handlers: Dict[int, RawTopicCallback] = {}
         self._seq = 0
         self._seq_lock = threading.Lock()
+        self._relay_dedup_enabled = False
+        self._last_delivered_seq: Dict[int, int] = {}  # topic_id -> seq_num, recv-thread-only
         self._want_large_buffers = False
 
     def enable_large_buffers(self):
@@ -105,10 +107,22 @@ class UdpTransport:
         with self._handlers_lock:
             self._handlers[topic_id] = callback
 
-    def publish_raw(self, topic_id: int, payload: bytes, peer: PeerAddr) -> bool:
+    def next_seq(self) -> int:
+        """Draws a fresh seq_num without sending -- so a caller that will
+        send the SAME logical message to several destinations (e.g.
+        every direct peer, plus a relay fallback copy) can give them all
+        the same seq_num via publish_raw's `seq` parameter. That's what
+        lets a relay-dedup-enabled receiver recognize direct and relayed
+        copies of one publish() call as the same message rather than
+        two."""
         with self._seq_lock:
             seq = self._seq
             self._seq = (self._seq + 1) & 0xFFFF
+            return seq
+
+    def publish_raw(self, topic_id: int, payload: bytes, peer: PeerAddr, seq: Optional[int] = None) -> bool:
+        if seq is None:
+            seq = self.next_seq()
         try:
             frame = encode_frame(topic_id, seq, payload)
         except FrameError:
@@ -118,6 +132,15 @@ class UdpTransport:
             return True
         except OSError:
             return False
+
+    def enable_relay_dedup(self):
+        """Opts this transport into dropping an exact-duplicate seq_num
+        per topic before it reaches the subscriber callback. Off by
+        default -- only relay fallback turns this on, since that's the
+        one case where the SAME message can legitimately arrive twice on
+        the same socket (once direct, once relayed). See relink.hpp's
+        enable_relay_dedup() for the full rationale."""
+        self._relay_dedup_enabled = True
 
     def publish_scattered(self, topic_id: int, extra_header: bytes,
                            data, peer: PeerAddr) -> bool:
@@ -187,6 +210,11 @@ class UdpTransport:
             frame = decode_frame(data)
         except FrameError:
             return False  # drop silently, per spec
+
+        if self._relay_dedup_enabled:
+            if self._last_delivered_seq.get(frame.topic_id) == frame.seq_num:
+                return True  # exact duplicate (direct + relay both delivered it) -- drop
+            self._last_delivered_seq[frame.topic_id] = frame.seq_num
 
         with self._handlers_lock:
             handler = self._handlers.get(frame.topic_id)

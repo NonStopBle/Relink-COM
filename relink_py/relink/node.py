@@ -23,6 +23,7 @@ from .multicast_discovery import (
 from .register import RLCORE_DEFAULT_PORT
 from .topic_directory import TopicDirEntry
 from . import topic_directory as tdir
+from .relay_wire import RELAY_DEFAULT_PORT, encode_relay_register
 from .image import (
     ImageChunk, encode_image_chunks, ImageReassembler, ImageTooLargeError,
     MAX_IMAGE_BYTES, IMAGE_CHUNK_DATA_BYTES, IMAGE_CHUNK_HEADER_BYTES,
@@ -107,6 +108,12 @@ class RelinkNode:
         self._repunch_stop = threading.Event()
         self._repunch_thread: Optional[threading.Thread] = None
 
+        self._relay_enabled = False
+        self._relay_ip = 0
+        self._relay_port = RELAY_DEFAULT_PORT
+        self._relay_stop = threading.Event()
+        self._relay_thread: Optional[threading.Thread] = None
+
     # --- mode B, mutually exclusive with mode A ---
     def use_multicast_discovery(self):
         self._select_mode(DiscoveryMode.MULTICAST)
@@ -155,6 +162,51 @@ class RelinkNode:
                 for _ in range(3):
                     via.publish_raw(NAT_PUNCH_TOPIC_ID, b"", p)
                     time.sleep(0.03)
+
+    def set_relay(self, ip: str, port: int = RELAY_DEFAULT_PORT):
+        """Relay fallback for when direct peer-to-peer hole punching
+        cannot cross a NAT/firewall at all -- a real, verified failure
+        mode (see README Step 13): some NATs (mobile carriers
+        especially) drop unsolicited inbound UDP from a third party
+        regardless of punch timing. A relay works there because both
+        clients only ever open a NAT mapping toward the relay's one
+        fixed (ip, port), never toward each other -- the relay's replies
+        always come from that exact remote endpoint, which every
+        stateful NAT/firewall allows back in, by definition.
+
+        This is a redundant SECOND path, not a detect-failure-then-
+        switch one: once enabled, every publish also goes to the relay,
+        and every topic's socket also registers with (and is kept alive
+        at) the relay, all the time -- direct punching still runs
+        exactly as before. A subscriber that gets the same message from
+        both paths silently drops the second copy (matched by seq_num,
+        see UdpTransport.enable_relay_dedup()). Call before
+        spin()/publish() traffic; must be paired with a relink-relay
+        daemon running at `ip:port`. See relink.hpp's set_relay() for
+        the full rationale."""
+        self._relay_enabled = True
+        self._relay_ip = ipv4_to_host_order(ip)
+        self._relay_port = port
+
+    def _relay_peer(self) -> PeerAddr:
+        return PeerAddr(self._relay_ip, self._relay_port)
+
+    def _register_all_topics_with_relay(self, groups):
+        for t, group_topics in groups:
+            t.enable_relay_dedup()
+            for topic in group_topics:
+                pkt = encode_relay_register(topic)
+                try:
+                    t.sock.sendto(pkt, (host_order_to_ipv4(self._relay_ip), self._relay_port))
+                except OSError:
+                    pass
+
+    def _relay_keepalive_loop(self, groups):
+        # Must outpace the relay daemon's MEMBER_TTL_SECONDS (30s) by a
+        # comfortable margin so a scheduling hiccup doesn't drop this
+        # node out of a topic's forwarding group.
+        while not self._relay_stop.wait(10.0):
+            self._register_all_topics_with_relay(groups)
 
     def _transport_for(self, topic_id: int) -> UdpTransport:
         if self._multiplex:
@@ -281,9 +333,12 @@ class RelinkNode:
         with self._peers_lock:
             peers = list(self._peers.get(topic_id, []))
         t = self._transport_for(topic_id)
+        seq = t.next_seq()  # shared across every direct peer AND the relay copy
         all_ok = True
         for peer in peers:
-            all_ok = t.publish_raw(topic_id, payload, peer) and all_ok
+            all_ok = t.publish_raw(topic_id, payload, peer, seq) and all_ok
+        if self._relay_enabled:
+            t.publish_raw(topic_id, payload, self._relay_peer(), seq)
         return all_ok and bool(peers)
 
     # --- publish: sends to every currently-known peer for this topic ---
@@ -294,9 +349,12 @@ class RelinkNode:
             peers = list(self._peers.get(topic_id, []))
         payload = bytes(value)
         t = self._transport if type(value) is ImageChunk else self._transport_for(topic_id)
+        seq = t.next_seq()  # shared across every direct peer AND the relay copy
         all_ok = True
         for peer in peers:
-            all_ok = t.publish_raw(topic_id, payload, peer) and all_ok
+            all_ok = t.publish_raw(topic_id, payload, peer, seq) and all_ok
+        if self._relay_enabled and type(value) is not ImageChunk:
+            t.publish_raw(topic_id, payload, self._relay_peer(), seq)
         return all_ok
 
     # --- Image: a library-provided large-blob type, automatically
@@ -558,5 +616,10 @@ class RelinkNode:
             if self._repunch_enabled:
                 self._repunch_thread = threading.Thread(target=self._repunch_loop, daemon=True)
                 self._repunch_thread.start()
+
+            if self._relay_enabled:
+                self._register_all_topics_with_relay(groups)  # immediate, don't wait for the first keepalive tick
+                self._relay_thread = threading.Thread(target=self._relay_keepalive_loop, args=(groups,), daemon=True)
+                self._relay_thread.start()
 
             self._started = True

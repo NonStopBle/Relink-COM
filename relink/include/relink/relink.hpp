@@ -13,6 +13,7 @@
 #include "relink/topic_hash.hpp"
 #include "relink/topic_directory.hpp"
 #include "relink/standard_msgs.hpp"
+#include "relink/relay_wire.hpp"
 #include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
@@ -97,6 +98,8 @@ public:
     ~RelinkNode() {
         repunch_stop_ = true;
         if (repunch_thread_.joinable()) repunch_thread_.join();
+        relay_stop_ = true;
+        if (relay_keepalive_thread_.joinable()) relay_keepalive_thread_.join();
     }
 
     // Opt-in background re-punch: instead of firing the NAT hole-punch
@@ -115,6 +118,34 @@ public:
     void enable_nat_repunch(double interval_seconds = 5.0) {
         repunch_enabled_ = true;
         repunch_interval_ = std::chrono::duration<double>(interval_seconds);
+    }
+
+    // Relay fallback for when direct peer-to-peer hole punching cannot
+    // cross a NAT/firewall at all -- a real, verified failure mode (see
+    // README Step 13): some NATs (mobile carriers especially) drop
+    // unsolicited inbound UDP from a third party regardless of punch
+    // timing. A relay works there because both clients only ever open a
+    // NAT mapping toward the relay's one fixed (ip, port), never toward
+    // each other -- the relay's replies always come from that exact
+    // remote endpoint, which every stateful NAT/firewall allows back in,
+    // by definition.
+    //
+    // This is a redundant SECOND path, not a detect-failure-then-switch
+    // one: once enabled, every publish also goes to the relay, and
+    // every topic's socket also registers with (and is kept alive at)
+    // the relay, all the time -- direct punching still runs exactly as
+    // before. This trades a bit of extra relay bandwidth for not having
+    // to reliably detect "did direct delivery actually work", which
+    // would need an ack protocol; a subscriber that gets the same
+    // message from both paths silently drops the second copy (matched
+    // by seq_num, see UdpTransport::enable_relay_dedup()), so enabling
+    // this is safe to leave on rather than something to toggle per
+    // failure. Call before spin()/publish() traffic; must be paired
+    // with a relink-relay daemon running at `ip:port`.
+    void set_relay(const std::string& ip, uint16_t port = kRelayDefaultPort) {
+        relay_enabled_ = true;
+        relay_ip_ = ipv4_to_host_order(ip);
+        relay_port_ = port;
     }
 
     // --- named topics: hash a human-readable topic name down to the
@@ -286,10 +317,12 @@ public:
             if (it != peers_.end()) peers = it->second;
         }
         UdpTransport& t = transport_for(topic_id);
+        uint16_t seq = t.next_seq(); // shared across every direct peer AND the relay copy
         bool all_ok = true;
         for (const auto& peer : peers) {
-            all_ok = t.publish_raw(topic_id, payload, payload_len, peer) && all_ok;
+            all_ok = t.publish_raw(topic_id, payload, payload_len, peer, seq) && all_ok;
         }
+        if (relay_enabled_) t.publish_raw(topic_id, payload, payload_len, relay_peer(), seq);
         return all_ok && !peers.empty();
     }
 
@@ -312,9 +345,13 @@ public:
             if (it != peers_.end()) peers = it->second;
         }
         UdpTransport& t = std::is_same<T, ImageChunk>::value ? transport_ : transport_for(topic_id);
+        uint16_t seq = t.next_seq(); // shared across every direct peer AND the relay copy
         bool all_ok = true;
         for (const auto& peer : peers) {
-            all_ok = t.publish_raw(topic_id, &value, sizeof(T), peer) && all_ok;
+            all_ok = t.publish_raw(topic_id, &value, sizeof(T), peer, seq) && all_ok;
+        }
+        if (relay_enabled_ && !std::is_same<T, ImageChunk>::value) {
+            t.publish_raw(topic_id, &value, sizeof(T), relay_peer(), seq);
         }
         return all_ok;
     }
@@ -729,6 +766,14 @@ private:
 
         if (repunch_enabled_) start_repunch_thread();
 
+        if (relay_enabled_) {
+            std::vector<std::pair<UdpTransport*, std::vector<uint32_t>>> relay_groups;
+            relay_groups.reserve(groups.size());
+            for (const auto& g : groups) relay_groups.emplace_back(g.transport, g.topics);
+            register_all_topics_with_relay(relay_groups); // immediate, don't wait for the first keepalive tick
+            start_relay_keepalive_thread(std::move(relay_groups));
+        }
+
         started_ = true;
     }
 
@@ -794,6 +839,50 @@ private:
     std::chrono::duration<double> repunch_interval_{5.0};
     std::atomic<bool> repunch_stop_{false};
     std::thread repunch_thread_;
+
+    bool relay_enabled_ = false;
+    uint32_t relay_ip_ = 0;
+    uint16_t relay_port_ = kRelayDefaultPort;
+    std::atomic<bool> relay_stop_{false};
+    std::thread relay_keepalive_thread_;
+
+    PeerAddr relay_peer() const { return PeerAddr{relay_ip_, relay_port_}; }
+
+    // Registers (and, via the keepalive thread, keeps registered) every
+    // topic-owning transport with the relay -- one REGISTER packet per
+    // (transport, topic) pair, sent from that exact transport's socket
+    // so the relay's forwarded copies land on the same socket that
+    // topic's direct traffic already listens on. Also turns on that
+    // transport's dedup filter, since it's now a candidate to receive
+    // the same message twice.
+    void register_all_topics_with_relay(const std::vector<std::pair<UdpTransport*, std::vector<uint32_t>>>& groups) {
+        uint8_t buf[8];
+        for (const auto& g : groups) {
+            g.first->enable_relay_dedup();
+            for (uint32_t topic : g.second) {
+                size_t len = encode_relay_register(topic, buf, sizeof(buf));
+                struct sockaddr_in dest{};
+                dest.sin_family = AF_INET;
+                dest.sin_addr.s_addr = htonl(relay_ip_);
+                dest.sin_port = htons(relay_port_);
+                ::sendto(g.first->native_handle(), buf, len, 0,
+                         reinterpret_cast<struct sockaddr*>(&dest), sizeof(dest));
+            }
+        }
+    }
+
+    void start_relay_keepalive_thread(std::vector<std::pair<UdpTransport*, std::vector<uint32_t>>> groups) {
+        relay_keepalive_thread_ = std::thread([this, groups = std::move(groups)] {
+            // Must outpace the relay daemon's kMemberTtlSeconds (30s) by
+            // a comfortable margin so a scheduling hiccup doesn't drop
+            // this node out of a topic's forwarding group.
+            while (!relay_stop_.load()) {
+                std::this_thread::sleep_for(std::chrono::seconds(10));
+                if (relay_stop_.load()) break;
+                register_all_topics_with_relay(groups);
+            }
+        });
+    }
 
     void start_repunch_thread() {
         repunch_thread_ = std::thread([this] {

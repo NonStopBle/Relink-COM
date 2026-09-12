@@ -140,13 +140,40 @@ public:
         handlers_[topic_id] = std::move(cb);
     }
 
+    // Opts this transport into dropping an exact-duplicate seq_num per
+    // topic before it reaches the subscriber callback. Off by default
+    // (extra map lookup on every receive) -- only relay fallback (see
+    // relay_wire.hpp) turns this on, since that's the one case where the
+    // SAME message can legitimately arrive twice on the same socket
+    // (once direct, once relayed). A message's seq_num is assigned once
+    // by the sender's monotonic per-transport counter and never reused
+    // for a different payload, so "same topic, same seq_num as the last
+    // one delivered" is a safe duplicate signal without needing to
+    // inspect payload bytes.
+    void enable_relay_dedup() { relay_dedup_enabled_ = true; }
+
     // Send one datagram to `peer`. Returns false (and does not send) if
     // payload_len exceeds the MTU budget -- reject loudly, never
     // silently truncate/fragment, per spec.
     bool publish_raw(uint32_t topic_id, const void* payload, size_t payload_len,
                       const PeerAddr& peer) {
+        return publish_raw(topic_id, payload, payload_len, peer,
+                            seq_counter_.fetch_add(1, std::memory_order_relaxed));
+    }
+
+    // Draws a fresh seq_num without sending -- so a caller that will
+    // send the SAME logical message to several destinations (e.g. every
+    // direct peer, plus a relay fallback copy) can give them all the
+    // same seq_num via the overload below. That's what lets a
+    // relay-dedup-enabled receiver recognize "direct and relayed copies
+    // of one publish() call" as the same message rather than two.
+    uint16_t next_seq() { return seq_counter_.fetch_add(1, std::memory_order_relaxed); }
+
+    // Same as publish_raw() above but with an explicit seq_num instead
+    // of drawing a new one -- see next_seq().
+    bool publish_raw(uint32_t topic_id, const void* payload, size_t payload_len,
+                      const PeerAddr& peer, uint16_t seq) {
         size_t frame_len = 0;
-        uint16_t seq = seq_counter_.fetch_add(1, std::memory_order_relaxed);
         EncodeResult r = encode_frame(topic_id, seq, payload, payload_len,
                                        send_buf_, sizeof(send_buf_), &frame_len);
         if (r != EncodeResult::Ok) {
@@ -305,6 +332,14 @@ private:
             return false; // drop silently, per spec
         }
 
+        if (relay_dedup_enabled_) {
+            auto it = last_delivered_seq_.find(frame.header.topic_id);
+            if (it != last_delivered_seq_.end() && it->second == frame.header.seq_num) {
+                return true; // exact duplicate (direct + relay both delivered it) -- drop
+            }
+            last_delivered_seq_[frame.header.topic_id] = frame.header.seq_num;
+        }
+
         RawTopicCallback cb;
         {
             std::lock_guard<std::mutex> lock(handlers_mutex_);
@@ -330,6 +365,9 @@ private:
 
     std::mutex handlers_mutex_;
     std::unordered_map<uint32_t, RawTopicCallback> handlers_;
+
+    bool relay_dedup_enabled_ = false;
+    std::unordered_map<uint32_t, uint16_t> last_delivered_seq_; // topic_id -> seq_num, recv-thread-only
 
     uint8_t send_buf_[kMaxFrameBytes];
     uint8_t recv_buf_[kMaxFrameBytes];
