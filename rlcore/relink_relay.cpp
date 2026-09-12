@@ -27,7 +27,25 @@
 #include <arpa/inet.h>
 #include <unistd.h>
 
+#ifdef RELINK_ENABLE_XDP
+#include "xdp/relay_xdp.hpp"
+#include <csignal>
+#endif
+
 using namespace relink;
+
+#ifdef RELINK_ENABLE_XDP
+namespace {
+// Global only so the signal handler (which can't take a capture) can
+// reach it -- detach() is idempotent, so double-calling on a
+// destructor+handler race is harmless.
+relink::RelayXdp* g_xdp_for_signal = nullptr;
+void handle_signal(int) {
+    if (g_xdp_for_signal) g_xdp_for_signal->detach();
+    std::_Exit(1);
+}
+} // namespace
+#endif
 
 namespace {
 
@@ -43,6 +61,48 @@ constexpr time_t kMemberTtlSeconds = 30; // must outlive the client's re-registe
 
 bool same_addr(const struct sockaddr_in& a, const struct sockaddr_in& b) {
     return a.sin_addr.s_addr == b.sin_addr.s_addr && a.sin_port == b.sin_port;
+}
+
+// Shared handling for one received datagram, regardless of whether it
+// arrived via plain recvfrom() or the AF_XDP fast path -- both loops
+// below call this so REGISTER bookkeeping, forwarding, and TTL sweep
+// logic exist exactly once.
+void handle_packet(int sock, std::unordered_map<uint32_t, std::vector<Member>>& groups,
+                    const uint8_t* buf, size_t n, const struct sockaddr_in& src,
+                    time_t& last_sweep) {
+    uint32_t topic_id = 0;
+    time_t now = std::time(nullptr);
+
+    if (decode_relay_register(buf, n, &topic_id)) {
+        auto& members = groups[topic_id];
+        bool found = false;
+        for (auto& m : members) {
+            if (same_addr(m.addr, src)) { m.last_seen = now; found = true; break; }
+        }
+        if (!found) members.push_back(Member{src, now});
+    } else if (peek_frame_topic_id(buf, n, &topic_id)) {
+        auto it = groups.find(topic_id);
+        if (it != groups.end()) {
+            for (const auto& m : it->second) {
+                if (same_addr(m.addr, src)) continue; // never echo back to the sender
+                ::sendto(sock, buf, n, 0,
+                         reinterpret_cast<const struct sockaddr*>(&m.addr), sizeof(m.addr));
+            }
+        }
+    }
+    // Anything else (malformed/unrecognized) is silently dropped --
+    // a relay must never misinterpret bytes it can't identify.
+
+    if (now != last_sweep) {
+        last_sweep = now;
+        for (auto& kv : groups) {
+            auto& members = kv.second;
+            members.erase(
+                std::remove_if(members.begin(), members.end(),
+                                [&](const Member& m) { return now - m.last_seen > kMemberTtlSeconds; }),
+                members.end());
+        }
+    }
 }
 
 } // namespace
@@ -65,55 +125,76 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    std::unordered_map<uint32_t, std::vector<Member>> groups;
+    time_t last_sweep = std::time(nullptr);
+
+#ifdef RELINK_ENABLE_XDP
+    // Fast path: an XDP program on the NIC redirects packets addressed
+    // to `port` straight into this AF_XDP socket's UMEM, bypassing the
+    // kernel's normal UDP receive path entirely (see xdp/relay_xdp.hpp
+    // for why this only speeds up local processing, not the WAN RTT
+    // that actually dominates relay latency). `sock` above still
+    // exists and handles TX (forwarding) plus anything the XDP program
+    // doesn't intercept.
+    const char* ifname = (argc > 2) ? argv[2] : "eth0";
+    RelayXdp xdp;
+    if (xdp.init(ifname, port)) {
+        g_xdp_for_signal = &xdp;
+        std::signal(SIGINT, handle_signal);
+        std::signal(SIGTERM, handle_signal);
+        std::printf("relink-relay listening on 0.0.0.0:%u (AF_XDP fast path on %s, %s mode)\n",
+                    port, ifname, xdp.is_attached() ? "attached" : "unattached");
+        std::fflush(stdout);
+
+        for (;;) {
+            if (!xdp.poll_rx(1000)) continue;
+            uint32_t idx_rx = 0;
+            uint32_t n = xdp.rx_batch(64, &idx_rx);
+            if (n == 0) continue;
+            for (uint32_t i = 0; i < n; ++i) {
+                uint8_t* data = nullptr;
+                uint32_t len = 0;
+                xdp.rx_frame(idx_rx + i, &data, &len);
+
+                // Frame data from the NIC includes Ethernet+IP+UDP
+                // headers; the relay's parsing (decode_relay_register/
+                // peek_frame_topic_id) expects to start at the ReLink
+                // payload, so skip past them the same way the kernel
+                // XDP program did (14B eth + IP header incl. options +
+                // 8B UDP) to find the actual UDP payload and its
+                // source address for the reply path.
+                if (len > 42) {
+                    const uint8_t* eth = data;
+                    const uint8_t* ip = eth + 14;
+                    uint8_t ihl = (ip[0] & 0x0F) * 4;
+                    const uint8_t* udp = ip + ihl;
+                    const uint8_t* payload = udp + 8;
+                    size_t payload_len = len - (payload - data);
+
+                    struct sockaddr_in src{};
+                    src.sin_family = AF_INET;
+                    std::memcpy(&src.sin_addr.s_addr, ip + 12, 4);
+                    std::memcpy(&src.sin_port, udp + 0, 2);
+
+                    handle_packet(sock, groups, payload, payload_len, src, last_sweep);
+                }
+            }
+            xdp.release_rx(n);
+        }
+    }
+    std::fprintf(stderr, "AF_XDP init failed, falling back to plain sockets\n");
+#endif
+
     std::printf("relink-relay listening on 0.0.0.0:%u\n", port);
     std::fflush(stdout);
 
-    std::unordered_map<uint32_t, std::vector<Member>> groups;
     uint8_t buf[kMaxFrameBytes];
-    time_t last_sweep = std::time(nullptr);
-
     for (;;) {
         struct sockaddr_in src{};
         socklen_t src_len = sizeof(src);
         ssize_t n = ::recvfrom(sock, buf, sizeof(buf), 0,
                                 reinterpret_cast<struct sockaddr*>(&src), &src_len);
         if (n <= 0) continue;
-
-        uint32_t topic_id = 0;
-        time_t now = std::time(nullptr);
-
-        if (decode_relay_register(buf, static_cast<size_t>(n), &topic_id)) {
-            auto& members = groups[topic_id];
-            bool found = false;
-            for (auto& m : members) {
-                if (same_addr(m.addr, src)) { m.last_seen = now; found = true; break; }
-            }
-            if (!found) members.push_back(Member{src, now});
-        } else if (peek_frame_topic_id(buf, static_cast<size_t>(n), &topic_id)) {
-            auto it = groups.find(topic_id);
-            if (it != groups.end()) {
-                for (const auto& m : it->second) {
-                    if (same_addr(m.addr, src)) continue; // never echo back to the sender
-                    ::sendto(sock, buf, static_cast<size_t>(n), 0,
-                             reinterpret_cast<const struct sockaddr*>(&m.addr), sizeof(m.addr));
-                }
-            }
-        }
-        // Anything else (malformed/unrecognized) is silently dropped --
-        // a relay must never misinterpret bytes it can't identify.
-
-        // Sweep expired members roughly once a second, not on every
-        // packet -- keeps the hot path free of a per-packet time() call
-        // beyond the one already taken above for last_seen bookkeeping.
-        if (now != last_sweep) {
-            last_sweep = now;
-            for (auto& kv : groups) {
-                auto& members = kv.second;
-                members.erase(
-                    std::remove_if(members.begin(), members.end(),
-                                    [&](const Member& m) { return now - m.last_seen > kMemberTtlSeconds; }),
-                    members.end());
-            }
-        }
+        handle_packet(sock, groups, buf, static_cast<size_t>(n), src, last_sweep);
     }
 }
