@@ -145,6 +145,12 @@ Not sure which to use? Try Mode B first (Step 2 already did). If it
 doesn't work on your network, switch to Mode A — see
 [Step 9](#step-9--running-the-rlcore-daemon).
 
+Either mode, a node shares one UDP socket across every topic by default
+(demultiplexed by topic id). Call `node.set_multiplex(false)` for ROS's
+one-port-per-topic model instead — see
+[Step 12's benchmarks](#step-12--benchmarks) for the throughput/latency
+tradeoff before reaching for it.
+
 ---
 
 ## Step 4 — Named topics
@@ -402,6 +408,33 @@ CPython's per-message interpreter overhead can't drain the receive socket
 fast enough, and a larger socket buffer (Step 8's `enable_large_buffers`)
 trades that loss for multi-millisecond queueing latency instead — not a
 fix. For sustained rates above that, use the C++ binding.
+
+**Multiplexed (default) vs. per-topic-port (`set_multiplex(false)`)** — a
+node normally shares one UDP socket across every topic, demultiplexed by
+topic id (see Step 3). `set_multiplex(false)` opts a node into ROS's
+one-port-per-topic model instead, for tooling/firewall-rule
+compatibility. Measured with 10 topics on one node, both discovery modes:
+
+| Scenario | Mode | Achieved Hz | Loss | Mean latency | Max latency |
+|---|---|---|---|---|---|
+| C++, multicast, paced | multiplex (default) | ~18.0-18.5k/s | 0% | 18-48 µs | 343-419 µs |
+| C++, multicast, paced | per-topic-port | ~17.2-17.3k/s | 0% | 28-35 µs | 2.7-2.9 ms |
+| C++, rlcore, paced | multiplex (default) | 18.5k/s | 0% | 27.9 µs | 1.0 ms |
+| C++, rlcore, paced | per-topic-port | 14.6k/s | 0% | 35.3 µs | 1.4 ms |
+| Python, rlcore, paced | multiplex (default) | 12.8k/s | 0% | 58.4 µs | 0.72 ms |
+| Python, rlcore, paced | per-topic-port | 7.2k/s | 0% | 108.7 µs | 2.0 ms |
+
+Single-topic unpaced bursts (200k C++ msgs / 50k Python msgs) showed the
+same ordering: multiplex matched or beat per-topic-port on throughput in
+every run, in both languages.
+
+**Why**: each extra topic in per-topic-port mode is another OS socket and
+another recv thread competing for CPU scheduling — that cost scales with
+topic count. The shared-socket default instead pays one topic-id lookup
+in a hash map per message (~26ns), which doesn't. `set_multiplex(false)`
+is a compatibility feature (ROS-style per-topic addressing), not a
+performance one — keep the default unless you specifically need a topic
+on its own port.
 
 ---
 
