@@ -14,16 +14,29 @@
 // plain sockets rather than crash.
 #pragma once
 
-// This VPS's kernel headers (5.4) predate `enum bpf_stats_type`, which
-// libbpf's bpf.h references in a forward declaration -- fine for C's
-// looser opaque-enum rule, a hard error in C++. Supply it ourselves
-// (matches upstream's only-ever value) before libbpf's headers use it.
-#ifndef __cplusplus
-#else
+// Older kernel headers (e.g. the VPS's 5.4) predate `enum
+// bpf_stats_type`, which libbpf's bpf.h references in a forward
+// declaration -- fine for C's looser opaque-enum rule, a hard error in
+// C++. Supply it ourselves (matches upstream's only-ever value) before
+// libbpf's headers use it. Newer kernel headers (e.g. this dev
+// machine's) already define it fully via linux/bpf.h, so CMake probes
+// for that (RELINK_NEED_BPF_STATS_TYPE_SHIM) and we skip our own
+// definition when it's not needed -- defining it twice is itself a
+// hard error.
+#if defined(__cplusplus) && defined(RELINK_NEED_BPF_STATS_TYPE_SHIM)
 enum bpf_stats_type { BPF_STATS_RUN_TIME = 0 };
 #endif
 #include <bpf/libbpf.h>
+// xsk.h's location moved between libbpf generations: older libbpf (e.g.
+// the VPS's 0.5.0) bundles it at bpf/xsk.h; newer distros split AF_XDP
+// support into a separate libxdp package, whose xsk.h (same API) lives
+// at xdp/xsk.h instead. CMake defines RELINK_XSK_H_IS_XDP_XSK when it
+// found the latter.
+#ifdef RELINK_XSK_H_IS_XDP_XSK
+#include <xdp/xsk.h>
+#else
 #include <bpf/xsk.h>
+#endif
 #include <bpf/bpf.h>
 #include <linux/if_link.h> // XDP_FLAGS_DRV_MODE / XDP_FLAGS_SKB_MODE (libbpf 0.5's bpf_set_link_xdp_fd API)
 #include <cstdio>
@@ -124,11 +137,18 @@ public:
         return xsk_ring_cons__peek(&rx_ring_, max, out_idx_rx);
     }
 
-    void rx_frame(uint32_t idx_rx, uint8_t** data, uint32_t* len) {
+    // `addr` is the UMEM frame address this packet lives in -- the
+    // caller MUST pass it back to refill() once done reading, or that
+    // frame is never returned to the fill ring: the NIC then has one
+    // fewer buffer to land future packets in, and after kNumFrames
+    // consumed frames go unrefilled, RX silently starts dropping
+    // (this was the actual cause of a ~27% loss under stress before
+    // this fix -- refill() existed but nothing ever called it).
+    void rx_frame(uint32_t idx_rx, uint8_t** data, uint32_t* len, uint64_t* addr) {
         const struct xdp_desc* desc = xsk_ring_cons__rx_desc(&rx_ring_, idx_rx);
         *data = static_cast<uint8_t*>(xsk_umem__get_data(umem_area_, desc->addr));
         *len = desc->len;
-        last_rx_addr_ = desc->addr;
+        *addr = desc->addr;
     }
 
     void release_rx(uint32_t nb) {
@@ -154,8 +174,13 @@ public:
     // idempotent so a signal handler can call it unconditionally.
     void detach() {
         if (attached_ && ifindex_) {
+#ifdef RELINK_LIBBPF_HAS_XDP_ATTACH
+            bpf_xdp_detach(ifindex_, XDP_FLAGS_DRV_MODE, nullptr);
+            bpf_xdp_detach(ifindex_, XDP_FLAGS_SKB_MODE, nullptr);
+#else
             bpf_set_link_xdp_fd(ifindex_, -1, XDP_FLAGS_DRV_MODE);
             bpf_set_link_xdp_fd(ifindex_, -1, XDP_FLAGS_SKB_MODE);
+#endif
             attached_ = false;
         }
     }
@@ -201,13 +226,23 @@ private:
 
         // Try native driver mode first (virtio_net supports it); fall
         // back to generic/SKB mode so this still works on NICs that
-        // don't -- slower, but correct. (libbpf 0.5's API here is
-        // bpf_set_link_xdp_fd, predating the bpf_xdp_attach rename.)
+        // don't -- slower, but correct. libbpf >= 1.0 renamed this API
+        // from bpf_set_link_xdp_fd to bpf_xdp_attach; CMake probes for
+        // the symbol (RELINK_LIBBPF_HAS_XDP_ATTACH) so the same source
+        // builds against either the VPS's libbpf 0.5.0 or a newer one.
+#ifdef RELINK_LIBBPF_HAS_XDP_ATTACH
+        int err = bpf_xdp_attach(ifindex_, prog_fd, XDP_FLAGS_DRV_MODE, nullptr);
+        if (err) {
+            std::fprintf(stderr, "native XDP attach failed (%s), falling back to generic mode\n",
+                         std::strerror(-err));
+            err = bpf_xdp_attach(ifindex_, prog_fd, XDP_FLAGS_SKB_MODE, nullptr);
+#else
         int err = bpf_set_link_xdp_fd(ifindex_, prog_fd, XDP_FLAGS_DRV_MODE);
         if (err) {
             std::fprintf(stderr, "native XDP attach failed (%s), falling back to generic mode\n",
                          std::strerror(-err));
             err = bpf_set_link_xdp_fd(ifindex_, prog_fd, XDP_FLAGS_SKB_MODE);
+#endif
             if (err) {
                 std::fprintf(stderr, "generic XDP attach also failed: %s\n", std::strerror(-err));
                 return false;
@@ -228,7 +263,6 @@ private:
     uint8_t* umem_area_ = nullptr;
     struct bpf_object* bpf_obj_ = nullptr;
     int xsk_fd_ = -1;
-    uint64_t last_rx_addr_ = 0;
 
 public:
     unsigned int ifindex() const { return ifindex_; }

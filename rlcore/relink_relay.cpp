@@ -154,7 +154,8 @@ int main(int argc, char** argv) {
             for (uint32_t i = 0; i < n; ++i) {
                 uint8_t* data = nullptr;
                 uint32_t len = 0;
-                xdp.rx_frame(idx_rx + i, &data, &len);
+                uint64_t addr = 0;
+                xdp.rx_frame(idx_rx + i, &data, &len, &addr);
 
                 // Frame data from the NIC includes Ethernet+IP+UDP
                 // headers; the relay's parsing (decode_relay_register/
@@ -178,6 +179,7 @@ int main(int argc, char** argv) {
 
                     handle_packet(sock, groups, payload, payload_len, src, last_sweep);
                 }
+                xdp.refill(addr); // return this UMEM frame to the fill ring now that we're done with it
             }
             xdp.release_rx(n);
         }
