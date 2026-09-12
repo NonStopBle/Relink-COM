@@ -10,7 +10,7 @@ import socket
 import struct
 import threading
 import time
-from typing import Callable, Dict, List, Optional, Set, Type, Union
+from typing import Callable, Dict, List, Optional, Set, Tuple, Type, Union
 
 from .wire import is_wire_type, NAT_PUNCH_TOPIC_ID
 from .topic_hash import fnv1a32
@@ -96,10 +96,16 @@ class RelinkNode:
         self._mcast: Optional[MulticastDiscovery] = None
         self._multiplex = True
         self._topic_transports: Dict[int, UdpTransport] = {}
+        self._topic_route: Dict[int, UdpTransport] = {}
 
         self._start_lock = threading.Lock()
         self._started = False
         self._stop_requested = threading.Event()
+
+        self._repunch_enabled = False
+        self._repunch_interval = 5.0
+        self._repunch_stop = threading.Event()
+        self._repunch_thread: Optional[threading.Thread] = None
 
     # --- mode B, mutually exclusive with mode A ---
     def use_multicast_discovery(self):
@@ -118,6 +124,37 @@ class RelinkNode:
         regardless of this setting. See relink.hpp's set_multiplex()
         for the full rationale."""
         self._multiplex = enabled
+
+    def enable_nat_repunch(self, interval_seconds: float = 5.0):
+        """Opt-in: instead of firing the NAT hole-punch burst only once
+        when a peer is first learned, keep re-punching every known peer
+        on a timer for the node's whole lifetime. Fixes a marginal NAT
+        whose mapping expires faster than expected, or a peer discovered
+        just before the other side's mapping timed out. Does NOT fix a
+        NAT/firewall that structurally drops all unsolicited inbound UDP
+        regardless of timing (verified against a real mobile-carrier NAT:
+        85 retries over 22 seconds still delivered zero packets) -- no
+        amount of retrying opens a path that was never open. Call before
+        spin()/publish() traffic; harmless no-op cost on a plain LAN,
+        same as the one-shot burst it supplements. See relink.hpp's
+        enable_nat_repunch() for the full rationale."""
+        self._repunch_enabled = True
+        self._repunch_interval = interval_seconds
+
+    def _repunch_loop(self):
+        while not self._repunch_stop.wait(self._repunch_interval):
+            targets = []
+            with self._peers_lock:
+                for topic, peers in self._peers.items():
+                    via = self._topic_route.get(topic, self._transport)
+                    for p in peers:
+                        targets.append((via, p))
+            for via, p in targets:
+                if self._repunch_stop.is_set():
+                    break
+                for _ in range(3):
+                    via.publish_raw(NAT_PUNCH_TOPIC_ID, b"", p)
+                    time.sleep(0.03)
 
     def _transport_for(self, topic_id: int) -> UdpTransport:
         if self._multiplex:
@@ -411,7 +448,17 @@ class RelinkNode:
             elif topics:
                 groups.append((self._transport, topics))
 
-            newly_learned_peers: List[PeerAddr] = []  # for the NAT punch burst below
+            # Which transport owns each topic's data socket, so NAT
+            # hole-punching fires from the SAME socket that topic's
+            # traffic actually uses -- required once set_multiplex(False)
+            # gives each topic its own port/NAT mapping, since punching
+            # from the wrong socket opens the wrong mapping and the
+            # peer's simultaneous punch back never gets through.
+            for t, group_topics in groups:
+                for tid in group_topics:
+                    self._topic_route[tid] = t
+
+            newly_learned_peers: List[Tuple[UdpTransport, PeerAddr]] = []  # for the NAT punch burst below
 
             if self._mode == DiscoveryMode.RLCORE:
                 # Registration MUST happen on the transport's own socket,
@@ -437,7 +484,7 @@ class RelinkNode:
                             for p in outcome.peers:
                                 addr = PeerAddr(p.ip, p.port)
                                 self._peers.setdefault(p.topic_id, []).append(addr)
-                                newly_learned_peers.append(addr)
+                                newly_learned_peers.append((t, addr))
                 # If registration failed after retries, register_with_rlcore
                 # already logged an error; proceed with an empty peer table
                 # rather than crashing the node.
@@ -465,8 +512,20 @@ class RelinkNode:
                 self._mcast = MulticastDiscovery(cfg)
 
                 def on_peer(topic: int, peer):
+                    addr = PeerAddr(peer.ip, peer.port)
                     with self._peers_lock:
-                        self._peers.setdefault(topic, []).append(PeerAddr(peer.ip, peer.port))
+                        self._peers.setdefault(topic, []).append(addr)
+                        via = self._topic_route.get(topic, self._transport)
+                    # Multicast discovery keeps running for the node's
+                    # whole lifetime (unlike rlcore's one-shot registration
+                    # burst below), so a peer for a set_multiplex(False)
+                    # topic can show up long after start() -- punch from
+                    # that topic's OWN socket every time, not just at
+                    # startup, or its NAT mapping never opens and the
+                    # peer's punch back is dropped.
+                    for _ in range(3):
+                        via.publish_raw(NAT_PUNCH_TOPIC_ID, b"", addr)
+                        time.sleep(0.03)
 
                 self._mcast.set_peer_discovered_callback(on_peer)
 
@@ -491,9 +550,13 @@ class RelinkNode:
             # own NAT's outbound mapping so the peer's (simultaneous)
             # punch datagram back can get through. Harmless no-op cost
             # on a plain LAN.
-            for peer in newly_learned_peers:
+            for t, peer in newly_learned_peers:
                 for _ in range(3):
-                    self._transport.publish_raw(NAT_PUNCH_TOPIC_ID, b"", peer)
+                    t.publish_raw(NAT_PUNCH_TOPIC_ID, b"", peer)
                     time.sleep(0.03)
+
+            if self._repunch_enabled:
+                self._repunch_thread = threading.Thread(target=self._repunch_loop, daemon=True)
+                self._repunch_thread.start()
 
             self._started = True

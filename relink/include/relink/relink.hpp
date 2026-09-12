@@ -94,6 +94,29 @@ public:
     // the shared transport regardless of this setting.
     void set_multiplex(bool enabled) { multiplex_ = enabled; }
 
+    ~RelinkNode() {
+        repunch_stop_ = true;
+        if (repunch_thread_.joinable()) repunch_thread_.join();
+    }
+
+    // Opt-in background re-punch: instead of firing the NAT hole-punch
+    // burst only once, when a peer is first learned, keep re-punching
+    // every known peer on a timer for the node's whole lifetime. Fixes
+    // a real but narrow class of failure -- a marginal NAT whose mapping
+    // expires faster than expected, or a peer discovered on one side
+    // just before the other side's mapping timed out -- by refreshing
+    // every mapping before it can expire. It does NOT fix a NAT/firewall
+    // that structurally drops all unsolicited inbound UDP regardless of
+    // timing (verified against a real mobile-carrier NAT: 85 retries
+    // over 22 seconds still delivered zero packets) -- no amount of
+    // retrying opens a path that was never open. Call before spin()/
+    // publish() traffic; harmless no-op cost on a plain LAN, same as the
+    // one-shot burst it supplements.
+    void enable_nat_repunch(double interval_seconds = 5.0) {
+        repunch_enabled_ = true;
+        repunch_interval_ = std::chrono::duration<double>(interval_seconds);
+    }
+
     // --- named topics: hash a human-readable topic name down to the
     // uint32_t that actually goes on the wire. One-way (FNV-1a) -- there
     // is no length limit on `name` since it is never itself transmitted,
@@ -556,9 +579,11 @@ private:
             } else if (!topics.empty()) {
                 groups.push_back(TopicGroup{&transport_, topics});
             }
+            for (const auto& g : groups)
+                for (uint32_t t : g.topics) topic_route_[t] = g.transport;
         }
 
-        std::vector<PeerAddr> newly_learned_peers; // for the NAT punch burst below
+        std::vector<std::pair<UdpTransport*, PeerAddr>> newly_learned_peers; // for the NAT punch burst below
 
         if (mode == DiscoveryMode::RlCore) {
             // Registration MUST happen on each group's own socket, before
@@ -589,7 +614,7 @@ private:
                     for (const auto& p : outcome.peers) {
                         PeerAddr addr{p.ip, p.port};
                         peers_[p.topic_id].push_back(addr);
-                        newly_learned_peers.push_back(addr);
+                        newly_learned_peers.push_back({g.transport, addr});
                     }
                 }
             }
@@ -635,8 +660,21 @@ private:
             }
             mcast_ = std::make_unique<MulticastDiscovery>(cfg);
             mcast_->set_peer_discovered_callback([this](uint32_t topic, const PeerInfo& p) {
-                std::lock_guard<std::mutex> lock2(state_mutex_);
-                peers_[topic].push_back(PeerAddr{p.ip, p.port});
+                PeerAddr addr{p.ip, p.port};
+                UdpTransport* via;
+                {
+                    std::lock_guard<std::mutex> lock2(state_mutex_);
+                    peers_[topic].push_back(addr);
+                    auto it = topic_route_.find(topic);
+                    via = (it != topic_route_.end()) ? it->second : &transport_;
+                }
+                // Multicast discovery keeps running for the node's whole
+                // lifetime (unlike rlcore's one-shot registration burst
+                // below), so a peer for a set_multiplex(false) topic can
+                // show up long after start() -- punch from that topic's
+                // OWN socket every time, not just at startup, or its NAT
+                // mapping never opens and the peer's punch back is dropped.
+                nat_punch(addr, *via);
             });
             // Answers rl_topic's name-directory queries (see
             // topic_directory.hpp) -- called from MulticastDiscovery's
@@ -685,12 +723,11 @@ private:
         // reachable directly). Uses the reserved kNatPunchTopicId, which
         // every node silently drops on receive since nothing ever
         // subscribes to it.
-        for (const auto& peer : newly_learned_peers) {
-            for (int i = 0; i < 3; ++i) {
-                transport_.publish_raw(kNatPunchTopicId, nullptr, 0, peer);
-                std::this_thread::sleep_for(std::chrono::milliseconds(30));
-            }
+        for (const auto& kv : newly_learned_peers) {
+            nat_punch(kv.second, *kv.first);
         }
+
+        if (repunch_enabled_) start_repunch_thread();
 
         started_ = true;
     }
@@ -738,6 +775,54 @@ private:
 
     bool multiplex_ = true;
     std::unordered_map<uint32_t, std::unique_ptr<UdpTransport>> topic_transports_;
+    // Which transport owns each topic's data socket, so NAT hole-punching
+    // (and anything else that needs to reach a specific peer) fires from
+    // the SAME socket that topic's traffic actually uses -- required once
+    // set_multiplex(false) gives each topic its own port/NAT mapping,
+    // since punching from the wrong socket opens the wrong mapping and
+    // the peer's simultaneous punch back never gets through.
+    std::unordered_map<uint32_t, UdpTransport*> topic_route_;
+
+    void nat_punch(const PeerAddr& peer, UdpTransport& via) {
+        for (int i = 0; i < 3; ++i) {
+            via.publish_raw(kNatPunchTopicId, nullptr, 0, peer);
+            std::this_thread::sleep_for(std::chrono::milliseconds(30));
+        }
+    }
+
+    bool repunch_enabled_ = false;
+    std::chrono::duration<double> repunch_interval_{5.0};
+    std::atomic<bool> repunch_stop_{false};
+    std::thread repunch_thread_;
+
+    void start_repunch_thread() {
+        repunch_thread_ = std::thread([this] {
+            while (!repunch_stop_.load()) {
+                std::this_thread::sleep_for(
+                    std::chrono::duration_cast<std::chrono::milliseconds>(repunch_interval_));
+                if (repunch_stop_.load()) break;
+                // Snapshot (topic, peer, transport) triples under the lock,
+                // then punch outside it -- nat_punch() sleeps between
+                // packets, and holding state_mutex_ across those sleeps
+                // would stall any advertise/subscribe/publish call racing
+                // to acquire it on another thread.
+                std::vector<std::tuple<UdpTransport*, PeerAddr>> targets;
+                {
+                    std::lock_guard<std::mutex> lock(state_mutex_);
+                    for (const auto& kv : peers_) {
+                        uint32_t topic = kv.first;
+                        auto it = topic_route_.find(topic);
+                        UdpTransport* via = (it != topic_route_.end()) ? it->second : &transport_;
+                        for (const auto& p : kv.second) targets.emplace_back(via, p);
+                    }
+                }
+                for (auto& t : targets) {
+                    if (repunch_stop_.load()) break;
+                    nat_punch(std::get<1>(t), *std::get<0>(t));
+                }
+            }
+        });
+    }
 };
 
 } // namespace relink

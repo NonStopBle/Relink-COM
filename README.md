@@ -151,6 +151,18 @@ one-port-per-topic model instead — see
 [Step 12's benchmarks](#step-12--benchmarks) for the throughput/latency
 tradeoff before reaching for it.
 
+`rl_topic` (`rl_topic.py`/`rl_topic.cpp`, a `rostopic`-style CLI —
+`list`/`info`/`hz`/`bw`/`echo`/`pub`) needs no special flag or code
+change to work against a node running `set_multiplex(false)`: a
+demultiplexed node's beacon/registration already announces each topic's
+real per-topic port, so `rl_topic`'s own node (which stays on the
+default shared socket) discovers and talks to it exactly like any other
+peer. Verified against a `set_multiplex(false)` publisher: `list`
+discovers the topic, `hz`/`echo` correctly read it, and `pub` correctly
+reaches a `set_multiplex(false)` subscriber. The only failure mode
+encountered was the ordinary beacon-startup-timing race (see Step 14),
+unrelated to multiplex mode.
+
 ---
 
 ## Step 4 — Named topics
@@ -447,7 +459,34 @@ networks/NATs can find each other. Requires Mode A (a daemon both sides
 can reach) — Mode B's multicast has no path across separate networks by
 definition.
 
----
+**Works transparently with `set_multiplex(false)`.** Each topic's punch
+burst fires from that topic's own dedicated socket, not a shared one —
+required because a per-topic socket has its own independent NAT mapping,
+so punching from the wrong socket would open the wrong mapping and the
+peer's simultaneous punch back would never get through. No extra
+configuration: a node auto-routes each newly discovered peer's punch
+through whichever transport (shared, in the default multiplexed mode, or
+that topic's dedicated one, under `set_multiplex(false)`) actually owns
+that topic, for both discovery modes — including peers discovered well
+after startup, since Mode B's multicast discovery keeps running for the
+node's whole lifetime.
+
+**Optional background re-punch.** By default a peer is punched once,
+right when it's first learned. `node.enable_nat_repunch(interval_seconds
+= 5.0)` instead keeps re-punching every known peer on a timer for the
+node's whole lifetime — call it before `spin()`/`publish()` traffic.
+This fixes a real but narrow class of failure: a marginal NAT whose
+mapping expires faster than expected, or a peer discovered on one side
+just before the other side's mapping timed out. It does **not** fix a
+NAT/firewall that structurally drops all unsolicited inbound UDP
+regardless of timing — verified against a real mobile-carrier NAT with a
+raw (non-ReLink) hole-punching test: 85 retry packets over 22 seconds
+still delivered zero packets in that direction, and a packet capture on
+the receiving host's own network interface confirmed the inbound side's
+NAT was dropping them before they ever arrived (not a local firewall —
+`ufw` was inactive throughout). No amount of client-side retrying opens
+a path that was never open; that case needs a relay/TURN-style fallback,
+which ReLink does not currently implement.
 
 ## Step 14 — Troubleshooting
 
@@ -459,6 +498,7 @@ definition.
 | `topic hash collision between "X" and "Y"` | Two different topic names hashed (FNV-1a) to the same 32-bit id — astronomically rare, but checked for | Rename one of the topics |
 | High packet loss at a high send rate | The receiver (especially Python) can't drain the socket as fast as it's being filled | Reduce the rate, or move that node to C++ (Step 12) — a bigger socket buffer only postpones this, see Step 8 |
 | A dropped/corrupted image frame | `Image` chunks have no retransmission — one lost UDP datagram drops the whole frame | Prefer a compressed payload (`image_compressed`) over raw frames (Step 8), and keep the subscriber callback fast |
+| `rl_topic` reports "no peers" right after starting a fresh node/tool pair | Multicast beacons only burst 3x in the first ~400ms, then go silent for 30-60s — starting the two sides even slightly apart can miss that window entirely | Start both sides together, or pass a longer `--timeout` to `rl_topic` so it catches the next sparse re-announce |
 
 ---
 
