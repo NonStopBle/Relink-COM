@@ -613,6 +613,18 @@ class RelinkNode:
                     t.publish_raw(NAT_PUNCH_TOPIC_ID, b"", peer)
                     time.sleep(0.03)
 
+            # NAT mode (rlcore, the only mode --nat applies to) gets a 1s
+            # re-punch thread by default -- this is the mode where a
+            # peer's real endpoint was learned from a NAT-mapped source
+            # port that can drift/expire, so continuously rechecking
+            # readiness matters enough to not require an opt-in call. A
+            # user who already called enable_nat_repunch() themselves
+            # (any mode, any interval) keeps their own setting -- this
+            # only fills in the default when nothing was requested.
+            if self._mode == DiscoveryMode.RLCORE and not self._repunch_enabled:
+                self._repunch_enabled = True
+                self._repunch_interval = 1.0
+
             if self._repunch_enabled:
                 self._repunch_thread = threading.Thread(target=self._repunch_loop, daemon=True)
                 self._repunch_thread.start()

@@ -764,6 +764,18 @@ private:
             nat_punch(kv.second, *kv.first);
         }
 
+        // NAT mode (rlcore, the only mode --nat applies to) gets a 1s
+        // re-punch thread by default -- this is the mode where a peer's
+        // real endpoint was learned from a NAT-mapped source port that
+        // can drift/expire, so continuously rechecking readiness matters
+        // enough to not require an opt-in call. A user who already
+        // called enable_nat_repunch() themselves (any mode, any
+        // interval) keeps their own setting -- this only fills in the
+        // default when nothing was explicitly requested.
+        if (mode == DiscoveryMode::RlCore && !repunch_enabled_) {
+            repunch_enabled_ = true;
+            repunch_interval_ = std::chrono::duration<double>(1.0);
+        }
         if (repunch_enabled_) start_repunch_thread();
 
         if (relay_enabled_) {

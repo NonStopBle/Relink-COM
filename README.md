@@ -483,11 +483,18 @@ that topic, for both discovery modes — including peers discovered well
 after startup, since Mode B's multicast discovery keeps running for the
 node's whole lifetime.
 
-**Optional background re-punch.** By default a peer is punched once,
-right when it's first learned. `node.enable_nat_repunch(interval_seconds
-= 5.0)` instead keeps re-punching every known peer on a timer for the
-node's whole lifetime — call it before `spin()`/`publish()` traffic.
-This fixes a real but narrow class of failure: a marginal NAT whose
+**Background re-punch.** Mode A (rlcore, the only mode `--nat` applies
+to) enables this automatically, at a 1s interval, with no call needed —
+that's the mode where a peer's real endpoint was learned from a
+NAT-mapped source port that can drift or expire, so continuously
+rechecking readiness matters enough to not be opt-in. Instead of
+punching a peer only once, right when it's first learned, a background
+thread keeps re-punching every known peer on a timer for the node's
+whole lifetime. Call `node.enable_nat_repunch(interval_seconds = 5.0)`
+yourself (before `spin()`/`publish()` traffic) to pick your own interval
+or to turn it on under Mode B/multicast too — an explicit call always
+overrides the Mode A default. This fixes a real but narrow class of
+failure: a marginal NAT whose
 mapping expires faster than expected, or a peer discovered on one side
 just before the other side's mapping timed out. It does **not** fix a
 NAT/firewall that structurally drops all unsolicited inbound UDP
