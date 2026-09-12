@@ -618,6 +618,13 @@ private:
             }
             for (const auto& g : groups)
                 for (uint32_t t : g.topics) topic_route_[t] = g.transport;
+            // Dedup MUST be armed before transport_.start() launches the
+            // recv thread below, not after -- enabling it post-start
+            // leaves a race window where an early direct+relay duplicate
+            // pair can both slip through before the flag takes effect.
+            if (relay_enabled_) {
+                for (const auto& g : groups) g.transport->enable_relay_dedup();
+            }
         }
 
         std::vector<std::pair<UdpTransport*, PeerAddr>> newly_learned_peers; // for the NAT punch burst below
@@ -864,13 +871,12 @@ private:
     // topic-owning transport with the relay -- one REGISTER packet per
     // (transport, topic) pair, sent from that exact transport's socket
     // so the relay's forwarded copies land on the same socket that
-    // topic's direct traffic already listens on. Also turns on that
-    // transport's dedup filter, since it's now a candidate to receive
-    // the same message twice.
+    // topic's direct traffic already listens on. (Dedup is armed
+    // earlier, in ensure_started(), before transport_.start() -- see
+    // that call site for why the ordering matters.)
     void register_all_topics_with_relay(const std::vector<std::pair<UdpTransport*, std::vector<uint32_t>>>& groups) {
         uint8_t buf[8];
         for (const auto& g : groups) {
-            g.first->enable_relay_dedup();
             for (uint32_t topic : g.second) {
                 size_t len = encode_relay_register(topic, buf, sizeof(buf));
                 struct sockaddr_in dest{};

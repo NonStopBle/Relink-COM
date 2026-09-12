@@ -332,12 +332,8 @@ private:
             return false; // drop silently, per spec
         }
 
-        if (relay_dedup_enabled_) {
-            auto it = last_delivered_seq_.find(frame.header.topic_id);
-            if (it != last_delivered_seq_.end() && it->second == frame.header.seq_num) {
-                return true; // exact duplicate (direct + relay both delivered it) -- drop
-            }
-            last_delivered_seq_[frame.header.topic_id] = frame.header.seq_num;
+        if (relay_dedup_enabled_ && is_recent_duplicate(frame.header.topic_id, frame.header.seq_num)) {
+            return true; // exact duplicate (direct + relay both delivered it) -- drop
         }
 
         RawTopicCallback cb;
@@ -367,7 +363,32 @@ private:
     std::unordered_map<uint32_t, RawTopicCallback> handlers_;
 
     bool relay_dedup_enabled_ = false;
-    std::unordered_map<uint32_t, uint16_t> last_delivered_seq_; // topic_id -> seq_num, recv-thread-only
+
+    // Remembers the last few delivered seq_nums per topic, not just the
+    // most recent one: a relay copy can legitimately arrive AFTER
+    // several newer direct messages already advanced past it (the relay
+    // hop adds real latency), so "only equal to the single last one"
+    // would miss it. A small fixed window (checked by linear scan --
+    // cheap at this size) catches a duplicate arriving reasonably out
+    // of order without unbounded memory growth.
+    struct SeqWindow {
+        static constexpr size_t kSize = 8;
+        uint16_t seen[kSize] = {};
+        bool valid[kSize] = {};
+        size_t next = 0;
+    };
+    std::unordered_map<uint32_t, SeqWindow> recent_seqs_; // topic_id -> window, recv-thread-only
+
+    bool is_recent_duplicate(uint32_t topic_id, uint16_t seq) {
+        auto& w = recent_seqs_[topic_id];
+        for (size_t i = 0; i < SeqWindow::kSize; ++i) {
+            if (w.valid[i] && w.seen[i] == seq) return true;
+        }
+        w.seen[w.next] = seq;
+        w.valid[w.next] = true;
+        w.next = (w.next + 1) % SeqWindow::kSize;
+        return false;
+    }
 
     uint8_t send_buf_[kMaxFrameBytes];
     uint8_t recv_buf_[kMaxFrameBytes];

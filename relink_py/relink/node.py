@@ -192,8 +192,10 @@ class RelinkNode:
         return PeerAddr(self._relay_ip, self._relay_port)
 
     def _register_all_topics_with_relay(self, groups):
+        # (Dedup is armed earlier, in _ensure_started(), before any
+        # transport.start() call -- see that call site for why the
+        # ordering matters.)
         for t, group_topics in groups:
-            t.enable_relay_dedup()
             for topic in group_topics:
                 pkt = encode_relay_register(topic)
                 try:
@@ -515,6 +517,15 @@ class RelinkNode:
             for t, group_topics in groups:
                 for tid in group_topics:
                     self._topic_route[tid] = t
+
+            # Dedup MUST be armed before any transport.start() call below
+            # launches its recv thread, not after -- enabling it post-
+            # start leaves a race window where an early direct+relay
+            # duplicate pair can both slip through before the flag takes
+            # effect.
+            if self._relay_enabled:
+                for t, _ in groups:
+                    t.enable_relay_dedup()
 
             newly_learned_peers: List[Tuple[UdpTransport, PeerAddr]] = []  # for the NAT punch burst below
 

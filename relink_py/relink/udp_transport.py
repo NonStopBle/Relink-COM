@@ -11,6 +11,7 @@ language are fine for v1," not a second implementation racing the C++
 core for the performance target.
 """
 
+import collections
 import socket
 import struct
 import threading
@@ -46,7 +47,14 @@ class UdpTransport:
         self._seq = 0
         self._seq_lock = threading.Lock()
         self._relay_dedup_enabled = False
-        self._last_delivered_seq: Dict[int, int] = {}  # topic_id -> seq_num, recv-thread-only
+        # Remembers the last few delivered seq_nums per topic, not just
+        # the most recent one: a relay copy can legitimately arrive
+        # AFTER several newer direct messages already advanced past it
+        # (the relay hop adds real latency), so "only equal to the
+        # single last one" would miss it. A small fixed-size deque
+        # (membership checked by linear scan -- cheap at this size)
+        # catches a duplicate arriving reasonably out of order.
+        self._recent_seqs: Dict[int, "collections.deque"] = {}  # topic_id -> deque[seq_num]
         self._want_large_buffers = False
 
     def enable_large_buffers(self):
@@ -142,6 +150,18 @@ class UdpTransport:
         enable_relay_dedup() for the full rationale."""
         self._relay_dedup_enabled = True
 
+    _RECENT_SEQ_WINDOW = 8
+
+    def _is_recent_duplicate(self, topic_id: int, seq: int) -> bool:
+        window = self._recent_seqs.get(topic_id)
+        if window is None:
+            window = collections.deque(maxlen=self._RECENT_SEQ_WINDOW)
+            self._recent_seqs[topic_id] = window
+        if seq in window:
+            return True
+        window.append(seq)
+        return False
+
     def publish_scattered(self, topic_id: int, extra_header: bytes,
                            data, peer: PeerAddr) -> bool:
         """Zero-copy variant for large-blob types like Image: publish_raw()
@@ -211,10 +231,8 @@ class UdpTransport:
         except FrameError:
             return False  # drop silently, per spec
 
-        if self._relay_dedup_enabled:
-            if self._last_delivered_seq.get(frame.topic_id) == frame.seq_num:
-                return True  # exact duplicate (direct + relay both delivered it) -- drop
-            self._last_delivered_seq[frame.topic_id] = frame.seq_num
+        if self._relay_dedup_enabled and self._is_recent_duplicate(frame.topic_id, frame.seq_num):
+            return True  # exact duplicate (direct + relay both delivered it) -- drop
 
         with self._handlers_lock:
             handler = self._handlers.get(frame.topic_id)
