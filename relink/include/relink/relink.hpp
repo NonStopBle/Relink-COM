@@ -11,6 +11,8 @@
 #include "relink/multicast_discovery.hpp"
 #include "relink/image.hpp"
 #include "relink/topic_hash.hpp"
+#include "relink/topic_directory.hpp"
+#include "relink/standard_msgs.hpp"
 #include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
@@ -24,6 +26,7 @@
 #include <memory>
 #include <cstring>
 #include <unistd.h>
+#include <functional>
 
 namespace relink {
 
@@ -67,6 +70,29 @@ public:
     void use_multicast_discovery() {
         select_mode(DiscoveryMode::Multicast);
     }
+
+    // Multiplex (default, true): every topic shares this node's one UDP
+    // socket/port, demultiplexed by topic_id in UdpTransport's handler
+    // map -- the design this library is built around (one socket per
+    // NODE, not per topic; see udp_transport.hpp's header comment). The
+    // ~26ns handler-map lookup this costs per received frame is dwarfed
+    // by the ~1-5us cost of a syscall, so per-topic sockets would not
+    // make a single node faster -- but they DO match ROS's familiar
+    // one-port-per-topic model, which some deployments want for its own
+    // sake (e.g. per-topic firewall rules, or tooling that expects to
+    // find a topic on its own port). set_multiplex(false) opts a node
+    // into that model: each advertise/subscribe/advertise_raw/
+    // subscribe_raw call after this is set gets its own dedicated
+    // UdpTransport bound to its own ephemeral port. Discovery (rlcore or
+    // multicast) automatically announces each topic's real port instead
+    // of one shared port -- no separate opt-in needed on rlcore's side,
+    // since a registration/beacon already carries an explicit port
+    // alongside whichever topics it lists (see MulticastDiscoveryConfig::
+    // PortGroup and ensure_started() below). Must be called before the
+    // first advertise/subscribe/publish call it should affect. Image
+    // (advertise_image/publish_image/subscribe_image) always stays on
+    // the shared transport regardless of this setting.
+    void set_multiplex(bool enabled) { multiplex_ = enabled; }
 
     // --- named topics: hash a human-readable topic name down to the
     // uint32_t that actually goes on the wire. One-way (FNV-1a) -- there
@@ -119,17 +145,31 @@ public:
                             // called for it, so no name is known locally)
     };
 
-    // Lists every topic this node has advertised or subscribed to so
-    // far, with its human name when known (from the string-based
-    // advertise/subscribe/publish overloads) -- a debugging/introspection
-    // aid, not part of the wire protocol. Does NOT list topics only
-    // known as a remote peer's publish target (see peers_for_topic()
-    // for that); this is specifically "what has THIS node declared."
+    // Lists every topic id THIS node has itself declared (advertised or
+    // subscribed to), PLUS -- when using multicast discovery (mode B) --
+    // every topic id any other node's beacon has announced, network-wide
+    // (the rostopic-list-style view). Beacons only ever carry the 4-byte
+    // numeric id, never a name (see multicast_discovery.hpp), so a topic
+    // learned purely from the network has an empty name here; it only
+    // gets a name if THIS process separately resolved that same id via
+    // topic_id_for() (i.e. it also advertised/subscribed that name
+    // itself) -- "decoding" a name is always local, never transmitted.
+    // Mode A (rlcore) does not currently feed this list beyond what this
+    // node declared -- the daemon doesn't broadcast a topic roster back.
     std::vector<RlTopicInfo> rltopic_list() {
+        std::unordered_set<uint32_t> ids;
+        {
+            std::lock_guard<std::mutex> lock(state_mutex_);
+            ids.insert(declared_topics_.begin(), declared_topics_.end());
+        }
+        if (mcast_) {
+            for (uint32_t id : mcast_->all_known_topic_ids()) ids.insert(id);
+        }
+
         std::lock_guard<std::mutex> lock(state_mutex_);
         std::vector<RlTopicInfo> out;
-        out.reserve(declared_topics_.size());
-        for (uint32_t id : declared_topics_) {
+        out.reserve(ids.size());
+        for (uint32_t id : ids) {
             auto it = topic_names_.find(id);
             out.push_back(RlTopicInfo{id, it != topic_names_.end() ? it->second : std::string()});
         }
@@ -147,7 +187,9 @@ public:
         static_assert(std::is_trivially_copyable<T>::value,
                       "advertise<T>: T must be trivially copyable");
         if constexpr (std::is_same<T, ImageChunk>::value) {
-            transport_.enable_large_buffers();
+            transport_.enable_large_buffers(); // Image always stays on the shared transport
+        } else {
+            transport_for(topic_id);
         }
         std::lock_guard<std::mutex> lock(state_mutex_);
         declared_topics_.insert(topic_id);
@@ -164,6 +206,7 @@ public:
     void subscribe(uint32_t topic_id, Callback callback, bool /*secure*/ = false) {
         static_assert(std::is_trivially_copyable<T>::value,
                       "subscribe<T>: T must be trivially copyable");
+        UdpTransport& t = std::is_same<T, ImageChunk>::value ? transport_ : transport_for(topic_id);
         if constexpr (std::is_same<T, ImageChunk>::value) {
             transport_.enable_large_buffers();
         }
@@ -171,12 +214,60 @@ public:
             std::lock_guard<std::mutex> lock(state_mutex_);
             declared_topics_.insert(topic_id);
         }
-        transport_.set_topic_handler(topic_id, [callback](const uint8_t* payload, size_t len) {
+        t.set_topic_handler(topic_id, [callback](const uint8_t* payload, size_t len) {
             if (len != sizeof(T)) return; // type/size mismatch: drop, never misinterpret bytes
             T value{};
             std::memcpy(&value, payload, sizeof(T));
             callback(value);
         });
+    }
+
+    // --- subscribe_raw/publish_raw: type-agnostic escape hatch, for
+    // tooling that inspects a topic without knowing its message type
+    // (rl_topic's echo/hz/bw subcommands -- see rl_topic.cpp/.py) --
+    // NOT for application code, which should always use the typed
+    // advertise/subscribe/publish<T> above so a size mismatch is caught
+    // per ReLink's "never misinterpret bytes" rule instead of being
+    // handed to you as unstructured bytes.
+    using RawCallback = std::function<void(const uint8_t* payload, size_t len)>;
+
+    void advertise_raw(const std::string& name) { advertise_raw(topic_id_for(name)); }
+    void advertise_raw(uint32_t topic_id) {
+        transport_for(topic_id);
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        declared_topics_.insert(topic_id);
+    }
+
+    void subscribe_raw(const std::string& name, RawCallback callback) {
+        subscribe_raw(topic_id_for(name), std::move(callback));
+    }
+    void subscribe_raw(uint32_t topic_id, RawCallback callback) {
+        UdpTransport& t = transport_for(topic_id);
+        {
+            std::lock_guard<std::mutex> lock(state_mutex_);
+            declared_topics_.insert(topic_id);
+        }
+        t.set_topic_handler(topic_id, std::move(callback));
+    }
+
+    bool publish_raw(const std::string& name, const void* payload, size_t payload_len) {
+        return publish_raw(topic_id_for(name), payload, payload_len);
+    }
+    bool publish_raw(uint32_t topic_id, const void* payload, size_t payload_len) {
+        ensure_started();
+        std::vector<PeerAddr> peers;
+        {
+            std::lock_guard<std::mutex> lock(state_mutex_);
+            declared_topics_.insert(topic_id);
+            auto it = peers_.find(topic_id);
+            if (it != peers_.end()) peers = it->second;
+        }
+        UdpTransport& t = transport_for(topic_id);
+        bool all_ok = true;
+        for (const auto& peer : peers) {
+            all_ok = t.publish_raw(topic_id, payload, payload_len, peer) && all_ok;
+        }
+        return all_ok && !peers.empty();
     }
 
     // --- publish: sends to every currently-known peer for this topic ---
@@ -197,9 +288,10 @@ public:
             auto it = peers_.find(topic_id);
             if (it != peers_.end()) peers = it->second;
         }
+        UdpTransport& t = std::is_same<T, ImageChunk>::value ? transport_ : transport_for(topic_id);
         bool all_ok = true;
         for (const auto& peer : peers) {
-            all_ok = transport_.publish_raw(topic_id, &value, sizeof(T), peer) && all_ok;
+            all_ok = t.publish_raw(topic_id, &value, sizeof(T), peer) && all_ok;
         }
         return all_ok;
     }
@@ -385,6 +477,26 @@ public:
 private:
     friend class RlCoreConfig;
 
+    // Returns the transport that topic_id should send/receive on: the
+    // one shared transport_ in multiplexed mode (the default), or a
+    // dedicated, lazily-created per-topic transport when
+    // set_multiplex(false) is in effect. Must be called (directly or via
+    // advertise/subscribe/advertise_raw/subscribe_raw) BEFORE
+    // ensure_started() for the topic's dedicated port to be known in
+    // time to register/beacon it -- same ordering requirement
+    // declared_topics_ already has.
+    UdpTransport& transport_for(uint32_t topic_id) {
+        if (multiplex_) return transport_;
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        auto it = topic_transports_.find(topic_id);
+        if (it != topic_transports_.end()) return *it->second;
+        auto t = std::make_unique<UdpTransport>();
+        t->bind(0);
+        UdpTransport* raw = t.get();
+        topic_transports_.emplace(topic_id, std::move(t));
+        return *raw;
+    }
+
     void select_mode(DiscoveryMode requested) {
         std::lock_guard<std::mutex> lock(state_mutex_);
         if (mode_ != DiscoveryMode::None && mode_ != requested) {
@@ -416,40 +528,98 @@ private:
         transport_.bind(0);
 
         std::vector<uint32_t> topics;
+        // One group per distinct transport this node's declared topics
+        // ended up on: exactly one (the shared transport_) in the
+        // default multiplexed mode; one per topic (each its own
+        // dedicated transport, plus a leftover group for any topic that
+        // for whatever reason never got one -- e.g. Image, which always
+        // stays on transport_) when set_multiplex(false) is in effect.
+        // This is the ONLY place multiplex vs. demultiplex changes
+        // discovery behavior -- rlcore/multicast themselves don't need
+        // to know which mode a node is in, since each registration/
+        // beacon already carries its own explicit port alongside
+        // whichever topics it lists.
+        struct TopicGroup { UdpTransport* transport; std::vector<uint32_t> topics; };
+        std::vector<TopicGroup> groups;
         {
             std::lock_guard<std::mutex> lock2(state_mutex_);
             topics.assign(declared_topics_.begin(), declared_topics_.end());
+            if (!multiplex_ && !topic_transports_.empty()) {
+                std::unordered_set<uint32_t> demuxed;
+                for (auto& kv : topic_transports_) {
+                    groups.push_back(TopicGroup{kv.second.get(), std::vector<uint32_t>{kv.first}});
+                    demuxed.insert(kv.first);
+                }
+                std::vector<uint32_t> leftover;
+                for (uint32_t id : declared_topics_) if (!demuxed.count(id)) leftover.push_back(id);
+                if (!leftover.empty()) groups.push_back(TopicGroup{&transport_, leftover});
+            } else if (!topics.empty()) {
+                groups.push_back(TopicGroup{&transport_, topics});
+            }
         }
 
         std::vector<PeerAddr> newly_learned_peers; // for the NAT punch burst below
 
         if (mode == DiscoveryMode::RlCore) {
-            // Registration MUST happen on transport_'s own socket, before
-            // transport_.start() hands that socket's recv loop to the
-            // dedicated data thread (two threads calling recvfrom() on
-            // the same fd concurrently would race the ack reply against
-            // the data thread's recv_and_dispatch). This also has a
-            // second purpose beyond avoiding that race: when rlcore is
+            // Registration MUST happen on each group's own socket, before
+            // that transport's start() hands its socket's recv loop to
+            // its dedicated data thread (two threads calling recvfrom()
+            // on the same fd concurrently would race the ack reply
+            // against the data thread's recv_and_dispatch). This also has
+            // a second purpose beyond avoiding that race: when rlcore is
             // run with --nat, it learns each node's real (NAT-mapped)
             // public endpoint from the register request's UDP source
             // port -- that's only useful/correct if it's the SAME port
-            // the node's data traffic actually arrives on, i.e. this
-            // socket, not a throwaway one.
+            // that transport's data traffic actually arrives on, i.e.
+            // this socket, not a throwaway one. One RegisterRequest is
+            // sent per group, each with that group's own port -- rlcore
+            // needs no code change to hand back the right per-topic port,
+            // since it already stores whatever (ip, port, topic) triple
+            // each request declares.
             uint32_t self_ip = detect_local_ip_for_peer(set_rlcore.resolved_ip(),
                                                          set_rlcore.resolved_port());
-            auto outcome = register_with_rlcore_on_socket(
-                transport_.native_handle(),
-                set_rlcore.resolved_ip(), set_rlcore.resolved_port(),
-                self_ip, transport_.local_port(),
-                topics.data(), static_cast<uint16_t>(topics.size()));
-            if (outcome.ok) {
-                std::lock_guard<std::mutex> lock2(state_mutex_);
-                for (const auto& p : outcome.peers) {
-                    PeerAddr addr{p.ip, p.port};
-                    peers_[p.topic_id].push_back(addr);
-                    newly_learned_peers.push_back(addr);
+            for (const auto& g : groups) {
+                auto outcome = register_with_rlcore_on_socket(
+                    g.transport->native_handle(),
+                    set_rlcore.resolved_ip(), set_rlcore.resolved_port(),
+                    self_ip, g.transport->local_port(),
+                    g.topics.data(), static_cast<uint16_t>(g.topics.size()));
+                if (outcome.ok) {
+                    std::lock_guard<std::mutex> lock2(state_mutex_);
+                    for (const auto& p : outcome.peers) {
+                        PeerAddr addr{p.ip, p.port};
+                        peers_[p.topic_id].push_back(addr);
+                        newly_learned_peers.push_back(addr);
+                    }
                 }
             }
+            // Tell rlcore about any names we resolved for these topics
+            // (best-effort, fire-and-forget -- rl_topic.py's RLNQ query
+            // to rlcore is what actually depends on this, not any
+            // data-path behavior, so a dropped/lost announce here is
+            // harmless: worst case rl_topic.py's dictionary is missing
+            // one name until the next process that knows it announces).
+            {
+                std::vector<TopicDirEntry> entries;
+                {
+                    std::lock_guard<std::mutex> lock2(state_mutex_);
+                    entries.reserve(topic_names_.size());
+                    for (const auto& kv : topic_names_) entries.push_back(TopicDirEntry{kv.first, kv.second});
+                }
+                if (!entries.empty()) {
+                    uint8_t announce_buf[kTopicDirMaxPacket];
+                    size_t announce_len = 0;
+                    if (encode_topic_dir_announce(entries, announce_buf, sizeof(announce_buf), &announce_len)) {
+                        struct sockaddr_in dest{};
+                        dest.sin_family = AF_INET;
+                        dest.sin_addr.s_addr = htonl(set_rlcore.resolved_ip());
+                        dest.sin_port = htons(set_rlcore.resolved_port());
+                        ::sendto(transport_.native_handle(), announce_buf, announce_len, 0,
+                                 reinterpret_cast<struct sockaddr*>(&dest), sizeof(dest));
+                    }
+                }
+            }
+
             // If registration failed after retries, register_with_rlcore
             // already logged an error; proceed with an empty peer table
             // rather than crashing the node (spec: never hang forever).
@@ -459,12 +629,25 @@ private:
             MulticastDiscoveryConfig cfg;
             cfg.self_ip = detect_local_ip_for_peer(
                 ipv4_to_host_order(kDefaultMulticastGroup), kDefaultMulticastPort);
-            cfg.self_data_port = transport_.local_port();
-            cfg.local_topics = topics;
+            for (const auto& g : groups) {
+                cfg.port_groups.push_back(
+                    MulticastDiscoveryConfig::PortGroup{g.transport->local_port(), g.topics});
+            }
             mcast_ = std::make_unique<MulticastDiscovery>(cfg);
             mcast_->set_peer_discovered_callback([this](uint32_t topic, const PeerInfo& p) {
                 std::lock_guard<std::mutex> lock2(state_mutex_);
                 peers_[topic].push_back(PeerAddr{p.ip, p.port});
+            });
+            // Answers rl_topic's name-directory queries (see
+            // topic_directory.hpp) -- called from MulticastDiscovery's
+            // own listener thread, so lock state_mutex_ ourselves rather
+            // than relying on a caller that already holds it.
+            mcast_->set_topic_name_provider([this]() {
+                std::lock_guard<std::mutex> lock2(state_mutex_);
+                std::vector<TopicDirEntry> out;
+                out.reserve(topic_names_.size());
+                for (const auto& kv : topic_names_) out.push_back(TopicDirEntry{kv.first, kv.second});
+                return out;
             });
             mcast_->start();
         }
@@ -482,6 +665,13 @@ private:
         // opt-in only via set_data_thread_core(core).
         int pin_core = (data_thread_core_override_ == kAutoPinCore) ? -1 : data_thread_core_override_;
         transport_.start(pin_core, use_realtime_, rt_priority_);
+        {
+            // Demultiplexed topics each need their own data thread too --
+            // set_topic_handler() was already called on these at
+            // advertise/subscribe time, before this point.
+            std::lock_guard<std::mutex> lock2(state_mutex_);
+            for (auto& kv : topic_transports_) kv.second->start(pin_core, use_realtime_, rt_priority_);
+        }
 
         // NAT hole punching: fire a small burst of empty datagrams at
         // every peer learned from this registration. This only matters
@@ -545,6 +735,9 @@ private:
 
     UdpTransport transport_;
     std::unique_ptr<MulticastDiscovery> mcast_;
+
+    bool multiplex_ = true;
+    std::unordered_map<uint32_t, std::unique_ptr<UdpTransport>> topic_transports_;
 };
 
 } // namespace relink
@@ -567,3 +760,15 @@ using relink::UInt32;
 using relink::UInt64;
 using relink::Float32;
 using relink::Float64;
+
+// Standard message types (relink/standard_msgs.hpp) at ROS-familiar,
+// top-level namespace names -- `std_msgs::Header`, `geometry_msgs::Pose`,
+// `sensor_msgs::Imu`, `nav_msgs::Odometry`, etc., not nested under
+// `relink::`, matching how ROS/NoROSLib code addresses them.
+namespace std_msgs = relink::std_msgs;
+namespace geometry_msgs = relink::geometry_msgs;
+namespace sensor_msgs = relink::sensor_msgs;
+namespace nav_msgs = relink::nav_msgs;
+namespace diagnostic_msgs = relink::diagnostic_msgs;
+namespace trajectory_msgs = relink::trajectory_msgs;
+namespace actionlib_msgs = relink::actionlib_msgs;

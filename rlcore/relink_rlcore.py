@@ -7,11 +7,13 @@ the C++ build (rlcore/relink_rlcore.cpp) -- same struct layout,
 little-endian, no framework beyond the standard library (socket + struct),
 per the spec's "no heavy serialization" rule applied to every language.
 
-Wire layout (matches relink/include/relink/register.hpp exactly):
+Wire layout (matches relink/include/relink/register.hpp exactly, topic_id
+widened to uint32_t -- see relink_py/relink/register.py, the reference
+this file was previously out of sync with):
     RegisterRequestHeader = "<IHH"  node_ip(u32) node_port(u16) topic_count(u16)
-                            + topic_count * "<H"
+                            + topic_count * "<I"
     RegisterAckHeader     = "<BH"   status(u8) peer_count(u16)
-                            + peer_count * RegisterAckPeer("<IHH" ip,port,topic_id)
+                            + peer_count * RegisterAckPeer("<IHI" ip,port,topic_id)
 
 --nat: NAT traversal / UDP hole punching support, mirrors
 rlcore/relink_rlcore.cpp's --nat flag exactly (byte-identical
@@ -23,9 +25,13 @@ the actual NAT hole additionally requires each RelinkNode client to send
 a punch-packet burst to every peer it learns about -- see
 relink/node.py's _ensure_started().
 """
+import os
 import socket
 import struct
 import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "relink_py"))
+from relink import topic_directory as tdir
 
 DEFAULT_PORT = 8445
 
@@ -33,7 +39,7 @@ REQ_HEADER_FMT = "<IHH"     # node_ip, node_port, topic_count
 REQ_HEADER_LEN = struct.calcsize(REQ_HEADER_FMT)
 ACK_HEADER_FMT = "<BH"      # status, peer_count
 ACK_HEADER_LEN = struct.calcsize(ACK_HEADER_FMT)
-PEER_FMT = "<IHH"           # ip, port, topic_id
+PEER_FMT = "<IHI"           # ip, port, topic_id
 PEER_LEN = struct.calcsize(PEER_FMT)
 
 
@@ -41,10 +47,10 @@ def decode_register_request(buf: bytes):
     if len(buf) < REQ_HEADER_LEN:
         return None
     node_ip, node_port, topic_count = struct.unpack_from(REQ_HEADER_FMT, buf, 0)
-    expected = REQ_HEADER_LEN + topic_count * 2
+    expected = REQ_HEADER_LEN + topic_count * 4
     if len(buf) != expected:
         return None
-    topics = list(struct.unpack_from("<%dH" % topic_count, buf, REQ_HEADER_LEN)) if topic_count else []
+    topics = list(struct.unpack_from("<%dI" % topic_count, buf, REQ_HEADER_LEN)) if topic_count else []
     return node_ip, node_port, topics
 
 
@@ -68,8 +74,33 @@ def main():
 
     table = {}  # topic_id -> set of (ip, port)
 
+    # topic_id -> name, accumulated from RLNM announces sent by any node
+    # registered here (see relink_py/relink/topic_directory.py) -- lets
+    # rl_topic.py ask rlcore for every topic name any node in this fleet
+    # has resolved, via a single RLNQ query, instead of reaching each
+    # node individually.
+    topic_names = {}
+
     while True:
-        data, addr = sock.recvfrom(2048)
+        data, addr = sock.recvfrom(max(2048, tdir.MAX_PACKET))
+
+        kind = tdir.packet_kind(data)
+        if kind == "announce":
+            entries = tdir.decode_entries(data)
+            if entries is not None:
+                for e in entries:
+                    topic_names[e.topic_id] = e.name
+            continue
+        if kind == "query":
+            entries = [tdir.TopicDirEntry(tid, name) for tid, name in topic_names.items()]
+            try:
+                sock.sendto(tdir.encode_reply(entries), addr)
+            except (ValueError, OSError):
+                pass
+            continue
+        if kind == "reply":
+            continue  # rlcore never queries anyone itself
+
         decoded = decode_register_request(data)
         if decoded is None:
             print("relink-rlcore: dropped malformed RegisterRequest", file=sys.stderr, flush=True)

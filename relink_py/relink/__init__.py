@@ -14,6 +14,8 @@ from .node import RelinkNode, DiscoveryMode
 from .register import RLCORE_DEFAULT_PORT
 from .multicast_discovery import DEFAULT_MULTICAST_GROUP, DEFAULT_MULTICAST_PORT
 from .image import ImageChunk, ImageReassembler, ImageTooLargeError, MAX_IMAGE_BYTES
+from . import std_msgs, geometry_msgs, sensor_msgs, nav_msgs
+from . import diagnostic_msgs, trajectory_msgs, actionlib_msgs
 
 __all__ = [
     "RelinkNode", "DiscoveryMode",
@@ -22,4 +24,6 @@ __all__ = [
     "is_wire_type",
     "RLCORE_DEFAULT_PORT", "DEFAULT_MULTICAST_GROUP", "DEFAULT_MULTICAST_PORT",
     "ImageChunk", "ImageReassembler", "ImageTooLargeError", "MAX_IMAGE_BYTES",
+    "std_msgs", "geometry_msgs", "sensor_msgs", "nav_msgs",
+    "diagnostic_msgs", "trajectory_msgs", "actionlib_msgs",
 ]

@@ -16,6 +16,7 @@
 #pragma once
 
 #include "relink/beacon.hpp"
+#include "relink/topic_directory.hpp"
 #include <atomic>
 #include <thread>
 #include <mutex>
@@ -51,11 +52,20 @@ struct MulticastDiscoveryConfig {
     uint16_t group_port = kDefaultMulticastPort;
 
     uint32_t self_ip = 0;      // host byte order -- this node's own IP
-    uint16_t self_data_port = 0; // this node's UDP data port
 
-    // Topics this node publishes OR subscribes to -- beaconed as interest,
-    // per spec ("Subscribers beacon their own topic interest too").
-    std::vector<uint32_t> local_topics;
+    // One beacon is sent per group, each with its own port. Multiplexed
+    // nodes (the default) have exactly one group covering every declared
+    // topic on the node's single shared data port. A node running with
+    // set_multiplex(false) (see relink.hpp) instead has one group per
+    // topic, each carrying that topic's own dedicated port -- letting
+    // peers learn a per-topic port the same way rostopic-style
+    // one-port-per-topic nodes do, without changing the beacon's wire
+    // format at all (still just node_ip + node_port + topic_ids).
+    struct PortGroup {
+        uint16_t port = 0;
+        std::vector<uint32_t> topics;
+    };
+    std::vector<PortGroup> port_groups;
 
     // Spec defaults: 3x jittered startup burst (0-200ms between sends),
     // then sparse 30-60s re-announce. Tests override these to be fast.
@@ -67,7 +77,12 @@ struct MulticastDiscoveryConfig {
 
 class MulticastDiscovery {
 public:
-    explicit MulticastDiscovery(MulticastDiscoveryConfig cfg) : cfg_(std::move(cfg)) {}
+    explicit MulticastDiscovery(MulticastDiscoveryConfig cfg) : cfg_(std::move(cfg)) {
+        for (const auto& g : cfg_.port_groups) {
+            self_ports_.insert(g.port);
+            for (uint32_t t : g.topics) local_topics_.insert(t);
+        }
+    }
     ~MulticastDiscovery() { stop(); }
 
     MulticastDiscovery(const MulticastDiscovery&) = delete;
@@ -75,6 +90,14 @@ public:
 
     void set_peer_discovered_callback(PeerDiscoveredCallback cb) {
         on_peer_discovered_ = std::move(cb);
+    }
+
+    // Lets RelinkNode answer rl_topic's "what topic names do you know?"
+    // queries without MulticastDiscovery needing to know anything about
+    // RelinkNode's internal registry -- called from the listener thread
+    // whenever an RLNQ query arrives, must be safe to call from there.
+    void set_topic_name_provider(std::function<std::vector<TopicDirEntry>()> provider) {
+        name_provider_ = std::move(provider);
     }
 
     void start() {
@@ -109,6 +132,18 @@ public:
     size_t known_topic_count() {
         std::lock_guard<std::mutex> lock(table_mutex_);
         return table_.size();
+    }
+
+    // Every topic_id seen in ANY beacon from ANY peer so far, regardless
+    // of whether this node itself declared it -- this is what lets
+    // rltopic_list() show topics other nodes have, not just our own
+    // (see relink.hpp). Only the numeric id crosses the wire (beacons
+    // never carry names), so a topic learned this way has no name here;
+    // RelinkNode::rltopic_list() fills one in only if this same process
+    // separately resolved that id itself via topic_id_for().
+    std::vector<uint32_t> all_known_topic_ids() {
+        std::lock_guard<std::mutex> lock(network_topics_mutex_);
+        return std::vector<uint32_t>(network_topics_.begin(), network_topics_.end());
     }
 
 private:
@@ -162,20 +197,22 @@ private:
     }
 
     void send_beacon_once() {
-        uint8_t buf[512];
-        size_t len = 0;
-        auto er = encode_beacon_packet(cfg_.self_ip, cfg_.self_data_port,
-                                        cfg_.local_topics.data(),
-                                        static_cast<uint16_t>(cfg_.local_topics.size()),
-                                        buf, sizeof(buf), &len);
-        if (er != BeaconEncodeResult::Ok) return;
-
         struct sockaddr_in dest{};
         dest.sin_family = AF_INET;
         ::inet_pton(AF_INET, cfg_.group_ip.c_str(), &dest.sin_addr);
         dest.sin_port = htons(cfg_.group_port);
 
-        ::sendto(send_sock_, buf, len, 0, reinterpret_cast<struct sockaddr*>(&dest), sizeof(dest));
+        // One beacon per port group -- see PortGroup's comment above.
+        for (const auto& g : cfg_.port_groups) {
+            uint8_t buf[512];
+            size_t len = 0;
+            auto er = encode_beacon_packet(cfg_.self_ip, g.port,
+                                            g.topics.data(),
+                                            static_cast<uint16_t>(g.topics.size()),
+                                            buf, sizeof(buf), &len);
+            if (er != BeaconEncodeResult::Ok) continue;
+            ::sendto(send_sock_, buf, len, 0, reinterpret_cast<struct sockaddr*>(&dest), sizeof(dest));
+        }
     }
 
     void sender_loop() {
@@ -222,17 +259,51 @@ private:
                                     reinterpret_cast<struct sockaddr*>(&src), &src_len);
             if (n <= 0) continue;
 
+            // rl_topic's name-directory protocol shares this port but is
+            // tagged with its own magic (see topic_directory.hpp) so it
+            // can never be mistaken for a BeaconPacket -- check that
+            // first, and only fall through to beacon decoding otherwise.
+            TopicDirKind dir_kind = topic_dir_packet_kind(buf, static_cast<size_t>(n));
+            if (dir_kind == TopicDirKind::Query) {
+                if (name_provider_) {
+                    std::vector<TopicDirEntry> entries = name_provider_();
+                    uint8_t reply_buf[kTopicDirMaxPacket];
+                    size_t reply_len = 0;
+                    if (encode_topic_dir_reply(entries, reply_buf, sizeof(reply_buf), &reply_len)) {
+                        ::sendto(send_sock_, reply_buf, reply_len, 0,
+                                 reinterpret_cast<struct sockaddr*>(&src), src_len);
+                    }
+                }
+                continue;
+            }
+            if (dir_kind == TopicDirKind::Announce || dir_kind == TopicDirKind::Reply) {
+                continue; // not collected locally -- only rl_topic consumes these
+            }
+
             DecodedBeacon b{};
             if (decode_beacon_packet(buf, static_cast<size_t>(n), &b) != BeaconDecodeResult::Ok) {
                 continue; // malformed / non-ReLink traffic on this port: drop
             }
 
-            // Ignore our own beacon (loopback delivers it to ourselves too).
-            if (b.node_ip == cfg_.self_ip && b.node_port == cfg_.self_data_port) continue;
+            // Ignore our own beacon (loopback delivers it to ourselves too) --
+            // any of our own port groups' ports counts as "ours" now that a
+            // demultiplexed node beacons from several ports, not just one.
+            if (b.node_ip == cfg_.self_ip && self_ports_.count(b.node_port)) continue;
 
             for (uint16_t i = 0; i < b.topic_count; ++i) {
                 uint32_t topic = beacon_topic_at(b, i);
-                if (!local_topics_.count(topic)) continue; // no overlap: discard, keep no state
+
+                // Record every topic id we ever see, regardless of local
+                // interest -- this is a network-wide "what topics exist"
+                // view (rltopic_list()), separate from the peer-routing
+                // table below (which only tracks topics WE need peers
+                // for, per the original discovery-overlap design).
+                {
+                    std::lock_guard<std::mutex> lock(network_topics_mutex_);
+                    network_topics_.insert(topic);
+                }
+
+                if (!local_topics_.count(topic)) continue; // no overlap: discard, keep no peer-routing state
 
                 PeerInfo peer{b.node_ip, b.node_port};
                 bool is_new;
@@ -250,7 +321,8 @@ private:
     }
 
     MulticastDiscoveryConfig cfg_;
-    std::unordered_set<uint32_t> local_topics_{cfg_.local_topics.begin(), cfg_.local_topics.end()};
+    std::unordered_set<uint32_t> local_topics_;
+    std::unordered_set<uint16_t> self_ports_;
 
     std::atomic<bool> running_{false};
     int send_sock_ = -1;
@@ -266,7 +338,11 @@ private:
     std::mutex table_mutex_;
     std::unordered_map<uint32_t, std::unordered_map<std::pair<uint32_t, uint16_t>, bool, PairHash>> table_;
 
+    std::mutex network_topics_mutex_;
+    std::unordered_set<uint32_t> network_topics_;
+
     PeerDiscoveredCallback on_peer_discovered_;
+    std::function<std::vector<TopicDirEntry>()> name_provider_;
 };
 
 } // namespace relink

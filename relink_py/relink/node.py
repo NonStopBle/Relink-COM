@@ -14,13 +14,15 @@ from typing import Callable, Dict, List, Optional, Set, Type, Union
 
 from .wire import is_wire_type, NAT_PUNCH_TOPIC_ID
 from .topic_hash import fnv1a32
-from .udp_transport import UdpTransport, PeerAddr, ipv4_to_host_order
+from .udp_transport import UdpTransport, PeerAddr, ipv4_to_host_order, host_order_to_ipv4
 from .rlcore_client import register_with_rlcore_on_socket
 from .multicast_discovery import (
-    MulticastDiscovery, MulticastDiscoveryConfig,
+    MulticastDiscovery, MulticastDiscoveryConfig, PortGroup,
     DEFAULT_MULTICAST_GROUP, DEFAULT_MULTICAST_PORT,
 )
 from .register import RLCORE_DEFAULT_PORT
+from .topic_directory import TopicDirEntry
+from . import topic_directory as tdir
 from .image import (
     ImageChunk, encode_image_chunks, ImageReassembler, ImageTooLargeError,
     MAX_IMAGE_BYTES, IMAGE_CHUNK_DATA_BYTES, IMAGE_CHUNK_HEADER_BYTES,
@@ -92,6 +94,8 @@ class RelinkNode:
 
         self._transport = UdpTransport()
         self._mcast: Optional[MulticastDiscovery] = None
+        self._multiplex = True
+        self._topic_transports: Dict[int, UdpTransport] = {}
 
         self._start_lock = threading.Lock()
         self._started = False
@@ -100,6 +104,30 @@ class RelinkNode:
     # --- mode B, mutually exclusive with mode A ---
     def use_multicast_discovery(self):
         self._select_mode(DiscoveryMode.MULTICAST)
+
+    def set_multiplex(self, enabled: bool):
+        """True (default): every topic shares this node's one UDP
+        socket/port. False: each advertise/subscribe/advertise_raw/
+        subscribe_raw call after this is set gets its own dedicated
+        UdpTransport on its own ephemeral port, ROS-style. Discovery
+        automatically announces each topic's real port -- rlcore/
+        multicast need no separate opt-in, since a registration/beacon
+        already carries an explicit port alongside whichever topics it
+        lists. Must be called before the advertise/subscribe/publish
+        calls it should affect. Image stays on the shared transport
+        regardless of this setting. See relink.hpp's set_multiplex()
+        for the full rationale."""
+        self._multiplex = enabled
+
+    def _transport_for(self, topic_id: int) -> UdpTransport:
+        if self._multiplex:
+            return self._transport
+        t = self._topic_transports.get(topic_id)
+        if t is None:
+            t = UdpTransport()
+            t.bind(0)
+            self._topic_transports[topic_id] = t
+        return t
 
     def _select_mode(self, requested: DiscoveryMode):
         if self._mode != DiscoveryMode.NONE and self._mode != requested:
@@ -138,14 +166,21 @@ class RelinkNode:
         return self._topic_names.get(topic_id, "")
 
     def rltopic_list(self) -> List[Dict[str, object]]:
-        """Lists every topic this node has advertised or subscribed to
-        so far, with its human name when known -- a debugging/
-        introspection aid, not part of the wire protocol. Each entry is
-        {"topic_id": int, "name": str} (name is "" if this topic was
-        declared by numeric id directly)."""
+        """Lists every topic id THIS node has itself declared, PLUS --
+        when using multicast discovery -- every topic id any other
+        node's beacon has announced, network-wide (rostopic-list-style).
+        Beacons only ever carry the numeric id, never a name, so a topic
+        learned purely from the network has name "" here; it only gets a
+        name if this same process separately resolved that id itself via
+        _topic_id_for() (i.e. it also advertised/subscribed that name).
+        Mode A (rlcore) does not currently feed this beyond what this
+        node declared -- the daemon doesn't broadcast a topic roster."""
+        ids = set(self._declared_topics)
+        if self._mcast is not None:
+            ids.update(self._mcast.all_known_topic_ids())
         return [
             {"topic_id": tid, "name": self._topic_names.get(tid, "")}
-            for tid in sorted(self._declared_topics)
+            for tid in sorted(ids)
         ]
 
     # --- advertise: publisher-side topic declaration ---
@@ -155,7 +190,9 @@ class RelinkNode:
         if not is_wire_type(msg_type):
             raise TypeError(f"{msg_type} must be a ctypes.Structure subclass with _pack_ = 1")
         if msg_type is ImageChunk:
-            self._transport.enable_large_buffers()
+            self._transport.enable_large_buffers()  # Image always stays on the shared transport
+        else:
+            self._transport_for(topic_id)
         self._declared_topics.add(topic_id)
 
     # --- subscribe: receiver-side topic declaration + typed callback,
@@ -167,13 +204,50 @@ class RelinkNode:
             raise TypeError(f"{msg_type} must be a ctypes.Structure subclass with _pack_ = 1")
         self._declared_topics.add(topic_id)
         expected_size = ctypes.sizeof(msg_type)
+        t = self._transport if msg_type is ImageChunk else self._transport_for(topic_id)
 
         def raw_handler(payload: bytes):
             if len(payload) != expected_size:
                 return  # type/size mismatch: drop, never misinterpret bytes
             callback(msg_type.from_buffer_copy(payload))
 
-        self._transport.set_topic_handler(topic_id, raw_handler)
+        t.set_topic_handler(topic_id, raw_handler)
+
+    # --- subscribe_raw/publish_raw: type-agnostic escape hatch, for
+    # tooling that inspects a topic without knowing its message type
+    # (rl_topic.py's echo/hz/bw subcommands) -- NOT for application
+    # code, which should always use the typed advertise/subscribe/
+    # publish above so a size mismatch is caught per ReLink's "never
+    # misinterpret bytes" rule instead of being handed unstructured
+    # bytes.
+    def advertise_raw(self, topic: Union[int, str]):
+        """Declares intent to publish `topic` without committing to a
+        message type -- must be called (or subscribe_raw/publish_raw
+        called) BEFORE the first spin_once()/publish()/subscribe() of
+        any kind, same ordering requirement as advertise<T>, since the
+        topic list beacons/registers with is snapshotted once at
+        ensure_started() time."""
+        topic_id = self._topic_id_for(topic)
+        self._transport_for(topic_id)
+        self._declared_topics.add(topic_id)
+
+    def subscribe_raw(self, topic: Union[int, str], callback: Callable[[bytes], None]):
+        topic_id = self._topic_id_for(topic)
+        t = self._transport_for(topic_id)
+        self._declared_topics.add(topic_id)
+        t.set_topic_handler(topic_id, callback)
+
+    def publish_raw(self, topic: Union[int, str], payload: bytes) -> bool:
+        topic_id = self._topic_id_for(topic)
+        self._declared_topics.add(topic_id)
+        self._ensure_started()
+        with self._peers_lock:
+            peers = list(self._peers.get(topic_id, []))
+        t = self._transport_for(topic_id)
+        all_ok = True
+        for peer in peers:
+            all_ok = t.publish_raw(topic_id, payload, peer) and all_ok
+        return all_ok and bool(peers)
 
     # --- publish: sends to every currently-known peer for this topic ---
     def publish(self, topic: Union[int, str], value: ctypes.Structure) -> bool:
@@ -182,9 +256,10 @@ class RelinkNode:
         with self._peers_lock:
             peers = list(self._peers.get(topic_id, []))
         payload = bytes(value)
+        t = self._transport if type(value) is ImageChunk else self._transport_for(topic_id)
         all_ok = True
         for peer in peers:
-            all_ok = self._transport.publish_raw(topic_id, payload, peer) and all_ok
+            all_ok = t.publish_raw(topic_id, payload, peer) and all_ok
         return all_ok
 
     # --- Image: a library-provided large-blob type, automatically
@@ -314,6 +389,28 @@ class RelinkNode:
             self._transport.bind(0)
 
             topics = list(self._declared_topics)
+
+            # One group per distinct transport a declared topic ended up
+            # on: one group (the shared transport) in the default
+            # multiplexed mode; one group per topic (plus a leftover
+            # group for anything that stayed on the shared transport,
+            # e.g. Image) when set_multiplex(False) is in effect. This is
+            # the only place multiplex vs. demultiplex changes discovery
+            # behavior -- rlcore/multicast don't need to know which mode
+            # a node is in, since each registration/beacon already
+            # carries its own explicit port alongside whichever topics it
+            # lists.
+            groups = []  # list of (transport, topics)
+            if not self._multiplex and self._topic_transports:
+                demuxed = set(self._topic_transports.keys())
+                for tid, t in self._topic_transports.items():
+                    groups.append((t, [tid]))
+                leftover = [tid for tid in self._declared_topics if tid not in demuxed]
+                if leftover:
+                    groups.append((self._transport, leftover))
+            elif topics:
+                groups.append((self._transport, topics))
+
             newly_learned_peers: List[PeerAddr] = []  # for the NAT punch burst below
 
             if self._mode == DiscoveryMode.RLCORE:
@@ -330,27 +427,40 @@ class RelinkNode:
                 # one.
                 self_ip = _detect_local_ip_for_peer(self.set_rlcore.resolved_ip,
                                                      self.set_rlcore.resolved_port)
-                outcome = register_with_rlcore_on_socket(
-                    self._transport.sock,
-                    self.set_rlcore.resolved_ip, self.set_rlcore.resolved_port,
-                    self_ip, self._transport.local_port, topics)
-                if outcome.ok:
-                    with self._peers_lock:
-                        for p in outcome.peers:
-                            addr = PeerAddr(p.ip, p.port)
-                            self._peers.setdefault(p.topic_id, []).append(addr)
-                            newly_learned_peers.append(addr)
+                for t, group_topics in groups:
+                    outcome = register_with_rlcore_on_socket(
+                        t.sock,
+                        self.set_rlcore.resolved_ip, self.set_rlcore.resolved_port,
+                        self_ip, t.local_port, group_topics)
+                    if outcome.ok:
+                        with self._peers_lock:
+                            for p in outcome.peers:
+                                addr = PeerAddr(p.ip, p.port)
+                                self._peers.setdefault(p.topic_id, []).append(addr)
+                                newly_learned_peers.append(addr)
                 # If registration failed after retries, register_with_rlcore
                 # already logged an error; proceed with an empty peer table
                 # rather than crashing the node.
+
+                # Tell rlcore about any names we resolved for these topics
+                # (best-effort, fire-and-forget -- see the C++ side's
+                # identical comment in relink.hpp for the rationale).
+                if self._topic_names:
+                    entries = [TopicDirEntry(tid, name) for tid, name in self._topic_names.items()]
+                    try:
+                        announce = tdir.encode_announce(entries)
+                        self._transport.sock.sendto(
+                            announce, (host_order_to_ipv4(self.set_rlcore.resolved_ip), self.set_rlcore.resolved_port))
+                    except (ValueError, OSError):
+                        pass
+
                 self._transport.start()
             else:
                 self._transport.start()
                 cfg = MulticastDiscoveryConfig(
                     self_ip=_detect_local_ip_for_peer(
                         ipv4_to_host_order(DEFAULT_MULTICAST_GROUP), DEFAULT_MULTICAST_PORT),
-                    self_data_port=self._transport.local_port,
-                    local_topics=topics,
+                    port_groups=[PortGroup(t.local_port, group_topics) for t, group_topics in groups],
                 )
                 self._mcast = MulticastDiscovery(cfg)
 
@@ -359,7 +469,18 @@ class RelinkNode:
                         self._peers.setdefault(topic, []).append(PeerAddr(peer.ip, peer.port))
 
                 self._mcast.set_peer_discovered_callback(on_peer)
+
+                def name_provider():
+                    return [TopicDirEntry(tid, name) for tid, name in self._topic_names.items()]
+
+                self._mcast.set_topic_name_provider(name_provider)
                 self._mcast.start()
+
+            # Demultiplexed topics each need their own data thread too --
+            # set_topic_handler() was already called on these at
+            # advertise/subscribe time, before this point.
+            for t in self._topic_transports.values():
+                t.start()
 
             # NAT hole punching: fire a small burst of empty datagrams at
             # every peer learned from this registration. Only matters

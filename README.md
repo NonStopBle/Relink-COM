@@ -1,145 +1,123 @@
+<div align="center">
+
 # ReLink
 
-A lightweight, ROS-like publish/subscribe protocol over UDP — built to be
-faster and simpler than ROS1/ROS2, with reference implementations in
-**C++** and **Python** that talk the same wire protocol interchangeably.
+**A lightweight, ROS-like publish/subscribe protocol over UDP — built to be
+faster and simpler than ROS1/ROS2.**
 
-## Abstract — why this exists
+![C++17](https://img.shields.io/badge/C%2B%2B-17-blue)
+![Python](https://img.shields.io/badge/Python-3.8%2B-blue)
+![Transport](https://img.shields.io/badge/transport-UDP-orange)
+![Platform](https://img.shields.io/badge/platform-Linux-lightgrey)
 
-Robotics and distributed-sensor stacks have reached for ROS as the
-default pub/sub layer for over a decade, but ROS's messaging core carries
-costs that show up directly in latency and jitter budgets: ROS1's
-TCPROS pays a per-message connection-management tax and depends on a
-single master for topic registration; ROS2's DDS fixes the master but
-replaces it with continuous multicast re-announcement (SPDP) that scales
-as O(N²) with node count and can flood constrained or WiFi networks the
-longer a system stays up. Neither was designed around a hard real-time
-latency floor — they were designed around generality (arbitrary QoS
-policies, arbitrary transports, arbitrary serialization), and generality
-has a cost.
+You do not need ROS installed. You do not need a master or a DDS
+implementation. Two reference implementations — **C++** and **Python** —
+speak the exact same bytes on the wire and are interchangeable.
 
-**ReLink exists for the case where you don't need that generality and do
-need the latency floor**: a fixed-layout message over raw UDP, discovered
-once at startup (not re-announced forever), serialized by a straight
-`memcpy` instead of a schema-driven encoder, dispatched on a dedicated
-thread with no lock in the hot path. In head-to-head measurement against
-ROS2 Humble on identical hardware/payload/rate (see Benchmarks below),
-that design difference is not theoretical: ReLink measured **~3x lower
-average latency and ~10x lower worst-case tail latency**.
+</div>
 
-The tradeoff is explicit, not hidden: ReLink is a **protocol**, not a
-general messaging framework. One message type per topic, fixed at
-registration. No arbitrary QoS matrix, no reliable-transport path in v1,
-no schema evolution story. If your system needs those things, ROS2/DDS
-is the more complete answer. If your system needs a `1000Hz+`,
-sub-millisecond, small-message control loop between a known set of nodes
-on a LAN — sensor fusion, joint-state streaming, a control loop between
-a planner and a driver — ReLink is built specifically for that case and
-gives up generality to get there.
+---
 
-**Byte layout over library**: every struct on the wire (header, beacon,
-default types, custom types) is documented as an exact byte layout, not
-just a C++ struct — which is *why* a second language binding (this repo
-ships both C++ and Python, proven wire-compatible in both directions) is
-a from-scratch reimplementation of the same bytes, not a wrapper around
-the C++ library. Any language that can open a UDP socket and pack a
-fixed struct can speak ReLink.
+## Table of contents
 
-## Zero to one
+- [Step 0 — What ReLink actually is](#step-0--what-relink-actually-is)
+- [Step 1 — Get the code](#step-1--get-the-code)
+- [Step 2 — Zero to one (run it)](#step-2--zero-to-one-run-it)
+- [Step 3 — Pick a discovery mode](#step-3--pick-a-discovery-mode)
+- [Step 4 — Named topics](#step-4--named-topics)
+- [Step 5 — Quick start: C++](#step-5--quick-start-c)
+- [Step 6 — Quick start: Python](#step-6--quick-start-python)
+- [Step 7 — Message types](#step-7--message-types)
+- [Step 8 — Sending images](#step-8--sending-images)
+- [Step 9 — Running the rlcore daemon](#step-9--running-the-rlcore-daemon)
+- [Step 10 — All examples](#step-10--all-examples)
+- [Step 11 — Testing](#step-11--testing)
+- [Step 12 — Benchmarks](#step-12--benchmarks)
+- [Step 13 — NAT traversal (cross-network nodes)](#step-13--nat-traversal-cross-network-nodes)
+- [Step 14 — Troubleshooting](#step-14--troubleshooting)
+- [Reference](#reference)
+  - [Feature matrix](#feature-matrix)
+  - [Repository layout](#repository-layout)
+  - [Status / scope](#status--scope)
+
+---
+
+## Step 0 — What ReLink actually is
+
+| Word | What it actually means |
+|---|---|
+| **Node** | Any process using `RelinkNode` (C++) or `RelinkNode` (Python). No node type distinction — every node can advertise, subscribe, and publish at once. |
+| **Topic** | A named or numbered channel. One message type per topic, fixed at registration — not renegotiable later. |
+| **Discovery** | How nodes find each other's IP/port before they can exchange messages. ReLink has exactly two modes (Step 3) — no auto-negotiated QoS, no DDS-style SPDP. |
+| **Wire format** | The literal byte layout of every packet — documented, not just implied by a struct definition. A from-scratch reimplementation in any language that can open a UDP socket can speak ReLink. |
+| **rlcore** | The optional small daemon used for Mode A discovery. Not required — Mode B (multicast) needs no daemon at all. |
+
+> **Why this exists:** ROS1's TCPROS pays a per-message connection-management
+> tax and depends on a single master. ROS2's DDS fixes the master but
+> replaces it with continuous multicast re-announcement (SPDP) that scales
+> as O(N²) with node count and grows the longer a system stays up. Neither
+> was designed around a hard real-time latency floor — both were designed
+> around generality (arbitrary QoS, arbitrary transports, arbitrary
+> serialization), and generality has a cost. ReLink gives up that
+> generality — one message type per topic, no reliable-transport path in
+> v1, no schema evolution — in exchange for a fixed-layout message over
+> raw UDP, discovered once (not re-announced forever), serialized by a
+> straight `memcpy`, dispatched on a dedicated thread with no lock in the
+> hot path. Measured head-to-head against ROS2 Humble on identical
+> hardware/payload/rate (Step 12): **~3x lower average latency, ~10x lower
+> worst-case tail latency**.
+
+If your system needs TCP reliability, arbitrary QoS policies, or schema
+evolution, ROS2/DDS is the more complete answer. If your system needs a
+`1000Hz+`, sub-millisecond, small-message control loop between a known set
+of nodes on a LAN — sensor fusion, joint-state streaming, a control loop
+between a planner and a driver — this is built specifically for that case.
+
+---
+
+## Step 1 — Get the code
+
+```bash
+git clone https://github.com/NonStopBle/Relink-COM.git
+cd Relink-COM
+```
+
+This is currently the only way to install it — there is no package
+manager entry, on purpose (see Step 0: no codegen, no dependency surface
+beyond a socket).
+
+---
+
+## Step 2 — Zero to one (run it)
 
 The fastest way to see it work: run the same tiny program twice (two
-terminals, or two computers on the same network) and watch them find
-each other and start talking, with no daemon, no config file, and no
-manual IP address to type in.
+terminals, or two computers on the same network) and watch them find each
+other and start talking — no daemon, no config file, no manual IP address.
 
-| Step | Do this | Why |
+| | C++ | Python |
 |---|---|---|
-| **1** | `git clone https://github.com/NonStopBle/Relink-COM.git && cd Relink-COM` | Get the code. |
-| **2** | Pick a language: **C++** or **Python**. Both talk the exact same protocol, so it doesn't matter which — you can even mix them. | ReLink isn't tied to one language. |
-| **3** | **C++**: `g++ -std=c++17 -I relink/include -pthread examples/cpp/hello_relink.cpp -o hello_relink`<br>**Python**: nothing to build — it's plain stdlib. | C++ needs a compile step; Python doesn't. |
-| **4** | Open **two terminal windows**. In each one, run the same program:<br>**C++**: `./hello_relink`<br>**Python**: `python3 relink_py/examples/hello_relink.py` | Each copy is both a sender and a receiver. |
-| **5** | Watch both windows. Within a second or two, each one prints `sent: N (to 1 peer(s))` and `received: N` — they found each other automatically over the network (multicast) and are exchanging a counter, once a second, in both directions. | This is discovery + pub/sub working, live. |
-| **6** | Open `relink_py/examples/hello_relink.py` or `examples/cpp/hello_relink.cpp` and read it — it's under 60 lines. Change `TOPIC_HELLO`, the message type, or what happens when a message arrives, and you're writing your own ReLink node. | The whole API surface is: `advertise`, `subscribe`, `publish`, `spin`. |
+| **Build** | `g++ -std=c++17 -I relink/include -pthread examples/cpp/hello_relink.cpp -o hello_relink` | nothing to build — pure stdlib |
+| **Run (in two terminals)** | `./hello_relink` | `python3 relink_py/examples/hello_relink.py` |
 
-If step 5 never prints `received:` on either side, the two copies most
-likely aren't on the same network segment, or something on the network
-is blocking UDP multicast (some WiFi routers and most cloud VPCs do) —
-see **Discovery modes** below for the alternative (a small daemon
-instead of multicast) that works around that.
+Within a second or two, each window prints `sent: N (to 1 peer(s))` and
+`received: N` — the two copies found each other over multicast and are
+exchanging a counter, once a second, in both directions.
 
-## Features
+**Check it worked**: if step 2 never prints `received:` on either side,
+see [Step 14 — Troubleshooting](#step-14--troubleshooting).
 
-- **UDP by default**, fixed 9-byte header, `'#' ... '\n'` framed, no
-  scanning for delimiters inside the payload.
-- **Named topics**: `advertise`/`subscribe`/`publish` (and the `_image`
-  variants) accept a human-readable string (`"/relink/camera/front"`)
-  instead of a hand-assigned numeric id — ReLink hashes it (FNV-1a) down
-  to the `uint32_t` that actually goes on the wire, so both sides just
-  need to type the same string, no shared header/constant required.
-  This is a one-way hash, not a reversible encoding (packing an
-  arbitrary-length name losslessly into 4 bytes isn't possible past
-  ~6 characters) — each node keeps a local name registry
-  (`topic_name_for()`/`rltopic_list()`) built from its own calls, for
-  debugging, and throws loudly on a genuine hash collision or a name
-  landing on the reserved NAT-punch id, rather than silently misrouting.
-  A numeric id still works exactly as before if you'd rather assign ids
-  by hand.
-- **std_msgs-style default types** (`Bool`, `Int32`, `Float32`, ...) plus
-  user-defined custom types — any trivially-copyable struct (C++
-  `#pragma pack(1)` / Python `ctypes.Structure` with `_pack_ = 1`) just
-  works, no registration, no schema exchange.
-- **Two mutually-exclusive discovery modes**, chosen explicitly per node:
-  - **Mode A — `relink-rlcore`**: a small central daemon (C++ and
-    Python builds, byte-identical wire behavior), request/ACK
-    registration, retry-with-backoff.
-  - **Mode B — multicast beacon**: fully decentralized, no daemon,
-    jittered startup burst + sparse re-announce (not continuous —
-    ReLink's traffic doesn't grow with uptime the way ROS2's does).
-- **UDP NAT traversal** (`relink-rlcore --nat`): the daemon acts as a
-  rendezvous point, handing out each node's real (NAT-mapped) endpoint
-  instead of its private LAN address, paired with client-side hole
-  punching — lets nodes across separate networks/NATs find each other.
-- **Built-in `Image` type** (`advertise_image` / `publish_image` /
-  `subscribe_image`) for messages bigger than one UDP datagram —
-  automatically chunks to the MTU maximum on send and reassembles on
-  receive, no hand-rolled chunking needed (see `camera_stream` in All
-  examples below). Two optimizations, both scoped to Image only so a
-  plain small-message node (this library's actual target — measured
-  ~3x faster than ROS2 Humble, see Benchmarks) is never affected:
-  - **Zero-copy chunk send/receive**: a chunk's data is handed straight
-    to the kernel (`sendmsg()`/`socket.sendmsg()` scatter-gather in C++
-    and Python) instead of being copied into an intermediate struct
-    first — only the 10-byte chunk header and 9-byte wire header are
-    ever assembled locally, the caller's actual bytes are never
-    duplicated in userspace on the way out or in.
-  - A **larger socket send/receive buffer** (1MB, requested only by a
-    node that calls `advertise_image`/`subscribe_image` — best-effort,
-    silently falls back to the OS default if refused) so a several-
-    hundred-chunk burst has room to sit in the kernel queue instead of
-    overflowing and silently dropping the tail of the image. **This
-    buffer trades drops for latency, not a free win**: it only helps
-    with short bursts a fast subscriber will drain in time. Measured
-    with a subscriber callback that takes 50ms/frame (a realistic
-    JPEG-decode-and-process cost) against a sender producing faster
-    than that, per-frame latency grew linearly (54ms, 104ms, 153ms,
-    ...) and delivery still eventually collapsed once the backlog
-    exceeded the buffer — a bigger buffer only postpones that, it
-    doesn't fix a subscriber that's slower than the publish rate. Since
-    subscriber callbacks run inline on ReLink's one data thread (see
-    Dedicated data thread below), the actual fix for a slow consumer is
-    to keep `subscribe_image`'s callback fast — hand heavy work
-    (decoding, disk I/O, ML inference) off to your own worker
-    thread/queue instead of doing it inside the callback.
-- **Dedicated data thread**, zero heap allocation and zero locking in the
-  benchmarked hot path, with opt-in CPU pinning and `SCHED_FIFO` for
-  real-time tail-latency control.
-- **C++ and Python bindings**, proven bidirectionally wire-compatible —
-  a C++ publisher and a Python subscriber (or vice versa) talk normally,
-  over either discovery mode.
+**Why it worked**: `hello_relink.{cpp,py}` is under 60 lines. Open it and
+read it — the whole API surface is `advertise`, `subscribe`, `publish`,
+`spin`. Change `TOPIC_HELLO`, the message type, or what happens on
+receive, and you're writing your own ReLink node.
 
-## Discovery modes — which one do I use?
+---
 
-Every node picks exactly one, explicitly:
+## Step 3 — Pick a discovery mode
+
+Every node picks exactly one, explicitly — there's no auto-detection,
+because silently falling back to a different discovery mechanism is
+exactly the kind of hidden behavior ReLink is trying to avoid.
 
 ```cpp
 // Mode A: a small daemon both sides can reach. Works everywhere,
@@ -151,91 +129,83 @@ node.set_rlcore.ip("10.0.0.5");
 node.use_multicast_discovery();
 ```
 
-Same choice in Python: `node.set_rlcore.ip(...)` or
-`node.use_multicast_discovery()`.
-
-If you're not sure which to use: try mode B (`hello_relink`, above)
-first since it needs nothing extra to run. If it doesn't work on your
-network, switch to mode A — start the daemon once (`./relink-rlcore`
-or `python3 rlcore/relink_rlcore.py`), then point every node at its
-IP address.
-
-## All examples
-
-Every example below is a complete, runnable program — not a snippet.
-Each one exists in both C++ (`examples/cpp/`) and Python
-(`relink_py/examples/`).
-
-| Example | What it shows | Run it |
-|---|---|---|
-| **`hello_relink`** | The simplest possible ReLink program. One file, no arguments, runs the same way on both ends — each copy is both a publisher and a subscriber, looping forever, sending a counter once a second. Start here. | `./hello_relink` / `python3 hello_relink.py` (run twice) |
-| **`rlcore_pubsub`** | Mode A (daemon) discovery, a custom message type (`ImuReading`, several `float`s + a timestamp) alongside a default type (`Float32`), one process as publisher and one as subscriber. | `./rlcore_pubsub pub <daemon_ip>` and `... sub <daemon_ip>` in separate terminals, with the daemon already running |
-| **`multicast_pubsub`** | The same pub/sub shape as `rlcore_pubsub`, but mode B (no daemon) — shows the two discovery modes are interchangeable from the application's point of view. | `./multicast_pubsub pub` and `... sub` |
-| **`camera_stream`** | A real webcam streamed over ReLink two ways at once, using the built-in `Image` type (`advertise_image`/`publish_image`/`subscribe_image` — see Features below) — `image_raw` (uncompressed, hundreds of MTU-sized chunks per frame) and `image_compressed` (JPEG, 2-3 chunks per frame). Both topics deliver ~100% reliably in both languages once the socket receive/send buffers are sized for a multi-hundred-chunk burst (ReLink requests 1MB buffers by default — see Features below); still, **prefer `image_compressed`** for anything real-time or over a busier network than loopback, since a dropped chunk drops the whole image (no retransmission) and compressed frames expose far fewer chunks to that risk. **Requires OpenCV, which you install yourself** (`pip install opencv-python`, or `sudo apt install libopencv-dev` for C++) — it is not a ReLink dependency. | `./camera_stream pub` and `... sub` |
-
-There's also a performance test harness (`relink_benchmark.cpp` at the
-repo root) used to produce the numbers in the Benchmarks section below —
-worth reading once you're comfortable with the basics, not a starting
-point.
-
-## Benchmarks
-
-Measured over 60s sustained at 1000Hz with a ~40-byte payload
-(`ImuReading`-sized), with CPU pinning + `SCHED_FIFO` applied to the data
-thread:
-
-| Metric | ReLink (C++) | ROS2 Humble (default QoS) |
-|---|---|---|
-| avg latency | 169 µs | 504 µs |
-| p99 latency | 297 µs | 989 µs |
-| **worst-case latency** | **388 µs** | 3703 µs |
-| 1ms budget | **PASS** | FAIL |
-
-Baseline (no CPU pinning/`SCHED_FIFO`) worst-case was ~2.9ms — pinning
-the data thread to a dedicated core and giving it real-time scheduling
-priority is what gets it under budget. These numbers were measured on
-loopback on a single dev machine, not real wired LAN with two physical
-nodes — directionally strong, not a certified LAN result.
-
-The `sustained rate` row from earlier versions of this table (~5900 Hz
-/ ~1985 Hz) has been removed: it was computed as `1e6 / avg_latency_us`
-in the benchmark harness, which inverts one-way latency and calls it a
-rate -- a different quantity, not an actual measured throughput (it
-gets a *bigger*, not smaller, the *lower* latency gets, which is
-backwards). The harness (`relink_benchmark.cpp`) has been fixed to
-report a real received rate (message count over wall-clock span)
-instead, but the old table numbers above were never re-measured with
-the corrected metric, so they're omitted here rather than left
-standing as if they meant something they didn't. The publisher in both
-benchmarks sends at a fixed, constant 1000Hz regardless of latency --
-that was never in question.
-
-## Repository layout
-
-```
-relink/include/relink/     C++ library (header-only)
-  wire.hpp                   byte-exact structs: RelinkHeader, BeaconPacket, default types
-  ring_buffer.hpp            fixed-capacity, drop-oldest-on-overflow
-  frame.hpp                  pure encode/decode, MTU-budgeted
-  udp_transport.hpp          dedicated data thread, CPU pinning, SCHED_FIFO
-  register.hpp / rlcore_client.hpp   mode A (rlcore) client
-  beacon.hpp / multicast_discovery.hpp mode B (multicast) client
-  relink.hpp                  RelinkNode -- the public API
-
-rlcore/
-  relink_rlcore.cpp        registration daemon, C++ build
-  relink_rlcore.py         registration daemon, Python build (byte-identical protocol)
-
-relink_py/relink/          Python library (stdlib-only: ctypes + socket + struct)
-  (mirrors the C++ layer-for-layer, see relink_py/README.md)
-
-examples/cpp/                C++ usage examples (see "All examples" above)
-relink_py/examples/          Python usage examples (see "All examples" above)
-tests/, relink_py/tests/     unit tests + two-process correctness tests, both languages
-ros2_compare/                 ROS2 Humble comparison benchmark package
+```python
+# Same choice in Python:
+node.set_rlcore.ip("10.0.0.5")
+# or:
+node.use_multicast_discovery()
 ```
 
-## Quick start — C++
+| Mode | Needs a daemon? | Works over WiFi/cloud VPC (multicast usually blocked)? | Use when |
+|---|---|---|---|
+| **A — rlcore** | Yes (`relink-rlcore`) | Yes | Your network blocks multicast, or you want one known rendezvous point |
+| **B — multicast beacon** | No | No | Simplest LAN setup, nothing extra to run |
+
+Not sure which to use? Try Mode B first (Step 2 already did). If it
+doesn't work on your network, switch to Mode A — see
+[Step 9](#step-9--running-the-rlcore-daemon).
+
+---
+
+## Step 4 — Named topics
+
+Topics can be a human-readable string instead of a hand-assigned number:
+
+```cpp
+node.advertise<Float32>("/relink/temperature");
+```
+
+```python
+node.advertise("/relink/temperature", Float32)
+```
+
+**How it works**: ReLink hashes the string (FNV-1a) down to the `uint32_t`
+that actually goes on the wire — both sides just need to type the same
+string, no shared header/constant needed. This is a **one-way hash, not a
+reversible encoding**: packing an arbitrary-length name losslessly into 4
+bytes isn't possible past ~6 characters. Each node keeps a local name
+registry (`topic_name_for()` / `rltopic_list()`), built only from its own
+calls, for debugging — not a network-wide directory. A genuine hash
+collision, or a name landing on the reserved NAT-punch id, throws loudly
+instead of silently misrouting.
+
+A numeric id still works exactly as before, if you'd rather assign ids by
+hand:
+
+```cpp
+node.subscribe<Float32>(101, [](const Float32& msg) { /* ... */ });
+```
+
+> **Performance note — resolve the string once, outside the hot loop.**
+> Every call to the string overload (`publish<T>(name, ...)`,
+> `advertise<T>(name, ...)`, `subscribe<T>(name, ...)`) re-hashes the
+> string (FNV-1a over every character), takes the node's internal lock,
+> and does a registry lookup+comparison — every single call, not just the
+> first. That's fine for `advertise`/`subscribe` (called once at startup),
+> but calling the *string* overload of `publish()` inside a tight publish
+> loop pays that cost on every message. Resolve the name to its numeric
+> id once with `topic_id_for()` (C++) / `_topic_id_for()` (Python) —
+> idempotent, always returns the same id for the same name — and call the
+> numeric overload of `publish()` in the loop instead:
+>
+> ```cpp
+> uint32_t topic_id = node.topic_id_for("/relink/temperature"); // once
+> for (...) {
+>     node.publish<Float32>(topic_id, Float32{ .data = reading }); // hot loop: numeric, no re-hash
+> }
+> ```
+>
+> Measured effect (microbenchmark, no peers attached, isolating just the
+> resolution cost): the numeric overload costs **~26 ns/call**, the string
+> overload **~49 ns/call** — the FNV-1a hash + lock + registry lookup
+> roughly **doubles** per-call overhead versus a bare numeric id. At the
+> multi-hundred-kHz burst rates in Step 12, that difference is exactly
+> the kind of per-message tax that determines whether the sender or
+> receiver becomes the bottleneck first — resolve once, publish by id.
+
+---
+
+## Step 5 — Quick start: C++
 
 ```cpp
 #include "relink/relink.hpp"
@@ -251,10 +221,13 @@ node.subscribe<Float32>(101, [](const Float32& msg) { /* ... */ });
 node.spin();
 ```
 
-Build against `relink/include/` (header-only). See `examples/cpp/` above
-for full publisher/subscriber programs.
+Build against `relink/include/` — header-only, no linking step beyond
+`-pthread`. See `examples/cpp/` (Step 10) for full publisher/subscriber
+programs.
 
-## Quick start — Python
+---
+
+## Step 6 — Quick start: Python
 
 ```python
 from relink import RelinkNode, Float32
@@ -270,13 +243,80 @@ node.subscribe(101, Float32, lambda msg: print(msg.data))
 node.spin()
 ```
 
-No install step — pure stdlib. See `relink_py/README.md` and
-`relink_py/examples/` above for full programs, including custom
-`ctypes.Structure` message types.
+No install step — pure stdlib (`ctypes` + `socket` + `struct`). See
+`relink_py/README.md` and `relink_py/examples/` (Step 10) for full
+programs, including custom `ctypes.Structure` message types.
 
-## Running rlcore (mode A discovery daemon)
+---
 
+## Step 7 — Message types
+
+`std_msgs`-style default types are built in (`Bool`, `Int32`, `Float32`,
+...), plus **user-defined custom types**: any trivially-copyable struct
+just works, no registration, no schema exchange, no codegen step.
+
+```cpp
+#pragma pack(push, 1)
+struct ImuReading { float ax, ay, az; uint64_t timestamp_us; };
+#pragma pack(pop)
+
+node.advertise<ImuReading>("/relink/imu");
 ```
+
+```python
+import ctypes
+
+class ImuReading(ctypes.LittleEndianStructure):
+    _pack_ = 1
+    _fields_ = [("ax", ctypes.c_float), ("ay", ctypes.c_float),
+                ("az", ctypes.c_float), ("timestamp_us", ctypes.c_uint64)]
+
+node.advertise("/relink/imu", ImuReading)
+```
+
+Both sides must independently define the identical byte layout — ReLink
+does no schema negotiation between nodes, same as ROS relies on both
+sides being built against the same generated message header.
+
+---
+
+## Step 8 — Sending images
+
+Messages bigger than one UDP datagram use the built-in `Image` type:
+
+```cpp
+node.advertise_image("/relink/camera/front");
+node.publish_image("/relink/camera/front", jpeg_bytes, jpeg_len);
+node.subscribe_image("/relink/camera/front", [](uint32_t frame_id, const uint8_t* data, size_t len) { /* ... */ });
+```
+
+It automatically chunks to the MTU maximum on send and reassembles on
+receive — no hand-rolled chunking needed (see `camera_stream` in Step 10).
+
+> **Not a free win.** `advertise_image`/`subscribe_image` request a larger
+> (1MB) socket buffer so a several-hundred-chunk burst has room to sit in
+> the kernel queue instead of overflowing and silently dropping the tail
+> of the image. That buffer only helps with **short bursts a fast
+> subscriber will drain in time** — it trades drops for latency, not a
+> free win. If your subscriber callback is slower than the publish rate
+> (measured: a 50ms/frame JPEG-decode-and-process callback against a
+> faster sender), per-frame latency grows linearly and delivery
+> eventually collapses once the backlog exceeds the buffer regardless of
+> buffer size. Since callbacks run inline on ReLink's one data thread, the
+> actual fix for a slow consumer is to keep the callback fast — hand heavy
+> work (decoding, disk I/O, ML inference) off to your own worker
+> thread/queue instead of doing it inside the callback. Prefer
+> `image_compressed`-style payloads over raw frames for anything
+> real-time: a dropped chunk drops the whole image (no retransmission),
+> and fewer chunks per frame means fewer chances to drop one.
+
+---
+
+## Step 9 — Running the rlcore daemon
+
+Only needed for Mode A discovery (Step 3):
+
+```bash
 # C++
 ./relink-rlcore --port 8445 [--nat]
 
@@ -284,12 +324,34 @@ No install step — pure stdlib. See `relink_py/README.md` and
 python3 rlcore/relink_rlcore.py --port 8445 [--nat]
 ```
 
-Either build works with either language's nodes. `--nat` enables UDP
-NAT traversal (see Features above) for nodes on separate networks.
+Either build works with either language's nodes — same wire protocol.
+`--nat` enables UDP NAT traversal (Step 13).
 
-## Testing
+---
 
-```
+## Step 10 — All examples
+
+Every example is a complete, runnable program, not a snippet — each one
+exists in both C++ (`examples/cpp/`) and Python (`relink_py/examples/`).
+
+| Example | What it shows | Run it |
+|---|---|---|
+| **`hello_relink`** | The simplest possible node — one file, no arguments, both publisher and subscriber at once. Start here. | `./hello_relink` / `python3 hello_relink.py` (run twice) |
+| **`talker` + `listener`** | Publisher and subscriber split into two separate files/roles, the classic ROS-tutorial shape. | `./listener` then `./talker` |
+| **`pubsub`** | `talker` + `listener` combined into one file/process — both roles at once, interoperable with either standalone binary above. | `./pubsub` (run twice, or against `talker`/`listener`) |
+| **`rlcore_pubsub`** | Mode A (daemon) discovery, a custom message type alongside a default type, one process as publisher and one as subscriber. | `./rlcore_pubsub pub <daemon_ip>` and `... sub <daemon_ip>`, daemon already running |
+| **`multicast_pubsub`** | Same pub/sub shape as `rlcore_pubsub`, but Mode B — shows the two discovery modes are interchangeable from the application's point of view. | `./multicast_pubsub pub` and `... sub` |
+| **`camera_stream`** | A real webcam streamed over ReLink two ways at once (`image_raw`, `image_compressed`) using the built-in `Image` type. **Requires OpenCV**, installed yourself — not a ReLink dependency. | `./camera_stream pub` and `... sub` |
+
+There's also a performance test harness (`relink_benchmark.cpp` at the
+repo root) used to produce the numbers in Step 12 — worth reading once
+you're comfortable with the basics, not a starting point.
+
+---
+
+## Step 11 — Testing
+
+```bash
 # C++ (each test is a standalone binary)
 g++ -std=c++17 -I relink/include -pthread tests/test_wire.cpp -o test_wire && ./test_wire
 
@@ -297,24 +359,131 @@ g++ -std=c++17 -I relink/include -pthread tests/test_wire.cpp -o test_wire && ./
 python3 relink_py/tests/test_relink.py
 ```
 
-Every layer (wire format, ring buffer, framing, discovery, the public
-API's error paths) has a plain-assert test suite in both languages, plus
-two-process correctness tests and cross-language interop tests
-(`tests/two_process_{pub,sub}.cpp` / `relink_py/tests/two_process_{pub,sub}.py`)
-proving the C++ and Python nodes actually interoperate over real
-sockets, not just in theory.
+Every layer (wire format, ring buffer, framing, discovery, named-topic
+hashing, the public API's error paths) has a plain-assert test suite in
+both languages, plus two-process correctness tests and cross-language
+interop tests (`tests/two_process_{pub,sub}.cpp` /
+`relink_py/tests/two_process_{pub,sub}.py`) proving the C++ and Python
+nodes actually interoperate over real sockets, not just in theory.
 
-## Status
+---
 
-Core is complete and tested: wire format, ring buffer, UDP transport,
-both discovery modes, the public API, correctness tests, the 1000Hz
-benchmark (passing with CPU pinning + `SCHED_FIFO`), a ROS2 comparison,
-discovery stress tests (boot storm, power-cycle, simulated network
-drop), a Python binding, and NAT traversal.
+## Step 12 — Benchmarks
+
+Measured over 60s sustained at 1000Hz with a ~40-byte payload
+(`ImuReading`-sized), CPU pinning + `SCHED_FIFO` applied to the data
+thread, on loopback on a single dev machine (directionally strong, not a
+certified LAN result):
+
+| Metric | ReLink (C++) | ROS2 Humble (default QoS) |
+|---|---|---|
+| avg latency | 169 µs | 504 µs |
+| p99 latency | 297 µs | 989 µs |
+| **worst-case latency** | **388 µs** | 3703 µs |
+| 1ms budget | **PASS** | FAIL |
+
+Baseline (no CPU pinning/`SCHED_FIFO`) worst-case was ~2.9ms — pinning the
+data thread to a dedicated core and giving it real-time scheduling
+priority is what gets it under budget.
+
+**Throughput / jitter, both languages, named-topic pub+sub in one file**
+(loopback, `pubsub.{cpp,py}` pattern, paced send):
+
+| Rate | C++ loss | C++ mean latency | Python loss | Python mean latency |
+|---|---|---|---|---|
+| 1 kHz | 0% | ~32 µs | 0% | ~75 µs |
+| 10 kHz | 0% | ~15 µs | 0% | ~47 µs |
+| 50 kHz | 0% | ~11 µs | 0% | ~26 µs |
+| 100 kHz | ~0.04% | ~9 µs | not sustainable | — |
+| unpaced burst | ~500k msg/s, small loss | sub-10 µs | ~90-100k msg/s, ~13% loss | 700 µs-1ms (queueing) |
+
+**Python's ceiling is real, not a bug**: past roughly 50kHz sustained,
+CPython's per-message interpreter overhead can't drain the receive socket
+fast enough, and a larger socket buffer (Step 8's `enable_large_buffers`)
+trades that loss for multi-millisecond queueing latency instead — not a
+fix. For sustained rates above that, use the C++ binding.
+
+---
+
+## Step 13 — NAT traversal (cross-network nodes)
+
+`relink-rlcore --nat` makes the daemon act as a rendezvous point: it hands
+out each node's real (NAT-mapped) public endpoint instead of its private
+LAN address, paired with client-side hole punching, so nodes on separate
+networks/NATs can find each other. Requires Mode A (a daemon both sides
+can reach) — Mode B's multicast has no path across separate networks by
+definition.
+
+---
+
+## Step 14 — Troubleshooting
+
+| What you see | What it means | Fix |
+|---|---|---|
+| `hello_relink` never prints `received:` on either side | The two copies aren't on the same network segment, or something is blocking UDP multicast (some WiFi routers, most cloud VPCs) | Switch to Mode A (Step 3/9): run `relink-rlcore` once, point both nodes at its IP with `set_rlcore.ip(...)` |
+| `rlcore IP not set` (thrown at `spin()`/`publish()`) | Called `set_rlcore.ip(...)` was never reached, or Mode A was selected without setting an IP | Call `node.set_rlcore.ip("x.x.x.x")` before any traffic, or switch to `use_multicast_discovery()` |
+| `no discovery method configured` | Neither discovery mode was selected before `spin()`/`publish()`/`subscribe()` traffic started | Pick exactly one mode (Step 3) before sending/receiving |
+| `topic hash collision between "X" and "Y"` | Two different topic names hashed (FNV-1a) to the same 32-bit id — astronomically rare, but checked for | Rename one of the topics |
+| High packet loss at a high send rate | The receiver (especially Python) can't drain the socket as fast as it's being filled | Reduce the rate, or move that node to C++ (Step 12) — a bigger socket buffer only postpones this, see Step 8 |
+| A dropped/corrupted image frame | `Image` chunks have no retransmission — one lost UDP datagram drops the whole frame | Prefer a compressed payload (`image_compressed`) over raw frames (Step 8), and keep the subscriber callback fast |
+
+---
+
+## Reference
+
+### Feature matrix
+
+| Feature | C++ | Python |
+|---|---|---|
+| Named topics (string → hashed id) | ✅ | ✅ |
+| Default `std_msgs`-style types | ✅ | ✅ |
+| Custom trivially-copyable types | ✅ | ✅ |
+| Mode A discovery (rlcore) | ✅ | ✅ |
+| Mode B discovery (multicast) | ✅ | ✅ |
+| UDP NAT traversal | ✅ | ✅ |
+| `Image` type (chunk + reassemble) | ✅ | ✅ |
+| Zero-copy image chunk send/recv | ✅ (`sendmsg`) | ✅ (`socket.sendmsg`) |
+| CPU pinning / `SCHED_FIFO` data thread | ✅ | — (not applicable to CPython's threading model) |
+| TCP reliable transport | ❌ (out of scope) | ❌ (out of scope) |
+| Encryption (`secure=true`) | ❌ (API shape decided, unimplemented) | ❌ (API shape decided, unimplemented) |
+
+### Repository layout
+
+```
+relink/include/relink/     C++ library (header-only)
+  wire.hpp                   byte-exact structs: RelinkHeader, BeaconPacket, default types
+  topic_hash.hpp              FNV-1a 32-bit hash for named topics
+  ring_buffer.hpp             fixed-capacity, drop-oldest-on-overflow
+  frame.hpp                   pure encode/decode, MTU-budgeted
+  udp_transport.hpp           dedicated data thread, CPU pinning, SCHED_FIFO
+  register.hpp / rlcore_client.hpp     mode A (rlcore) client
+  beacon.hpp / multicast_discovery.hpp  mode B (multicast) client
+  relink.hpp                  RelinkNode -- the public API
+
+rlcore/
+  relink_rlcore.cpp          registration daemon, C++ build
+  relink_rlcore.py           registration daemon, Python build (byte-identical protocol)
+
+relink_py/relink/           Python library (stdlib-only: ctypes + socket + struct)
+  (mirrors the C++ layer-for-layer, see relink_py/README.md)
+
+examples/cpp/                C++ usage examples (Step 10)
+relink_py/examples/          Python usage examples (Step 10)
+tests/, relink_py/tests/     unit tests + two-process correctness tests, both languages
+ros2_compare/                 ROS2 Humble comparison benchmark package
+```
+
+### Status / scope
+
+Core is complete and tested: wire format, named-topic hashing, ring
+buffer, UDP transport, both discovery modes, the public API, correctness
+tests, the 1000Hz benchmark (passing with CPU pinning + `SCHED_FIFO`), a
+ROS2 comparison, discovery stress tests (boot storm, power-cycle,
+simulated network drop), a Python binding, and NAT traversal.
 
 **Explicitly out of scope for now**: TCP reliable transport, AES-256-GCM
 encryption (`secure=true`, API shape decided but unimplemented), message
-fragmentation beyond one UDP datagram's MTU budget (see `camera_stream`
-above for the recommended workaround pattern), and automatic
+fragmentation beyond one UDP datagram's MTU budget (see Step 8's
+`Image` type for the recommended workaround pattern), and automatic
 multi-language codegen (bindings are hand-written per language,
 deliberately).

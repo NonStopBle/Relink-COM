@@ -28,8 +28,7 @@ int main() {
     // rlcore interop test's node at port 9001, topics 100/101).
     MulticastDiscoveryConfig cfg_a;
     cfg_a.self_ip = loopback;
-    cfg_a.self_data_port = 9001;
-    cfg_a.local_topics = {100, 101};
+    cfg_a.port_groups = {{9001, {100, 101}}};
     cfg_a.startup_burst_count = 3;
     cfg_a.startup_jitter_max_ms = 20; // fast for test
     cfg_a.reannounce_min_ms = 300;
@@ -39,8 +38,7 @@ int main() {
     // port 9002) -- topic 100 overlaps with A, topic 200/101 do not.
     MulticastDiscoveryConfig cfg_b;
     cfg_b.self_ip = loopback;
-    cfg_b.self_data_port = 9002;
-    cfg_b.local_topics = {100, 200};
+    cfg_b.port_groups = {{9002, {100, 200}}};
     cfg_b.startup_burst_count = 3;
     cfg_b.startup_jitter_max_ms = 20;
     cfg_b.reannounce_min_ms = 300;
