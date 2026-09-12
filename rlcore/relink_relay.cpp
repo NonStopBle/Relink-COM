@@ -26,6 +26,7 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <unistd.h>
+#include <poll.h>
 
 #ifdef RELINK_ENABLE_XDP
 #include "xdp/relay_xdp.hpp"
@@ -135,7 +136,13 @@ int main(int argc, char** argv) {
     // for why this only speeds up local processing, not the WAN RTT
     // that actually dominates relay latency). `sock` above still
     // exists and handles TX (forwarding) plus anything the XDP program
-    // doesn't intercept.
+    // doesn't (or structurally can't) intercept -- notably loopback
+    // traffic, which never traverses the NIC driver's XDP hook at all,
+    // so a peer running ON this same box (e.g. a client using
+    // 127.0.0.1 for the relay) would otherwise have its REGISTER/DATA
+    // packets land on `sock` and sit there unread forever. Poll BOTH
+    // fds every iteration so nothing that bypasses XDP is silently
+    // dropped.
     const char* ifname = (argc > 2) ? argv[2] : "eth0";
     RelayXdp xdp;
     if (xdp.init(ifname, port)) {
@@ -146,42 +153,61 @@ int main(int argc, char** argv) {
                     port, ifname, xdp.is_attached() ? "attached" : "unattached");
         std::fflush(stdout);
 
+        struct pollfd pfds[2];
+        pfds[0].fd = xdp.fd();
+        pfds[0].events = POLLIN;
+        pfds[1].fd = sock;
+        pfds[1].events = POLLIN;
+
+        uint8_t plain_buf[kMaxFrameBytes];
         for (;;) {
-            if (!xdp.poll_rx(1000)) continue;
-            uint32_t idx_rx = 0;
-            uint32_t n = xdp.rx_batch(64, &idx_rx);
-            if (n == 0) continue;
-            for (uint32_t i = 0; i < n; ++i) {
-                uint8_t* data = nullptr;
-                uint32_t len = 0;
-                uint64_t addr = 0;
-                xdp.rx_frame(idx_rx + i, &data, &len, &addr);
+            pfds[0].revents = 0;
+            pfds[1].revents = 0;
+            if (::poll(pfds, 2, 1000) <= 0) continue;
 
-                // Frame data from the NIC includes Ethernet+IP+UDP
-                // headers; the relay's parsing (decode_relay_register/
-                // peek_frame_topic_id) expects to start at the ReLink
-                // payload, so skip past them the same way the kernel
-                // XDP program did (14B eth + IP header incl. options +
-                // 8B UDP) to find the actual UDP payload and its
-                // source address for the reply path.
-                if (len > 42) {
-                    const uint8_t* eth = data;
-                    const uint8_t* ip = eth + 14;
-                    uint8_t ihl = (ip[0] & 0x0F) * 4;
-                    const uint8_t* udp = ip + ihl;
-                    const uint8_t* payload = udp + 8;
-                    size_t payload_len = len - (payload - data);
-
-                    struct sockaddr_in src{};
-                    src.sin_family = AF_INET;
-                    std::memcpy(&src.sin_addr.s_addr, ip + 12, 4);
-                    std::memcpy(&src.sin_port, udp + 0, 2);
-
-                    handle_packet(sock, groups, payload, payload_len, src, last_sweep);
-                }
-                xdp.refill(addr); // return this UMEM frame to the fill ring now that we're done with it
+            if (pfds[1].revents & POLLIN) {
+                struct sockaddr_in src{};
+                socklen_t src_len = sizeof(src);
+                ssize_t n = ::recvfrom(sock, plain_buf, sizeof(plain_buf), 0,
+                                        reinterpret_cast<struct sockaddr*>(&src), &src_len);
+                if (n > 0) handle_packet(sock, groups, plain_buf, static_cast<size_t>(n), src, last_sweep);
             }
-            xdp.release_rx(n);
+
+            if (pfds[0].revents & POLLIN) {
+                uint32_t idx_rx = 0;
+                uint32_t n = xdp.rx_batch(64, &idx_rx);
+                for (uint32_t i = 0; i < n; ++i) {
+                    uint8_t* data = nullptr;
+                    uint32_t len = 0;
+                    uint64_t addr = 0;
+                    xdp.rx_frame(idx_rx + i, &data, &len, &addr);
+
+                    // Frame data from the NIC includes Ethernet+IP+UDP
+                    // headers; the relay's parsing (decode_relay_register/
+                    // peek_frame_topic_id) expects to start at the ReLink
+                    // payload, so skip past them the same way the kernel
+                    // XDP program did (14B eth + IP header incl. options +
+                    // 8B UDP) to find the actual UDP payload and its
+                    // source address for the reply path.
+                    if (len > 42) {
+                        const uint8_t* eth = data;
+                        const uint8_t* ip = eth + 14;
+                        uint8_t ihl = (ip[0] & 0x0F) * 4;
+                        const uint8_t* udp = ip + ihl;
+                        const uint8_t* payload = udp + 8;
+                        size_t payload_len = len - (payload - data);
+
+                        struct sockaddr_in src{};
+                        src.sin_family = AF_INET;
+                        std::memcpy(&src.sin_addr.s_addr, ip + 12, 4);
+                        std::memcpy(&src.sin_port, udp + 0, 2);
+
+                        handle_packet(sock, groups, payload, payload_len, src, last_sweep);
+                    }
+                    xdp.refill(addr); // return this UMEM frame to the fill ring now that we're done with it
+                }
+                if (n > 0) xdp.release_rx(n);
+            }
         }
     }
     std::fprintf(stderr, "AF_XDP init failed, falling back to plain sockets\n");

@@ -267,6 +267,7 @@ private:
 public:
     unsigned int ifindex() const { return ifindex_; }
     bool is_attached() const { return attached_; }
+    int fd() const { return xsk_fd_; }
 };
 
 } // namespace relink
