@@ -96,8 +96,8 @@ other and start talking — no daemon, no config file, no manual IP address.
 
 | | C++ | Python |
 |---|---|---|
-| **Build** | `g++ -std=c++17 -I relink/include -pthread examples/cpp/hello_relink.cpp -o hello_relink` | nothing to build — pure stdlib |
-| **Run (in two terminals)** | `./hello_relink` | `python3 relink_py/examples/hello_relink.py` |
+| **Build** | `g++ -std=c++17 -I cpp/relink/include -pthread cpp/examples/hello_relink.cpp -o hello_relink` | nothing to build — pure stdlib |
+| **Run (in two terminals)** | `./hello_relink` | `python3 python/relink_py/examples/hello_relink.py` |
 
 Within a second or two, each window prints `sent: N (to 1 peer(s))` and
 `received: N` — the two copies found each other over multicast and are
@@ -151,7 +151,7 @@ one-port-per-topic model instead — see
 [Step 12's benchmarks](#step-12--benchmarks) for the throughput/latency
 tradeoff before reaching for it.
 
-`rl_topic` (`rl_topic.py`/`rl_topic.cpp`, a `rostopic`-style CLI —
+`rl_topic` (`python/rl_topic.py`/`cpp/rl_topic.cpp`, a `rostopic`-style CLI —
 `list`/`info`/`hz`/`bw`/`echo`/`pub`) needs no special flag or code
 change to work against a node running `set_multiplex(false)`: a
 demultiplexed node's beacon/registration already announces each topic's
@@ -225,45 +225,113 @@ node.subscribe<Float32>(101, [](const Float32& msg) { /* ... */ });
 
 ## Step 5 — Quick start: C++
 
+This is a real, complete, runnable program — not a snippet. Every
+ReLink node can publish and subscribe at the same time (there's no
+separate "publisher node" vs. "subscriber node"), so this one file does
+both: it broadcasts its own counted message on a timer, and prints
+whatever any other copy of itself sends. Save it, build it, then run
+the same binary in two terminals (or on two machines on the same LAN)
+and watch them talk to each other:
+
 ```cpp
+// pubsub.cpp
 #include "relink/relink.hpp"
+#include <cstdio>
+#include <cstring>
+#include <chrono>
+#include <thread>
 
-RelinkNode node;
-node.set_rlcore.ip("10.0.0.5");        // mode A; or node.use_multicast_discovery() for mode B
+struct Chatter { char data[128]; };
+const char* TOPIC = "/relink/chatter";
 
-// Topics can be a name (hashed to a wire id for you) or a hand-assigned number:
-node.advertise<Float32>("/relink/temperature");
-node.publish<Float32>("/relink/temperature", Float32{ .data = 36.6f });
+int main() {
+    RelinkNode node;
+    node.use_multicast_discovery();   // zero setup -- no daemon to start first
 
-node.subscribe<Float32>(101, [](const Float32& msg) { /* ... */ });
-node.spin();
+    // Subscribe before advertising, so we don't miss early messages.
+    // The callback fires on ReLink's own background thread whenever a
+    // message arrives from any other node (never your own).
+    node.subscribe<Chatter>(TOPIC, [](const Chatter& msg) {
+        std::printf("received: %s\n", msg.data);
+    });
+    node.advertise<Chatter>(TOPIC);
+
+    int count = 0;
+    while (true) {                     // <- the real work happens here
+        node.spin_once();              // services discovery -- call this every loop
+
+        Chatter msg{};
+        std::snprintf(msg.data, sizeof(msg.data), "hello world %d", count++);
+        node.publish<Chatter>(TOPIC, msg);
+        std::printf("sent:     %s\n", msg.data);
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    }
+}
 ```
 
-Build against `relink/include/` — header-only, no linking step beyond
-`-pthread`. See `examples/cpp/` (Step 10) for full publisher/subscriber
-programs.
+```bash
+g++ -std=c++17 -I cpp/relink/include -pthread pubsub.cpp -o pubsub
+./pubsub        # run this in a second terminal too, and watch them find each other
+```
+
+Build against `cpp/relink/include/` — header-only, no linking step beyond
+`-pthread`. `node.set_rlcore.ip("10.0.0.5")` instead of
+`use_multicast_discovery()` switches to Mode A (Step 9), needed if your
+network blocks multicast or the two nodes aren't on the same LAN. See
+`cpp/examples/` (Step 10) for more programs, including split
+publisher/subscriber files and custom message types.
 
 ---
 
 ## Step 6 — Quick start: Python
 
+The same idea, same wire format — a Python copy and a C++ copy of this
+pattern talk to each other with zero changes on either side:
+
 ```python
-from relink import RelinkNode, Float32
+#!/usr/bin/env python3
+# pubsub.py
+import ctypes
+import time
+from relink import RelinkNode
 
-node = RelinkNode()
-node.set_rlcore.ip("10.0.0.5")         # mode A; or node.use_multicast_discovery() for mode B
+class Chatter(ctypes.Structure):
+    _fields_ = [("data", ctypes.c_char * 128)]
 
-# Topics can be a name (hashed to a wire id for you) or a hand-assigned number:
-node.advertise("/relink/temperature", Float32)
-node.publish("/relink/temperature", Float32(data=36.6))
+TOPIC = "/relink/chatter"
 
-node.subscribe(101, Float32, lambda msg: print(msg.data))
-node.spin()
+def main():
+    node = RelinkNode()
+    node.use_multicast_discovery()   # zero setup -- no daemon to start first
+
+    node.subscribe(TOPIC, Chatter, lambda msg: print("received:", msg.data.decode()))
+    node.advertise(TOPIC, Chatter)
+
+    count = 0
+    while True:                      # <- the real work happens here
+        node.spin_once()             # services discovery -- call this every loop
+
+        msg = Chatter(data=f"hello world {count}".encode())
+        node.publish(TOPIC, msg)
+        print("sent:    ", msg.data.decode())
+        count += 1
+
+        time.sleep(0.5)
+
+if __name__ == "__main__":
+    main()
 ```
 
-No install step — pure stdlib (`ctypes` + `socket` + `struct`). See
-`relink_py/README.md` and `relink_py/examples/` (Step 10) for full
-programs, including custom `ctypes.Structure` message types.
+```bash
+python3 pubsub.py        # run this in a second terminal too
+```
+
+No install step — pure stdlib (`ctypes` + `socket` + `struct`).
+`node.set_rlcore.ip("10.0.0.5")` instead of `use_multicast_discovery()`
+switches to Mode A (Step 9). See `python/relink_py/README.md` and
+`python/relink_py/examples/` (Step 10) for more programs, including custom
+`ctypes.Structure` message types.
 
 ---
 
@@ -332,37 +400,188 @@ receive — no hand-rolled chunking needed (see `camera_stream` in Step 10).
 
 ## Step 9 — Running the rlcore daemon
 
-Only needed for Mode A discovery (Step 3):
+Only needed for Mode A discovery (Step 3) — skip this whole section if
+you're using `use_multicast_discovery()` (Mode B).
+
+### What `relink-rlcore` actually is
+
+One small standalone daemon (no dependencies beyond the C++ standard
+library) that every node on your network registers with once at
+startup. It has no idea what your messages mean and never carries your
+actual pub/sub traffic — its only job is answering "who else is out
+there for topic X, and how do I reach them." See [rlcore in plain
+terms](#rlcore-in-plain-terms) below for the non-jargon version.
+
+### Building it
 
 ```bash
-# C++
-./relink-rlcore --port 8445 [--nat]
+# Option A: plain g++, one file, no build system needed
+g++ -std=c++17 -O2 -pthread cpp/rlcore/relink_rlcore.cpp -o relink-rlcore
 
-# Python
-python3 rlcore/relink_rlcore.py --port 8445 [--nat]
+# Option B: the CMake project under cpp/rlcore/ (also builds relink-relay,
+# see "AF_XDP" below) — same result, useful if you want it alongside
+# relink-relay in one build directory
+cd cpp/rlcore && cmake -B build . && cmake --build build
+# binaries land in cpp/rlcore/build/relink-rlcore and cpp/rlcore/build/relink-relay
+
+# Python — no build step at all, pure stdlib
+python3 python/rlcore/relink_rlcore.py --port 8445 [--nat]
 ```
 
-Either build works with either language's nodes — same wire protocol.
-`--nat` enables UDP NAT traversal (Step 13).
-
-Relay fallback (Step 13), only needed when direct hole punching can't
-cross a NAT at all:
+### Running it
 
 ```bash
-# C++
-g++ -std=c++17 -O2 -I relink/include -pthread rlcore/relink_relay.cpp -o relink-relay
+./relink-rlcore --port 8445          # plain mode: LAN-only discovery
+./relink-rlcore --port 8445 --nat    # adds cross-network / NAT punching, see below
+```
+
+Either the C++ or Python build works with either language's client
+nodes — same wire protocol, pick whichever is more convenient to run
+where you're running it. Only one instance needs to run, reachable by
+every node that will use it; nodes never talk to each other through it
+after the initial handshake.
+
+### `--nat`: reaching nodes behind a router/firewall
+
+Without `--nat`, rlcore only works for nodes on the same LAN — it
+hands out each node's *self-reported* address, which is meaningless to
+a peer on a different network (it's usually a private `192.168.x.x`
+address). `--nat` changes what rlcore hands out: instead of trusting
+what a node says its address is, it uses the address the node's
+registration packet actually *arrived from* — the real, internet-
+facing address your router assigned that connection. Paired with each
+node automatically sending a burst of small "punch" packets to every
+peer it's told about, this is standard UDP hole punching: both sides'
+routers open an outbound mapping toward each other at roughly the same
+time, and direct traffic gets through afterward without either side
+needing port forwarding configured.
+
+```bash
+./relink-rlcore --port 8445 --nat
+```
+
+```cpp
+// Both nodes just point at the same rlcore instance -- nothing else
+// changes in your pub/sub code:
+node.set_rlcore.ip("203.0.113.10");   // rlcore's public IP
+```
+
+This works reliably when at least one side has a NAT type that allows
+it (most home routers do). Some NAT types (notably "symmetric" NAT,
+common on mobile carriers and some corporate networks) structurally
+cannot be punched through — no software workaround exists for that,
+only a relay in the middle. That's what `relink-relay` is for:
+
+```cpp
+node.set_rlcore.ip("203.0.113.10");
+node.set_relay("203.0.113.10");   // same machine works fine; a relay just needs to be reachable by both sides
+```
+
+With both lines set, a node always tries the direct punched path
+first and *also* sends every message through the relay as a backup —
+whichever arrives, arrives; the relay copy is silently deduplicated if
+the direct one also got through. You don't have to detect or configure
+which case you're in.
+
+```bash
+# Build + run the relay (plain sockets, no AF_XDP -- see below)
+g++ -std=c++17 -O2 -I cpp/relink/include -pthread cpp/rlcore/relink_relay.cpp -o relink-relay
 ./relink-relay [port]   # default 8446
 
 # Python
-python3 rlcore/relink_relay.py [port]
+python3 python/rlcore/relink_relay.py [port]
 ```
+
+**Stress-tested**: 30 concurrent nodes registering, punching, and
+publishing through the same `relink-rlcore --nat` instance at once —
+30/30 succeeded, 900/900 messages delivered, 0 failures (numbers below
+in Step 12). Step 13 covers the full technical mechanism (background
+re-punch, multiplexed-vs-per-topic-port routing, exactly what a NAT
+type can and can't be punched through).
+
+### AF_XDP — optional, and fully detachable
+
+`relink-relay` has an opt-in fast-path build flag,
+`-DRELINK_ENABLE_XDP`, that lets it bypass the Linux kernel's normal
+UDP receive path for lower latency (Step 12 has real measured numbers:
+~400-550 µs faster per round trip). It needs `libbpf`, `clang`, and
+Linux ≥ 5.1 to build, and root/`CAP_NET_ADMIN` to run.
+
+**You do not need any of this to use `relink-relay`.** It's off by
+default, and detaching it again is a matter of not passing the flag —
+there's no code to remove, no separate binary to maintain:
+
+```bash
+cd rlcore
+cmake -B build .                       # plain relay -- no AF_XDP, no extra dependencies
+cmake -B build . -DRELINK_ENABLE_XDP=ON  # same relay, faster RX path, needs libbpf + clang
+cmake --build build
+```
+
+If AF_XDP is enabled but the running kernel, NIC driver, or permissions
+don't actually support it, `relink-relay` detects that at startup and
+falls back to plain sockets automatically — it never hard-fails
+because AF_XDP isn't available. Missing build dependencies fail
+`cmake`'s configure step with the exact `apt-get install` line needed,
+rather than a confusing compile error.
+
+### rlcore in plain terms
+
+If the discovery-mode names (Mode A/B) feel abstract, here's the same
+thing without the jargon: `relink-rlcore` is one small program you run
+once, on one machine both your other programs can reach — think of it
+as a phone book. Every node calls it once on startup to say "here I
+am, and here's what I publish," and rlcore tells each node how to
+reach the others directly. After that, rlcore is out of the way —
+actual messages never pass through it, only the one-time introduction
+does.
+
+A complete two-machine example — a temperature sensor on one machine, a
+logger on another, found via rlcore:
+
+```bash
+# 1. On any reachable machine (or your own laptop), start the phone book once:
+./relink-rlcore --port 8445
+```
+
+```cpp
+// 2. sensor.cpp — publishes a reading once a second
+#include "relink/relink.hpp"
+#include <unistd.h>
+
+int main() {
+    RelinkNode node;
+    node.set_rlcore.ip("10.0.0.5");   // the machine running relink-rlcore
+    node.advertise<Float32>("/temperature");
+    while (true) {
+        node.publish<Float32>("/temperature", Float32{ .data = 36.6f });
+        sleep(1);
+    }
+}
+```
+
+```python
+# 3. logger.py — prints every reading it receives
+from relink import RelinkNode, Float32
+
+node = RelinkNode()
+node.set_rlcore.ip("10.0.0.5")   # same phone book as the sensor
+node.subscribe("/temperature", Float32, lambda msg: print("got:", msg.data))
+node.spin()
+```
+
+Run all three (in any order — nodes retry until rlcore is reachable),
+and `logger.py` starts printing readings from `sensor.cpp` a moment
+later, even though they're two different languages on two different
+machines. That's the whole point: rlcore just handles the "how do I
+find you" problem so your actual code doesn't have to.
 
 ---
 
 ## Step 10 — All examples
 
 Every example is a complete, runnable program, not a snippet — each one
-exists in both C++ (`examples/cpp/`) and Python (`relink_py/examples/`).
+exists in both C++ (`cpp/examples/`) and Python (`python/relink_py/examples/`).
 
 | Example | What it shows | Run it |
 |---|---|---|
@@ -383,22 +602,34 @@ you're comfortable with the basics, not a starting point.
 
 ```bash
 # C++ (each test is a standalone binary)
-g++ -std=c++17 -I relink/include -pthread tests/test_wire.cpp -o test_wire && ./test_wire
+g++ -std=c++17 -I cpp/relink/include -pthread cpp/tests/test_wire.cpp -o test_wire && ./test_wire
 
 # Python
-python3 relink_py/tests/test_relink.py
+python3 python/relink_py/tests/test_relink.py
 ```
 
 Every layer (wire format, ring buffer, framing, discovery, named-topic
 hashing, the public API's error paths) has a plain-assert test suite in
 both languages, plus two-process correctness tests and cross-language
-interop tests (`tests/two_process_{pub,sub}.cpp` /
-`relink_py/tests/two_process_{pub,sub}.py`) proving the C++ and Python
+interop tests (`cpp/tests/two_process_{pub,sub}.cpp` /
+`python/relink_py/tests/two_process_{pub,sub}.py`) proving the C++ and Python
 nodes actually interoperate over real sockets, not just in theory.
 
 ---
 
 ## Step 12 — Benchmarks
+
+**In plain terms**: using the C++ version, a message sent by one
+program typically arrives at the other in well under a millisecond —
+around 40-170 microseconds on average depending on the setup, which is
+1,000x faster than the blink of an eye. Compared to ROS2 (the most
+common alternative), ReLink was 2-3x faster on average and had a much
+more consistent worst case — ROS2's occasional slow message (up to
+3.7ms) was almost 10x slower than ReLink's. On the relay path
+specifically, ReLink handled a sustained 10,000 messages per second
+with zero messages lost and typical delivery in under 100
+microseconds (details in [the AF_XDP fast path
+section](#af_xdp-fast-path) below).
 
 Measured over 60s sustained at 1000Hz with a ~40-byte payload
 (`ImuReading`-sized), CPU pinning + `SCHED_FIFO` applied to the data
@@ -460,6 +691,132 @@ is a compatibility feature (ROS-style per-topic addressing), not a
 performance one — keep the default unless you specifically need a topic
 on its own port.
 
+### AF_XDP fast path
+
+`cpp/rlcore/relink_relay.cpp`, built with `-DRELINK_ENABLE_XDP` —
+an opt-in build flag that has the relay bypass the kernel's normal UDP
+receive path for matched traffic via a native/driver-mode XDP program +
+AF_XDP socket (falls back to a plain socket automatically if the
+kernel/driver/toolchain don't support it — see `cpp/rlcore/xdp/relay_xdp.hpp`).
+All results below are against a real production VPS (Ubuntu 20.04,
+virtio_net NIC, libbpf 0.5.0), not loopback.
+
+*Round-trip latency, AF_XDP vs. plain socket, identical relay code and
+network path, only the RX mechanism differs* (WAN: dev laptop ↔ VPS,
+500 samples, two relay hops per sample — pinger → relay → responder →
+relay → pinger):
+
+| Path | min | p50 | p90 | p99 | max | avg |
+|---|---|---|---|---|---|---|
+| AF_XDP | 4488.7 µs | 4980.4 µs | 6169.1 µs | 8520.7 µs | 13226.6 µs | 5308.7 µs |
+| Plain socket | 4823.4 µs | 5409.3 µs | 6645.5 µs | 9074.3 µs | 14283.7 µs | 5735.6 µs |
+
+AF_XDP is consistently ~400-550 µs faster per round trip (2 hops) — a
+real, measurable win, small relative to WAN RTT here but a fixed
+per-hop saving that matters proportionally more on a LAN or between
+geographically close peers.
+
+*Single-topic sustained throughput* (paced publish, one pub + one sub,
+loss and duplicates measured, AF_XDP relay):
+
+| Publisher/subscriber location | Rate | Messages | Loss | Duplicates |
+|---|---|---|---|---|
+| Dev laptop (WAN, real home uplink) | 500 msg/s | 5,000 | 0% | 0 |
+| Dev laptop (WAN, real home uplink) | 2,000 msg/s | 10,000 | 0% | 0 |
+| Dev laptop (WAN, real home uplink) | 5,000 msg/s | 20,000 | 0% | 0 |
+| Dev laptop (WAN, real home uplink) | 10,000 msg/s | 30,000 | 18-44%\* | 0 |
+| **VPS itself** (both pub and sub on the relay's own box, via its real NIC — not loopback) | 10,000 msg/s | 30,000 | **0%** | 0 |
+
+\* At 10,000 msg/s from the dev laptop, loss appeared on two separate
+runs (44.3% and 18.5%) — but the VPS's own NIC redirect counters
+(`ethtool -S eth0`, `rx_queue_0_xdp_redirects`) showed an *exact*
+packet-count match both times (e.g. 30,002 in for 30,000 data +
+2 registration packets, zero new `rx_queue_0_xdp_drops`), proving the
+relay received and processed 100% of traffic with zero server-side
+loss. Re-running the identical test with both publisher and subscriber
+on the VPS itself (removing the dev laptop's home network from the
+path entirely) reproduced 0% loss with sub-100 µs latency
+(min=18.0 µs, p50=41.0 µs, p90=70.0 µs, p99=159.0 µs, avg=55.8 µs).
+The loss at 10,000 msg/s from the laptop is the laptop's home
+internet uplink saturating under a sustained ~10k pps flow, not a
+defect in the relay or its AF_XDP path.
+
+**`relink-rlcore --nat` under concurrent load** — real cross-network
+nodes (a dev laptop behind a home NAT ↔ the VPS), each topic
+independently registering with rlcore, learning its peer's NAT-mapped
+address, attempting a direct punch, and falling back to the relay
+(this laptop's NAT type structurally blocks the specific punch
+pattern here, confirmed separately — see Step 13), fired concurrently:
+
+| Concurrent topics | Messages/topic | Total messages | Passed | Failed |
+|---|---|---|---|---|
+| 10 | 20 | 200 | 10/10 | 0 |
+| 30 | 30 | 900 | 30/30 | 0 |
+
+Every publisher resolved exactly one peer and every subscriber
+received 100% of its messages with zero duplicates, across both runs —
+rlcore's registration/rendezvous logic and the relay-fallback path
+both held up cleanly with no cross-talk between concurrently-running
+topics.
+
+### Image / video streaming (real webcam)
+
+All tests below used a real `/dev/video0` webcam and the actual
+`camera_stream` example (Step 10), not synthetic data.
+
+**Same-machine, both resolutions the test camera actually supports**
+(everything else this camera claims to support returned an empty
+frame — a driver limitation, not a ReLink one):
+
+| Resolution | Frames sent | Delivered (raw) | Delivered (compressed) |
+|---|---|---|---|
+| 320×240 | 46 | 46/46 (100%) | 46/46 (100%) |
+| 640×480 | 42 | 42/42 (100%) | 42/42 (100%) |
+
+**Cross-network, real NAT hole punching** (laptop webcam behind a home
+NAT → VPS, via `relink-rlcore --nat` — `Image` has **no relay
+fallback** at all, see Step 13, so this is testing the direct punched
+path in isolation with nothing to fall back to). Publishing raw and
+compressed together, at increasing target FPS:
+
+| Target FPS | Actual FPS (camera-limited) | Raw delivered | Compressed delivered |
+|---|---|---|---|
+| 5 | 5.0 | 39/40 (97.5%) | 39/40 (97.5%) |
+| 10 | 10.0 | 21/80 (26%) | 60/80 (75%) |
+| 15 | 8.0 | 1/65 (1.5%) | 31/65 (48%) |
+| 30 | 6.1 | 0/49 (0%) | 20/49 (41%) |
+
+Two findings here: this webcam physically tops out around 6-8 FPS once
+JPEG encode + a several-hundred-chunk raw frame's worth of `sendto()`
+calls are in the loop every frame — and **raw collapses far faster
+than compressed as load increases**, exactly matching Step 8's
+warning (one dropped chunk drops the whole frame; raw is ~166 chunks
+at this resolution, compressed is 2-6).
+
+**Isolating the actual bottleneck**: capturing frames alone hit a true
+30 FPS, and JPEG-encoding them also stayed at 30 FPS — the slowdown
+above was specifically the *raw* topic's per-frame chunk-send volume,
+not the camera or the encoder. Dropping the raw topic and publishing
+**compressed only**:
+
+| Target FPS | Actual FPS | Delivered |
+|---|---|---|
+| 30 | 29.8 | 229/239 (95.8%) |
+
+A real webcam, real cross-NAT delivery, at a genuine ~30 FPS with
+~96% of frames arriving intact — `image_compressed` is the one to use
+for anything resembling live video; raw is fine for occasional
+snapshots or a LAN with no NAT/relay concerns.
+
+(One caveat on the FPS-ladder table above: those four runs reused the
+same topic IDs in quick succession, so `peers_for_topic` climbed from
+1 to 7 across them as earlier runs' registrations hadn't yet expired
+under rlcore's 30s TTL — the relay/rlcore was also wasting some effort
+routing toward those stale dead peers, so the true degradation curve
+for raw is likely slightly better than shown. The direction of the
+finding — and the compressed-only result, run on a fresh topic — both
+hold regardless.)
+
 ---
 
 ## Step 13 — NAT traversal (cross-network nodes)
@@ -508,7 +865,7 @@ a path that was never open; that case needs a relay/TURN-style fallback
 — see below.
 
 **Relay fallback, for NATs punching can't cross at all.** Run
-`relink-relay` (C++, `rlcore/relink_relay.cpp`) or `relink_relay.py`
+`relink-relay` (C++, `cpp/rlcore/relink_relay.cpp`) or `relink_relay.py`
 (pure Python, no compiler needed) on a host both nodes can reach — the
 same box running `relink-rlcore --nat` works fine. Then call
 `node.set_relay(ip, port = 8446)` on every node that needs it, before
@@ -577,31 +934,43 @@ frame is already tolerated, see the troubleshooting table below).
 
 ### Repository layout
 
+Everything C++ lives under `cpp/`, everything Python lives under
+`python/` — same two-language split as the rest of this doc, so it's
+never ambiguous which build tooling a given file needs.
+
 ```
-relink/include/relink/     C++ library (header-only)
-  wire.hpp                   byte-exact structs: RelinkHeader, BeaconPacket, default types
-  topic_hash.hpp              FNV-1a 32-bit hash for named topics
-  ring_buffer.hpp             fixed-capacity, drop-oldest-on-overflow
-  frame.hpp                   pure encode/decode, MTU-budgeted
-  udp_transport.hpp           dedicated data thread, CPU pinning, SCHED_FIFO
-  register.hpp / rlcore_client.hpp     mode A (rlcore) client
-  beacon.hpp / multicast_discovery.hpp  mode B (multicast) client
-  relink.hpp                  RelinkNode -- the public API
-  relay_wire.hpp               relay fallback wire helpers (Step 13)
+cpp/
+  relink/include/relink/       C++ library (header-only)
+    wire.hpp                     byte-exact structs: RelinkHeader, BeaconPacket, default types
+    topic_hash.hpp                FNV-1a 32-bit hash for named topics
+    ring_buffer.hpp               fixed-capacity, drop-oldest-on-overflow
+    frame.hpp                     pure encode/decode, MTU-budgeted
+    udp_transport.hpp             dedicated data thread, CPU pinning, SCHED_FIFO
+    register.hpp / rlcore_client.hpp       mode A (rlcore) client
+    beacon.hpp / multicast_discovery.hpp    mode B (multicast) client
+    relink.hpp                    RelinkNode -- the public API
+    relay_wire.hpp                 relay fallback wire helpers (Step 13)
 
-rlcore/
-  relink_rlcore.cpp          registration daemon, C++ build
-  relink_rlcore.py           registration daemon, Python build (byte-identical protocol)
-  relink_relay.cpp           relay fallback daemon, C++ build (Step 13)
-  relink_relay.py            relay fallback daemon, Python build (byte-identical protocol)
+  rlcore/                       C++ daemons, CMake project (Step 9)
+    relink_rlcore.cpp             registration daemon
+    relink_relay.cpp              relay fallback daemon (Step 13)
+    CMakeLists.txt                 -DRELINK_ENABLE_XDP=ON for the AF_XDP fast path (Step 12)
+    xdp/                           AF_XDP socket + eBPF kernel program
 
-relink_py/relink/           Python library (stdlib-only: ctypes + socket + struct)
-  (mirrors the C++ layer-for-layer, see relink_py/README.md)
+  examples/                     C++ usage examples (Step 10)
+  tests/                        unit tests + two-process correctness tests (Step 11)
+  cpp/ros2_compare/                  ROS2 Humble comparison benchmark package
+  relink_benchmark.cpp, relink_example.cpp, rl_topic.cpp
 
-examples/cpp/                C++ usage examples (Step 10)
-relink_py/examples/          Python usage examples (Step 10)
-tests/, relink_py/tests/     unit tests + two-process correctness tests, both languages
-ros2_compare/                 ROS2 Humble comparison benchmark package
+python/
+  relink_py/relink/             Python library (stdlib-only: ctypes + socket + struct)
+    (mirrors the C++ layer-for-layer, see python/relink_py/README.md)
+  relink_py/examples/            Python usage examples (Step 10)
+  relink_py/tests/               unit tests + two-process correctness tests (Step 11)
+  rlcore/                        Python daemons, byte-identical wire protocol to cpp/rlcore/
+    relink_rlcore.py               registration daemon
+    relink_relay.py                relay fallback daemon (Step 13)
+  rl_topic.py
 ```
 
 ### Status / scope
