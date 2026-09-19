@@ -31,7 +31,7 @@ int main(int argc, char** argv) {
         return 2;
     }
 
-    uint16_t topic_id = static_cast<uint16_t>(std::atoi(argv[argi++]));
+    uint32_t topic_id = static_cast<uint32_t>(std::atoi(argv[argi++]));
     int count = std::atoi(argv[argi++]);
 
     node.advertise<Int32>(topic_id);
