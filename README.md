@@ -128,6 +128,69 @@ This is currently the only way to install it — there is no package
 manager entry, on purpose (see Step 0: no codegen, no dependency surface
 beyond a socket).
 
+### Building the C++ library, per OS
+
+The C++ side is header-only (`cpp/relink/include/`) — there's no
+library to link, just headers to compile against. Python needs no
+build step at all on any OS (pure stdlib). `camera_stream.cpp` is the
+one exception below: it needs OpenCV, installed separately, on every
+OS.
+
+**Linux** — a C++17 compiler is usually already installed:
+
+```bash
+sudo apt-get install -y g++          # if you don't already have one
+g++ -std=c++17 -I cpp/relink/include -pthread cpp/examples/hello_relink.cpp -o hello_relink
+```
+
+**macOS** — Apple Clang (from Xcode Command Line Tools) works as-is;
+no `-pthread` flag needed (macOS links pthreads by default):
+
+```bash
+xcode-select --install                # if you don't already have the toolchain
+clang++ -std=c++17 -I cpp/relink/include cpp/examples/hello_relink.cpp -o hello_relink
+```
+
+macOS shares the same POSIX sockets code path as Linux. The one
+difference: `pthread_setaffinity_np()` (CPU core pinning, Step 12's
+`-pthread` benchmark path) is a Linux-only glibc extension with no
+macOS equivalent, so pinning is silently skipped there — everything
+else (discovery, pub/sub, NAT traversal, `rlcore`/`relink-relay`)
+works the same. This path is believed correct (it's the same POSIX
+sockets/pthreads code Linux uses) but hasn't been run on real macOS
+hardware — if you hit something, please open an issue.
+
+**Windows** — two supported ways to get a C++17 compiler:
+
+```bash
+# Option A: MSYS2/MinGW-w64 (recommended -- closest to the Linux/macOS
+# build commands above, no Visual Studio needed)
+pacman -S mingw-w64-x86_64-gcc
+g++ -std=c++17 -I cpp/relink/include cpp/examples/hello_relink.cpp -o hello_relink.exe -lws2_32
+
+# Option B: cross-compile FROM Linux/WSL for Windows (what this
+# project's own CI/verification used -- see Step 11)
+sudo apt-get install -y g++-mingw-w64-x86-64-posix
+x86_64-w64-mingw32-g++ -std=c++17 -I cpp/relink/include hello_relink.cpp -o hello_relink.exe -lws2_32
+```
+
+`-lws2_32` (Winsock) is required on Windows — there's no equivalent
+flag on Linux/macOS since sockets are already part of libc there.
+MSVC (`cl.exe`) is not tested but should work with the same `-lws2_32`
+equivalent (`ws2_32.lib`) and no other changes, since the Windows code
+path (`relink/platform.hpp`) is plain Win32/Winsock API, not
+MinGW-specific.
+
+**Verified, not just theorized**: the Windows build was cross-compiled
+with MinGW-w64 and actually run under Wine — every unit/integration
+test passing, plus live cross-platform pub/sub (a Windows `.exe` and a
+native Linux binary exchanging messages over multicast in both
+directions) and a 6-node concurrent stress test (3 Windows + 3 Linux
+processes, 30s, zero crashes/errors). See [Step 15's Technical deep
+dive](#step-15--technical-deep-dive) for anything platform-specific
+that came up (a Windows header name collision, Winsock's different
+`SO_RCVTIMEO` type, no true `sendmsg()` scatter-gather).
+
 Now that you have the code, let's run it.
 
 ---
@@ -1483,6 +1546,54 @@ to run — none of which are needed for the plain-socket relay ([Step
 fail `cmake`'s configure step with the exact `apt-get install` line
 needed, rather than a confusing compile error. Measured numbers for
 this path are in [Step 12's AF_XDP section](#af_xdp-fast-path).
+
+### Porting the C++ core to Windows
+
+`relink/platform.hpp` is the one file that knows the difference between
+POSIX sockets and Winsock; every other header/source file is written
+once and compiles unchanged on both, via a handful of portable
+wrappers (`close_socket()`, `set_recv_timeout_ms()`, `sendmsg_to()`,
+`pin_thread_to_core()`, `set_thread_realtime()`). Three real platform
+gaps had to be worked around, not just renamed:
+
+- **A Windows header name collision.** `windows.h`'s GDI header
+  declares a global `Polygon()` function, which collided with
+  ReLink's own `geometry_msgs::Polygon` (Step 7) once `using namespace
+  geometry_msgs;` was in scope — a genuine ambiguous-symbol compile
+  error, not a typo. Fixed with `#define NOGDI` before including
+  `windows.h`, since ReLink never touches GDI anyway.
+- **`SO_RCVTIMEO` has a different wire shape.** POSIX takes a `struct
+  timeval` (seconds + microseconds); Winsock takes a single `DWORD` of
+  milliseconds. `set_recv_timeout_ms()` hides that difference behind
+  one signature both platforms implement.
+- **No `sendmsg()`/scatter-gather send on Windows** without
+  `WSASendMsg` (which needs a runtime function-pointer lookup via
+  `WSAIoctl`, not a plain link-time symbol). Windows' `sendmsg_to()`
+  instead copies every `iovec` segment into one ≤1500-byte stack
+  buffer and sends it with a single `sendto()` — not zero-copy like
+  the POSIX path (see `udp_transport.hpp::publish_scattered`'s use for
+  `Image`, Step 8), but correct, and payloads here are always well
+  under that size.
+
+AF_XDP (this section, above) stays Linux-only regardless of the
+`RELINK_ENABLE_XDP` build flag — it's gated out under `_WIN32`, since
+the whole mechanism (eBPF, UMEM, native XDP sockets) doesn't exist on
+Windows; the plain-socket relay is the only path there.
+
+**Verification method**: rather than trusting that a clean
+cross-compile means a working port, the Windows build was actually
+*run*, under Wine (`x86_64-w64-mingw32-g++` to build, a 64-bit Wine
+prefix to execute) — all 10 C++ test binaries passing, a native Linux
+`hello_relink` and a Windows `.exe` (under Wine) exchanging messages
+in both directions over real multicast, a Linux client registering
+against a Windows-hosted `relink-rlcore` daemon, a sustained 1000Hz/60s
+throughput run (Windows publisher, Linux subscriber, effectively zero
+loss in steady state), and a 6-node concurrent stress test (3 Windows
++ 3 Linux processes, 30s, zero crashes across ~90,000 total logged
+messages). macOS shares the POSIX branch of `platform.hpp` (real
+sockets, real `sendmsg()`) and is believed correct by the same
+reasoning, but hasn't been run on real hardware the way the Windows
+port was verified under Wine.
 
 ---
 

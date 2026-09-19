@@ -11,11 +11,17 @@
 // pthread_setaffinity_np()/SCHED_FIFO (mapped to the nearest Windows
 // equivalents, best-effort, same as the POSIX side already treats a
 // failed real-time request as non-fatal).
+//
+// macOS/BSD share the POSIX branch below (real sockets, real sendmsg)
+// but also lack pthread_setaffinity_np()/cpu_set_t (a glibc-only
+// extension) -- pin_thread_to_core() is a no-op there, same
+// non-fatal-fallback policy as everywhere else in this file.
 
 #pragma once
 
 #include <cstdint>
 #include <cstddef>
+#include <cstring>
 #include <string>
 
 #if defined(_WIN32)
@@ -170,10 +176,18 @@ inline ssize_t sendmsg_to(socket_t s, const iovec* iov, int iovcnt,
 
 inline void pin_thread_to_core(int core) {
     if (core < 0) return;
+#ifdef __linux__
+    // cpu_set_t/CPU_SET/pthread_setaffinity_np are a glibc (Linux)
+    // extension -- macOS/BSD have no equivalent thread-to-core pinning
+    // API at all, so this is a no-op there, same "continue unpinned"
+    // policy as a failed request anywhere else.
     cpu_set_t cpuset;
     CPU_ZERO(&cpuset);
     CPU_SET(core, &cpuset);
     ::pthread_setaffinity_np(pthread_self(), sizeof(cpuset), &cpuset);
+#else
+    (void)core;
+#endif
 }
 inline void set_thread_realtime(int priority) {
     struct sched_param param{};
