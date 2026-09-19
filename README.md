@@ -50,26 +50,21 @@ whichever language fits your project.
 
 ## Words you might not know yet
 
-If you've never touched networking or robotics before, a few words
-show up constantly below. Skim this once — you won't need to
-memorize it, just recognize the words when they show up.
+This doc assumes you already know the basics of networking (IP, port,
+UDP/TCP) and software engineering, plus some robotics/mechatronics
+background (sensors, control loops, maybe ROS). A few terms below are
+specific to ReLink or used loosely elsewhere — worth a quick skim.
 
-| Word | Plain-English meaning |
+| Word | What it means here |
 |---|---|
-| **Network** | Computers that can send data to each other, like your laptop and phone on the same WiFi. |
-| **IP address** | A computer's "phone number" on a network, like `192.168.1.5`, so other computers know who to send data to. |
-| **Port** | A number (like an apartment number, on top of the "building address" that's the IP) that says which program on that computer the data is for. Lets one computer run many programs that each talk over the network without mixing up each other's data. |
-| **Socket** | The thing a program opens to actually send/receive data over the network — think of it as picking up the phone before you can make a call. |
-| **UDP** | One way computers send data over a network — fast, but with no guarantee a message arrives (compare: mailing a postcard). ReLink uses this. |
-| **TCP** | The other common way — slower, but guarantees the message arrives and arrives in order (compare: a phone call where you can ask "did you hear that?"). ReLink deliberately does not use this, for speed. |
-| **Daemon** | A program that just runs quietly in the background, not something you interact with directly — like an alarm clock app running while you do other things. |
-| **Multicast** | One computer sending a message that every other computer on the local network can hear at once, without addressing each one individually — like shouting in a room instead of calling each person. |
-| **NAT** | Short for Network Address Translation — the reason most home/phone networks let many devices share one public internet address, and also the reason two computers on different networks often can't reach each other directly without extra help (Step 13). |
-| **ROS** | "Robot Operating System" — the most widely-used existing toolkit for writing robot software. ReLink borrows some of its ideas (topics, messages) but is not ROS and doesn't need it installed. |
-| **Publish/subscribe** | A messaging pattern: one program "publishes" (sends) data on a named channel, and any number of other programs "subscribe" (listen) to that channel — neither side needs to know who else is on it. |
-| **Topic** | The name of that channel — e.g. `/temperature`. Anyone publishing or subscribing to the same topic name is talking about the same data. |
-| **Wire format** | The exact sequence of bytes (0s and 1s, grouped) sent over the network for a message — "wire" as in the physical/network wire the bits travel over. |
-| **Latency** | How long a message takes to arrive after it's sent — lower is faster/better. |
+| **Daemon** | A small program that just runs in the background and waits to be asked for something — not something you interact with directly while it runs. |
+| **Discovery** | The process of a node finding out another node's IP/port before either can send it anything. ReLink does this itself; you don't hand-configure addresses. |
+| **Rendezvous point** | A single known, reachable address that other nodes register with so they can find each other — that's `rlcore`'s whole job (Step 9), nothing more. |
+| **Multicast** | One node sending a message that every node on the local network can receive at once, without addressing each one individually. |
+| **Publish/subscribe (pub/sub)** | A messaging pattern: a node "publishes" data on a named topic, and any number of other nodes "subscribe" to that topic — publishers and subscribers don't need to know about each other directly. |
+| **Topic** | The named (or numbered) channel a message is published/subscribed on — same concept as a ROS topic. |
+| **Wire format** | The exact byte layout of a message as it's actually sent over the network — not just "whatever the struct looks like in memory," but a documented, fixed layout both sides agree on. |
+| **NAT traversal / hole punching** | Techniques for getting two nodes on different networks (e.g. behind different home routers) to reach each other directly, despite neither having a public IP — covered in Step 13. |
 
 Come back to this table any time a word below doesn't make sense yet.
 
