@@ -1,15 +1,16 @@
 # ReLink pub/sub quickstart (`cpp/src/`)
 
-Three minimal files showing the three ways to structure a ReLink
-node — pick whichever matches your project's shape:
+Four minimal files showing the ways to structure a ReLink node — pick
+whichever matches your project's shape:
 
 | File | What it is | Run it with |
 |---|---|---|
-| `pub.cpp` | Publisher only | a copy of `sub.cpp` (or `pubsub.cpp`) on the other end |
-| `sub.cpp` | Subscriber only | a copy of `pub.cpp` (or `pubsub.cpp`) on the other end |
-| `pubsub.cpp` | Both roles in one node | another copy of itself, or `pub.cpp`/`sub.cpp` |
+| `pub.cpp` | Publisher only | a copy of `sub.cpp` (or `pubsub.cpp`/`main.cpp`) on the other end |
+| `sub.cpp` | Subscriber only | a copy of `pub.cpp` (or `pubsub.cpp`/`main.cpp`) on the other end |
+| `pubsub.cpp` | Both roles in one node | another copy of itself, `main.cpp`, or `pub.cpp`/`sub.cpp` |
+| `main.cpp` | Same as `pubsub.cpp`, named `main.cpp` for build tooling that expects that entry-point filename | same as `pubsub.cpp` |
 
-All three talk on the same topic (`/example/chatter`) with the same
+All four talk on the same topic (`/example/chatter`) with the same
 message shape, so any combination of them can talk to each other. This
 file covers only "how do I build and run these" — for the full API
 (message types, images, NAT traversal, etc.) see the
@@ -23,7 +24,7 @@ These are already wired into the top-level `cpp/CMakeLists.txt`:
 cd cpp
 cmake -B build .
 cmake --build build
-./build/src/pub      # or: ./build/src/sub, ./build/src/pubsub
+./build/src/pub      # or: ./build/src/sub, ./build/src/pubsub, ./build/src/main
 ```
 
 Or compile a single file directly with `g++`/`clang++`, the same way

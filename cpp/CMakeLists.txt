@@ -70,6 +70,13 @@ target_link_libraries(pub PRIVATE relink)
 add_executable(sub src/sub.cpp)
 target_link_libraries(sub PRIVATE relink)
 
+# main.cpp is functionally identical to pubsub.cpp (conventional
+# src/main.cpp entry point) -- its own target, not reusing src_pubsub's
+# object files, so it can diverge later without affecting pubsub.cpp.
+add_executable(src_main src/main.cpp)
+target_link_libraries(src_main PRIVATE relink)
+set_target_properties(src_main PROPERTIES OUTPUT_NAME main RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/src)
+
 add_executable(src_pubsub src/pubsub.cpp)
 target_link_libraries(src_pubsub PRIVATE relink)
 set_target_properties(src_pubsub PROPERTIES OUTPUT_NAME pubsub RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/src)
