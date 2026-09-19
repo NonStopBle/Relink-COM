@@ -349,7 +349,8 @@ class JointState(ctypes.LittleEndianStructure):
     ]
 
     def set_name(self, i: int, s: str):
-        self._name[i] = s.encode("utf-8")[:STRING_MAX_LEN - 1]
+        encoded = s.encode("utf-8")[:STRING_MAX_LEN - 1]
+        self._name[i][:] = encoded.ljust(STRING_MAX_LEN, b"\x00")
 
     def name_str(self, i: int) -> str:
         return bytes(self._name[i]).rstrip(b"\x00").decode("utf-8", errors="replace")
@@ -516,7 +517,8 @@ class JointTrajectory(ctypes.LittleEndianStructure):
     ]
 
     def set_joint_name(self, i: int, s: str):
-        self._joint_names[i] = s.encode("utf-8")[:STRING_MAX_LEN - 1]
+        encoded = s.encode("utf-8")[:STRING_MAX_LEN - 1]
+        self._joint_names[i][:] = encoded.ljust(STRING_MAX_LEN, b"\x00")
 
 
 class MultiDOFJointTrajectoryPoint(ctypes.LittleEndianStructure):
@@ -541,7 +543,8 @@ class MultiDOFJointTrajectory(ctypes.LittleEndianStructure):
     ]
 
     def set_joint_name(self, i: int, s: str):
-        self._joint_names[i] = s.encode("utf-8")[:STRING_MAX_LEN - 1]
+        encoded = s.encode("utf-8")[:STRING_MAX_LEN - 1]
+        self._joint_names[i][:] = encoded.ljust(STRING_MAX_LEN, b"\x00")
 
 
 for _t in (JointTrajectoryPoint, JointTrajectory, MultiDOFJointTrajectoryPoint, MultiDOFJointTrajectory):
