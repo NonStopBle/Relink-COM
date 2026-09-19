@@ -191,6 +191,38 @@ dive](#step-15--technical-deep-dive) for anything platform-specific
 that came up (a Windows header name collision, Winsock's different
 `SO_RCVTIMEO` type, no true `sendmsg()` scatter-gather).
 
+### Using CMake instead of raw compiler commands
+
+The commands above call the compiler directly, which is fine for one
+file. For a real project, [`cpp/cmake_example/`](cpp/cmake_example/) is
+a copy-pasteable CMake project that builds the same `hello_relink.cpp`
+on all three OSes from one `CMakeLists.txt` (it handles `-lws2_32` on
+Windows and `pthread` on Linux/macOS for you):
+
+```bash
+cd cpp/cmake_example
+cmake -B build .
+cmake --build build
+./build/hello_relink        # build/hello_relink.exe on Windows
+```
+
+Cross-compiling for Windows from Linux/WSL works the same way, via the
+included toolchain file (this is exactly how the Windows build in this
+README was produced and verified under Wine — see below):
+
+```bash
+sudo apt-get install -y g++-mingw-w64-x86-64-posix   # once
+cmake -B build-win -DCMAKE_TOOLCHAIN_FILE=mingw-w64-toolchain.cmake .
+cmake --build build-win
+wine build-win/hello_relink.exe   # or copy the .exe to a real Windows machine
+```
+
+To use this as a template for your own project: copy the
+`cpp/cmake_example/` directory, change `RELINK_INCLUDE_DIR` to wherever
+you've vendored `cpp/relink/include/`, and change the one
+`add_executable(...)` line to point at your own `.cpp` file(s) instead
+of `hello_relink.cpp`.
+
 Now that you have the code, let's run it.
 
 ---
