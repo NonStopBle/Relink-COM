@@ -58,6 +58,23 @@ target_link_libraries(relink_example PRIVATE relink)
 add_executable(relink_benchmark tools/relink_benchmark.cpp)
 target_link_libraries(relink_benchmark PRIVATE relink)
 
+# cpp/src/ -- a minimal pub/sub quickstart (see src/README.md), separate
+# from cpp/examples/'s larger message-type-coverage set. The pubsub.cpp
+# FILE is named the same as examples/pubsub.cpp, but the executable
+# TARGET is named src_pubsub to avoid a CMake target-name collision --
+# both binaries still land in the build directory under their own
+# subfolder-qualified path.
+add_executable(pub src/pub.cpp)
+target_link_libraries(pub PRIVATE relink)
+
+add_executable(sub src/sub.cpp)
+target_link_libraries(sub PRIVATE relink)
+
+add_executable(src_pubsub src/pubsub.cpp)
+target_link_libraries(src_pubsub PRIVATE relink)
+set_target_properties(src_pubsub PROPERTIES OUTPUT_NAME pubsub RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/src)
+set_target_properties(pub sub PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/src)
+
 if(RELINK_BUILD_EXAMPLES)
     set(RELINK_EXAMPLES
         hello_relink
