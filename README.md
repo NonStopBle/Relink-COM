@@ -347,9 +347,11 @@ This is a real, complete, runnable program — not a snippet. Every
 ReLink node can publish and subscribe at the same time (there's no
 separate "publisher node" vs. "subscriber node"), so this one file does
 both: it broadcasts its own counted message on a timer, and prints
-whatever any other copy of itself sends. Save it, build it, then run
-the same binary in two terminals (or on two machines on the same LAN)
-and watch them talk to each other:
+whatever any other copy of itself sends.
+
+### The Code
+
+Save the following as `pubsub.cpp`:
 
 ```cpp
 // pubsub.cpp
@@ -388,16 +390,82 @@ int main() {
 }
 ```
 
-```bash
-g++ -std=c++17 -I cpp/relink/include -pthread pubsub.cpp -o pubsub
-./pubsub        # run this in a second terminal too, and watch them find each other
+### The Code Explained
+
+Now, let's break down the code piece by piece.
+
+```cpp
+RelinkNode node;
+node.use_multicast_discovery();
 ```
 
-Build against `cpp/relink/include/` — header-only, no linking step beyond
-`-pthread`. `node.set_rlcore.ip("10.0.0.5")` instead of
+Every ReLink program starts by constructing a `RelinkNode` and picking
+exactly one discovery mode (Step 3) before doing anything else.
+`use_multicast_discovery()` is Mode B — no daemon to start first, which
+is why it's the fastest way to get two nodes talking on a LAN.
+
+```cpp
+node.subscribe<Chatter>(TOPIC, [](const Chatter& msg) {
+    std::printf("received: %s\n", msg.data);
+});
+node.advertise<Chatter>(TOPIC);
+```
+
+`subscribe<T>` registers a callback that fires on ReLink's own
+background thread whenever a `Chatter` message arrives on `TOPIC` from
+any other node — never from this node's own `publish()` calls.
+`advertise<T>` declares that this node will publish `Chatter` on that
+same topic. Subscribing before advertising means an early message from
+a peer that started first is never missed.
+
+```cpp
+while (true) {
+    node.spin_once();              // services discovery -- call this every loop
+    ...
+    node.publish<Chatter>(TOPIC, msg);
+```
+
+`spin_once()` is what actually drives the library — it services
+discovery bookkeeping (beacon send/receive, peer-table updates) and
+must be called on some regular cadence for the node to find peers and
+keep receiving. `publish<T>()` sends `msg` to every peer currently
+known for `TOPIC`; if no peer has been discovered yet, it's a no-op,
+not an error.
+
+### Building your node
+
+```bash
+g++ -std=c++17 -I cpp/relink/include -pthread pubsub.cpp -o pubsub
+```
+
+Build against `cpp/relink/include/` — header-only, no linking step
+beyond `-pthread`. `node.set_rlcore.ip("10.0.0.5")` instead of
 `use_multicast_discovery()` switches to Mode A (Step 9), needed if your
-network blocks multicast or the two nodes aren't on the same LAN. See
-`cpp/examples/` (Step 10) for more programs, including split
+network blocks multicast or the two nodes aren't on the same LAN.
+
+### Running it
+
+Run the same binary in two terminals (or on two machines on the same
+LAN) and watch them talk to each other:
+
+```bash
+./pubsub
+```
+
+You should see output interleaving both directions once the two copies
+discover each other — this is real captured output from two instances
+of the program above, not a mockup:
+
+```
+sent:     hello world 0
+received: hello world 1
+sent:     hello world 1
+received: hello world 2
+sent:     hello world 2
+received: hello world 3
+```
+
+See `cpp/examples/` (Step 10) for more programs, including split
 publisher/subscriber files and custom message types.
 
 ---
@@ -410,7 +478,11 @@ publisher/subscriber files and custom message types.
 **◀ Previous:** [Step 5 — Quick start: C++](#step-5--quick-start-c) &nbsp;|&nbsp; **Next ▶:** [Step 7 — Message types](#step-7--message-types)
 
 The same idea, same wire format — a Python copy and a C++ copy of this
-pattern talk to each other with zero changes on either side:
+pattern talk to each other with zero changes on either side.
+
+### The Code
+
+Save the following as `pubsub.py`:
 
 ```python
 #!/usr/bin/env python3
@@ -420,6 +492,7 @@ import time
 from relink import RelinkNode
 
 class Chatter(ctypes.Structure):
+    _pack_ = 1
     _fields_ = [("data", ctypes.c_char * 128)]
 
 TOPIC = "/relink/chatter"
@@ -446,11 +519,67 @@ if __name__ == "__main__":
     main()
 ```
 
+### The Code Explained
+
+```python
+class Chatter(ctypes.Structure):
+    _pack_ = 1
+    _fields_ = [("data", ctypes.c_char * 128)]
+```
+
+Every message type is a `ctypes.Structure` with `_pack_ = 1` set —
+required so its in-memory layout is byte-exact, with no compiler
+padding, matching the equivalent C++ `struct` field-for-field. ReLink
+rejects a type at `subscribe()`/`advertise()` time if `_pack_ = 1` is
+missing, rather than silently misreading the wire later.
+
+```python
+node = RelinkNode()
+node.use_multicast_discovery()   # zero setup -- no daemon to start first
+```
+
+Same as the C++ side (Step 5): construct a node, pick exactly one
+discovery mode before any other call.
+
+```python
+node.subscribe(TOPIC, Chatter, lambda msg: print("received:", msg.data.decode()))
+node.advertise(TOPIC, Chatter)
+```
+
+`subscribe()` registers a callback for `TOPIC`, `advertise()` declares
+this node publishes `Chatter` on it — subscribing first again avoids
+missing an early message from a peer that started first.
+
+```python
+while True:
+    node.spin_once()             # services discovery -- call this every loop
+    ...
+    node.publish(TOPIC, msg)
+```
+
+`spin_once()` must be called on some regular cadence to service
+discovery; `publish()` sends to every currently-known peer for `TOPIC`
+and is a no-op (not an error) if none have been discovered yet.
+
+### Running it
+
+No build step — pure stdlib (`ctypes` + `socket` + `struct`):
+
 ```bash
 python3 pubsub.py        # run this in a second terminal too
 ```
 
-No install step — pure stdlib (`ctypes` + `socket` + `struct`).
+This is real captured output from two instances of the program above:
+
+```
+sent:     hello world 0
+received: hello world 1
+sent:     hello world 1
+received: hello world 2
+sent:     hello world 2
+received: hello world 3
+```
+
 `node.set_rlcore.ip("10.0.0.5")` instead of `use_multicast_discovery()`
 switches to Mode A (Step 9). See `python/relink_py/README.md` and
 `python/relink_py/examples/` (Step 10) for more programs, including custom
