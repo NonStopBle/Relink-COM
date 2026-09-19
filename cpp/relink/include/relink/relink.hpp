@@ -72,6 +72,19 @@ public:
         select_mode(DiscoveryMode::Multicast);
     }
 
+    // ROS_DOMAIN_ID-style isolation for Mode B only (Mode A/rlcore
+    // already isolates deployments via each rlcore daemon's own
+    // ip:port). Nodes with different network_id join DIFFERENT
+    // multicast group addresses (see derive_multicast_group() in
+    // multicast_discovery.hpp) -- true OS-level isolation, not a
+    // payload check, so two unrelated deployments sharing a LAN never
+    // even receive each other's beacons. Default 0 maps to today's
+    // fixed multicast address, so existing single-domain deployments
+    // that never call this see zero behavior change. Must be called
+    // before use_multicast_discovery()/first traffic -- same ordering
+    // requirement as advertise/subscribe before ensure_started().
+    void set_network_id(uint16_t network_id) { network_id_ = network_id; }
+
     // Multiplex (default, true): every topic shares this node's one UDP
     // socket/port, demultiplexed by topic_id in UdpTransport's handler
     // map -- the design this library is built around (one socket per
@@ -237,19 +250,30 @@ public:
         return out;
     }
 
-    // --- advertise: publisher-side topic declaration ---
+    // --- advertise: publisher-side topic declaration. pair/pair_id are
+    // a purely LOCAL (this node only) hint under set_multiplex(false):
+    // any topics advertised/subscribed here with pair=true and the same
+    // pair_id share one UDP port instead of each getting its own -- see
+    // transport_for()/register_pair(). Ignored entirely when multiplex
+    // is on (everything already shares transport_). No wire-format
+    // involvement and no requirement that a peer's pub or sub side make
+    // the same pairing choice -- discovery already resolves peers by
+    // topic_id regardless of which port a topic happens to live on. ---
     template <typename T>
-    void advertise(const std::string& name, bool secure = false, bool checksum = false) {
-        advertise<T>(topic_id_for(name), secure, checksum);
+    void advertise(const std::string& name, bool secure = false, bool checksum = false,
+                   bool pair = false, uint32_t pair_id = 0) {
+        advertise<T>(topic_id_for(name), secure, checksum, pair, pair_id);
     }
 
     template <typename T>
-    void advertise(uint32_t topic_id, bool /*secure*/ = false, bool /*checksum*/ = false) {
+    void advertise(uint32_t topic_id, bool /*secure*/ = false, bool /*checksum*/ = false,
+                   bool pair = false, uint32_t pair_id = 0) {
         static_assert(std::is_trivially_copyable<T>::value,
                       "advertise<T>: T must be trivially copyable");
         if constexpr (std::is_same<T, ImageChunk>::value) {
             transport_.enable_large_buffers(); // Image always stays on the shared transport
         } else {
+            register_pair(topic_id, pair, pair_id);
             transport_for(topic_id);
         }
         std::lock_guard<std::mutex> lock(state_mutex_);
@@ -258,16 +282,20 @@ public:
     }
 
     // --- subscribe: receiver-side topic declaration + typed callback,
-    // invoked inline on the data thread per spec's v1 threading design ---
+    // invoked inline on the data thread per spec's v1 threading design.
+    // pair/pair_id: see advertise<T>() above. ---
     template <typename T, typename Callback>
-    void subscribe(const std::string& name, Callback callback, bool secure = false) {
-        subscribe<T>(topic_id_for(name), std::move(callback), secure);
+    void subscribe(const std::string& name, Callback callback, bool secure = false,
+                   bool pair = false, uint32_t pair_id = 0) {
+        subscribe<T>(topic_id_for(name), std::move(callback), secure, pair, pair_id);
     }
 
     template <typename T, typename Callback>
-    void subscribe(uint32_t topic_id, Callback callback, bool /*secure*/ = false) {
+    void subscribe(uint32_t topic_id, Callback callback, bool /*secure*/ = false,
+                   bool pair = false, uint32_t pair_id = 0) {
         static_assert(std::is_trivially_copyable<T>::value,
                       "subscribe<T>: T must be trivially copyable");
+        if constexpr (!std::is_same<T, ImageChunk>::value) register_pair(topic_id, pair, pair_id);
         UdpTransport& t = std::is_same<T, ImageChunk>::value ? transport_ : transport_for(topic_id);
         if constexpr (std::is_same<T, ImageChunk>::value) {
             transport_.enable_large_buffers();
@@ -294,18 +322,22 @@ public:
     // handed to you as unstructured bytes.
     using RawCallback = std::function<void(const uint8_t* payload, size_t len)>;
 
-    void advertise_raw(const std::string& name) { advertise_raw(topic_id_for(name)); }
-    void advertise_raw(uint32_t topic_id) {
+    void advertise_raw(const std::string& name, bool pair = false, uint32_t pair_id = 0) {
+        advertise_raw(topic_id_for(name), pair, pair_id);
+    }
+    void advertise_raw(uint32_t topic_id, bool pair = false, uint32_t pair_id = 0) {
+        register_pair(topic_id, pair, pair_id);
         transport_for(topic_id);
         std::lock_guard<std::mutex> lock(state_mutex_);
         declared_topics_.insert(topic_id);
         advertised_topics_.insert(topic_id);
     }
 
-    void subscribe_raw(const std::string& name, RawCallback callback) {
-        subscribe_raw(topic_id_for(name), std::move(callback));
+    void subscribe_raw(const std::string& name, RawCallback callback, bool pair = false, uint32_t pair_id = 0) {
+        subscribe_raw(topic_id_for(name), std::move(callback), pair, pair_id);
     }
-    void subscribe_raw(uint32_t topic_id, RawCallback callback) {
+    void subscribe_raw(uint32_t topic_id, RawCallback callback, bool pair = false, uint32_t pair_id = 0) {
+        register_pair(topic_id, pair, pair_id);
         UdpTransport& t = transport_for(topic_id);
         {
             std::lock_guard<std::mutex> lock(state_mutex_);
@@ -561,13 +593,44 @@ private:
     UdpTransport& transport_for(uint32_t topic_id) {
         if (multiplex_) return transport_;
         std::lock_guard<std::mutex> lock(state_mutex_);
-        auto it = topic_transports_.find(topic_id);
+        uint64_t key = group_key_locked(topic_id);
+        auto it = topic_transports_.find(key);
         if (it != topic_transports_.end()) return *it->second;
         auto t = std::make_unique<UdpTransport>();
         t->bind(0);
         UdpTransport* raw = t.get();
-        topic_transports_.emplace(topic_id, std::move(t));
+        topic_transports_.emplace(key, std::move(t));
         return *raw;
+    }
+
+    // Caller must hold state_mutex_.
+    uint64_t group_key_locked(uint32_t topic_id) const {
+        auto pit = topic_pair_id_.find(topic_id);
+        if (pit != topic_pair_id_.end()) return kPairKeyTag | pit->second;
+        return topic_id;
+    }
+
+    // Records that `topic_id` should share a port with every other topic
+    // registered under the same pair_id, purely a local (this node only)
+    // port-allocation decision -- no wire-format involvement, see
+    // group_key_locked()/transport_for(). Must be called BEFORE
+    // transport_for(topic_id) so the topic's transport is created (or
+    // found) under the right group key from the start. A topic_id
+    // re-declared later with a different pair_id (or paired then later
+    // unpaired) is almost certainly a bug -- fail loudly rather than
+    // silently rebinding it to a new port out from under a caller who
+    // may already be relying on the earlier port.
+    void register_pair(uint32_t topic_id, bool pair, uint32_t pair_id) {
+        if (!pair) return;
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        auto it = topic_pair_id_.find(topic_id);
+        if (it != topic_pair_id_.end() && it->second != pair_id) {
+            throw std::runtime_error(
+                "relink: topic " + std::to_string(topic_id) +
+                " already paired under pair_id " + std::to_string(it->second) +
+                ", cannot re-pair under pair_id " + std::to_string(pair_id));
+        }
+        topic_pair_id_[topic_id] = pair_id;
     }
 
     void select_mode(DiscoveryMode requested) {
@@ -618,11 +681,24 @@ private:
             std::lock_guard<std::mutex> lock2(state_mutex_);
             topics.assign(declared_topics_.begin(), declared_topics_.end());
             if (!multiplex_ && !topic_transports_.empty()) {
+                // Bucket by transport POINTER, not by iterating
+                // topic_transports_'s own entries directly: a paired
+                // group of topics all resolves to the SAME map entry
+                // (same group key, see group_key_locked()), so the old
+                // "one map entry == one topic" assumption doesn't hold
+                // once pairing is in use -- recompute each declared
+                // topic's group key here and group by the transport it
+                // resolves to, so a paired topic's peers all end up
+                // correctly listed together in one registration/beacon.
+                std::unordered_map<UdpTransport*, std::vector<uint32_t>> by_transport;
                 std::unordered_set<uint32_t> demuxed;
-                for (auto& kv : topic_transports_) {
-                    groups.push_back(TopicGroup{kv.second.get(), std::vector<uint32_t>{kv.first}});
-                    demuxed.insert(kv.first);
+                for (uint32_t id : declared_topics_) {
+                    auto it = topic_transports_.find(group_key_locked(id));
+                    if (it == topic_transports_.end()) continue;
+                    by_transport[it->second.get()].push_back(id);
+                    demuxed.insert(id);
                 }
+                for (auto& kv : by_transport) groups.push_back(TopicGroup{kv.first, kv.second});
                 std::vector<uint32_t> leftover;
                 for (uint32_t id : declared_topics_) if (!demuxed.count(id)) leftover.push_back(id);
                 if (!leftover.empty()) groups.push_back(TopicGroup{&transport_, leftover});
@@ -749,10 +825,18 @@ private:
             // rather than crashing the node (spec: never hang forever).
         } else {
             // Multicast: self_ip auto-detected via the multicast group
-            // address as the "peer" for route selection.
+            // address as the "peer" for route selection. group_ip AND
+            // group_port are BOTH derived from network_id_ (see
+            // set_network_id()) -- the default network_id=0 reproduces
+            // today's fixed address/port exactly. Port must vary too,
+            // not just the address -- see derive_multicast_port()'s
+            // comment for the SO_REUSEPORT reason why address alone
+            // does not isolate two network_ids sharing a host.
             MulticastDiscoveryConfig cfg;
+            cfg.group_ip = derive_multicast_group(network_id_);
+            cfg.group_port = derive_multicast_port(network_id_);
             cfg.self_ip = detect_local_ip_for_peer(
-                ipv4_to_host_order(kDefaultMulticastGroup), kDefaultMulticastPort);
+                ipv4_to_host_order(cfg.group_ip), cfg.group_port);
             for (const auto& g : groups) {
                 cfg.port_groups.push_back(
                     MulticastDiscoveryConfig::PortGroup{g.transport->local_port(), g.topics});
@@ -927,9 +1011,21 @@ private:
 
     UdpTransport transport_;
     std::unique_ptr<MulticastDiscovery> mcast_;
+    uint16_t network_id_ = 0;
 
     bool multiplex_ = true;
-    std::unordered_map<uint32_t, std::unique_ptr<UdpTransport>> topic_transports_;
+    // Keyed by a 64-bit group key, not topic_id directly: an unpaired
+    // topic's key is just its topic_id (fits in the low 32 bits, tag bit
+    // never set since topic_id is uint32_t); a paired topic's key is
+    // kPairKeyTag | pair_id instead, so multiple topic_ids sharing one
+    // pair_id resolve to the SAME map entry (see pair()/transport_for()).
+    // Tagging pair keys this way, rather than reusing pair_id as a raw
+    // uint32_t key, avoids an arbitrary user-chosen pair_id ever
+    // colliding with an unrelated topic_id that happens to have the same
+    // numeric value.
+    static constexpr uint64_t kPairKeyTag = uint64_t{1} << 32;
+    std::unordered_map<uint32_t, uint32_t> topic_pair_id_;  // topic_id -> pair_id, paired topics only
+    std::unordered_map<uint64_t, std::unique_ptr<UdpTransport>> topic_transports_;
     // Which transport owns each topic's data socket, so NAT hole-punching
     // (and anything else that needs to reach a specific peer) fires from
     // the SAME socket that topic's traffic actually uses -- required once

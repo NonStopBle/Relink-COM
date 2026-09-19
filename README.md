@@ -24,6 +24,8 @@ speak the exact same bytes on the wire and are interchangeable.
 - [Step 1 — Get the code](#step-1--get-the-code)
 - [Step 2 — Zero to one (run it)](#step-2--zero-to-one-run-it)
 - [Step 3 — Pick a discovery mode](#step-3--pick-a-discovery-mode)
+  - [Pairing topics onto one port under `set_multiplex(false)`](#pairing-topics-onto-one-port-under-set_multiplexfalse)
+  - [`network_id` — domain isolation for Mode B (multicast)](#network_id--domain-isolation-for-mode-b-multicast)
 - [Step 4 — Named topics](#step-4--named-topics)
 - [Step 5 — Quick start: C++](#step-5--quick-start-c)
 - [Step 6 — Quick start: Python](#step-6--quick-start-python)
@@ -163,6 +165,91 @@ discovers the topic, `hz`/`echo` correctly read it, and `pub` correctly
 reaches a `set_multiplex(false)` subscriber. The only failure mode
 encountered was the ordinary beacon-startup-timing race (see Step 14),
 unrelated to multiplex mode.
+
+### Pairing topics onto one port under `set_multiplex(false)`
+
+`set_multiplex(false)` gives every topic its own dedicated UDP port —
+great for per-topic firewall rules or ROS-style tooling expectations,
+but wasteful when a node declares many small, related topics (a bank of
+IoT sensor/actuator topics, say) and doesn't want one socket per topic.
+`pair`/`pair_id` let you opt a *group* of topics into sharing one port
+while everything else on that node still gets its own:
+
+```cpp
+node.set_multiplex(false);
+node.advertise<Int16>("/room/light/1", false, false, /*pair=*/true, /*pair_id=*/1);
+node.advertise<Int16>("/room/light/2", false, false, /*pair=*/true, /*pair_id=*/1);
+node.advertise<Int16>("/room/light/3");  // unpaired -- still gets its own port
+```
+
+```python
+node.set_multiplex(False)
+node.advertise("/room/light/1", Int16, pair=True, pair_id=1)
+node.advertise("/room/light/2", Int16, pair=True, pair_id=1)
+node.advertise("/room/light/3", Int16)  # unpaired -- still gets its own port
+```
+
+Same `pair`/`pair_id` parameters exist on `subscribe`/`advertise_raw`/
+`subscribe_raw` in both languages.
+
+**Pairing is a purely local decision — nothing goes on the wire for
+it.** A `RegisterRequest`/beacon already lists every topic sharing a
+port alongside that port, regardless of *why* they share it, so there's
+no protocol change and no requirement that a peer's pub or sub side
+make the same pairing choice: discovery already resolves each peer by
+topic id, not by port. Verified live: a C++ publisher packing two
+topics onto one port was received correctly by an independent Python
+subscriber that left those same two topics on two separate ports of its
+own — pairing on one side doesn't need to be mirrored on the other.
+
+Re-declaring a topic under a different `pair_id` (or paired, then later
+unpaired) raises/throws rather than silently rebinding it — almost
+certainly a bug if it happens.
+
+### `network_id` — domain isolation for Mode B (multicast)
+
+Mode A (rlcore) already isolates independent deployments — each
+`relink-rlcore` daemon is its own rendezvous point. Mode B's multicast
+beacon has no equivalent by default: every ReLink node defaults to the
+same multicast address, so two unrelated deployments sharing a LAN
+could cross-discover each other if their topic ids happen to overlap.
+`set_network_id(uint16_t)` gives Mode B a ROS_DOMAIN_ID-style fix —
+call it before `use_multicast_discovery()`:
+
+```cpp
+node.set_network_id(42);
+node.use_multicast_discovery();
+```
+
+```python
+node.set_network_id(42)
+node.use_multicast_discovery()
+```
+
+Nodes with different `network_id` values don't just ignore each other's
+beacons after decoding them — they join **different multicast group
+addresses *and* different ports**, so the isolation happens at the
+OS/kernel level; a node configured for `network_id=42` never receives a
+single byte from a `network_id=7` deployment on the same LAN. Both the
+address and the port must vary together: an earlier address-only design
+(mirroring the address-shifting half of how ROS assigns domains) turned
+out to leak across domains on Linux specifically because
+`MulticastDiscovery`'s listener socket sets `SO_REUSEPORT` (needed so
+several ReLink nodes can share one host on the same multicast port) —
+and `SO_REUSEPORT`'s delivery selection is scoped by port only, so two
+sockets bound to the *same port* but joined to *different* multicast
+addresses still both received a beacon meant for only one of them, a
+directly-reproduced kernel behavior on this project's own test machine.
+Varying the port too sidesteps it entirely.
+
+`network_id=0` (the default — i.e. never calling `set_network_id()`)
+reproduces today's fixed address/port exactly, so existing
+single-domain deployments see no behavior change. Verified: same
+`network_id` on both sides (including cross-language, C++ publisher to
+Python subscriber) discovers and delivers correctly; different
+`network_id` values produce zero cross-talk in either direction. No
+beacon wire-format change — isolation is entirely about which
+address/port a node's socket joins, not anything inside the packet.
 
 ---
 

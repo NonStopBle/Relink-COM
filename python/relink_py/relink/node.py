@@ -19,6 +19,7 @@ from .rlcore_client import register_with_rlcore_on_socket
 from .multicast_discovery import (
     MulticastDiscovery, MulticastDiscoveryConfig, PortGroup,
     DEFAULT_MULTICAST_GROUP, DEFAULT_MULTICAST_PORT,
+    derive_multicast_group, derive_multicast_port,
 )
 from .register import RLCORE_DEFAULT_PORT
 from .topic_directory import TopicDirEntry
@@ -103,8 +104,18 @@ class RelinkNode:
 
         self._transport = UdpTransport()
         self._mcast: Optional[MulticastDiscovery] = None
+        self._network_id = 0
         self._multiplex = True
-        self._topic_transports: Dict[int, UdpTransport] = {}
+        # Keyed by a "group key", not always topic_id directly: an
+        # unpaired topic's key is its own topic_id; a paired topic's key
+        # is ("pair", pair_id) instead, so every topic_id sharing a
+        # pair_id resolves to the SAME entry here -- see
+        # _group_key()/_register_pair()/_transport_for(). A tuple tag
+        # (rather than reusing pair_id as a raw int key) avoids an
+        # arbitrary user-chosen pair_id ever colliding with an unrelated
+        # topic_id that happens to have the same numeric value.
+        self._topic_transports: Dict[object, UdpTransport] = {}
+        self._topic_pair_id: Dict[int, int] = {}  # topic_id -> pair_id, paired topics only
         self._topic_route: Dict[int, UdpTransport] = {}
 
         self._start_lock = threading.Lock()
@@ -142,6 +153,20 @@ class RelinkNode:
     # --- mode B, mutually exclusive with mode A ---
     def use_multicast_discovery(self):
         self._select_mode(DiscoveryMode.MULTICAST)
+
+    def set_network_id(self, network_id: int):
+        """ROS_DOMAIN_ID-style isolation for Mode B only (Mode A/rlcore
+        already isolates deployments via each rlcore daemon's own
+        ip:port). Nodes with different network_id join DIFFERENT
+        multicast group addresses (see derive_multicast_group() in
+        multicast_discovery.py) -- true OS-level isolation, not a
+        payload check, so two unrelated deployments sharing a LAN never
+        even receive each other's beacons. Default 0 maps to today's
+        fixed multicast address, so existing single-domain deployments
+        that never call this see zero behavior change. Must be called
+        before use_multicast_discovery()/first traffic -- same ordering
+        requirement as advertise/subscribe before _ensure_started()."""
+        self._network_id = network_id
 
     def set_multiplex(self, enabled: bool):
         """True (default): every topic shares this node's one UDP
@@ -341,14 +366,41 @@ class RelinkNode:
         while not self._relay_stop.wait(10.0):
             self._register_all_topics_with_relay(groups)
 
+    def _group_key(self, topic_id: int):
+        pair_id = self._topic_pair_id.get(topic_id)
+        if pair_id is not None:
+            return ("pair", pair_id)
+        return topic_id
+
+    def _register_pair(self, topic_id: int, pair: bool, pair_id: int):
+        """Records that `topic_id` should share a port with every other
+        topic registered under the same pair_id -- purely a LOCAL (this
+        node only) port-allocation decision, no wire-format involvement,
+        see _group_key()/_transport_for(). Must be called BEFORE
+        _transport_for(topic_id) so the topic's transport is created (or
+        found) under the right group key from the start. Re-declaring a
+        topic_id later under a different pair_id (or paired then later
+        unpaired) is almost certainly a bug -- fail loudly rather than
+        silently rebinding it to a new port out from under a caller who
+        may already be relying on the earlier port."""
+        if not pair:
+            return
+        existing = self._topic_pair_id.get(topic_id)
+        if existing is not None and existing != pair_id:
+            raise RuntimeError(
+                f"relink: topic {topic_id} already paired under pair_id {existing}, "
+                f"cannot re-pair under pair_id {pair_id}")
+        self._topic_pair_id[topic_id] = pair_id
+
     def _transport_for(self, topic_id: int) -> UdpTransport:
         if self._multiplex:
             return self._transport
-        t = self._topic_transports.get(topic_id)
+        key = self._group_key(topic_id)
+        t = self._topic_transports.get(key)
         if t is None:
             t = UdpTransport()
             t.bind(0)
-            self._topic_transports[topic_id] = t
+            self._topic_transports[key] = t
         return t
 
     def _select_mode(self, requested: DiscoveryMode):
@@ -405,29 +457,43 @@ class RelinkNode:
             for tid in sorted(ids)
         ]
 
-    # --- advertise: publisher-side topic declaration ---
+    # --- advertise: publisher-side topic declaration. pair/pair_id are
+    # a purely LOCAL (this node only) hint under set_multiplex(False):
+    # any topics advertised/subscribed here with pair=True and the same
+    # pair_id share one UDP port instead of each getting its own -- see
+    # _transport_for()/_register_pair(). Ignored entirely when multiplex
+    # is on (everything already shares one transport). No wire-format
+    # involvement and no requirement that a peer's pub or sub side make
+    # the same pairing choice -- discovery already resolves peers by
+    # topic_id regardless of which port a topic happens to live on. ---
     def advertise(self, topic: Union[int, str], msg_type: Type[ctypes.Structure],
-                  secure: bool = False, checksum: bool = False):
+                  secure: bool = False, checksum: bool = False,
+                  pair: bool = False, pair_id: int = 0):
         topic_id = self._topic_id_for(topic)
         if not is_wire_type(msg_type):
             raise TypeError(f"{msg_type} must be a ctypes.Structure subclass with _pack_ = 1")
         if msg_type is ImageChunk:
             self._transport.enable_large_buffers()  # Image always stays on the shared transport
         else:
+            self._register_pair(topic_id, pair, pair_id)
             self._transport_for(topic_id)
         self._declared_topics.add(topic_id)
         self._advertised_topics.add(topic_id)
 
     # --- subscribe: receiver-side topic declaration + typed callback,
-    # invoked inline on the data thread, per spec's v1 threading design ---
+    # invoked inline on the data thread, per spec's v1 threading design.
+    # pair/pair_id: see advertise() above. ---
     def subscribe(self, topic: Union[int, str], msg_type: Type[ctypes.Structure],
-                  callback: Callable[[ctypes.Structure], None], secure: bool = False):
+                  callback: Callable[[ctypes.Structure], None], secure: bool = False,
+                  pair: bool = False, pair_id: int = 0):
         topic_id = self._topic_id_for(topic)
         if not is_wire_type(msg_type):
             raise TypeError(f"{msg_type} must be a ctypes.Structure subclass with _pack_ = 1")
         self._declared_topics.add(topic_id)
         self._subscribed_topics.add(topic_id)
         expected_size = ctypes.sizeof(msg_type)
+        if msg_type is not ImageChunk:
+            self._register_pair(topic_id, pair, pair_id)
         t = self._transport if msg_type is ImageChunk else self._transport_for(topic_id)
 
         def raw_handler(payload: bytes):
@@ -444,20 +510,23 @@ class RelinkNode:
     # publish above so a size mismatch is caught per ReLink's "never
     # misinterpret bytes" rule instead of being handed unstructured
     # bytes.
-    def advertise_raw(self, topic: Union[int, str]):
+    def advertise_raw(self, topic: Union[int, str], pair: bool = False, pair_id: int = 0):
         """Declares intent to publish `topic` without committing to a
         message type -- must be called (or subscribe_raw/publish_raw
         called) BEFORE the first spin_once()/publish()/subscribe() of
         any kind, same ordering requirement as advertise<T>, since the
         topic list beacons/registers with is snapshotted once at
-        ensure_started() time."""
+        ensure_started() time. pair/pair_id: see advertise()."""
         topic_id = self._topic_id_for(topic)
+        self._register_pair(topic_id, pair, pair_id)
         self._transport_for(topic_id)
         self._declared_topics.add(topic_id)
         self._advertised_topics.add(topic_id)
 
-    def subscribe_raw(self, topic: Union[int, str], callback: Callable[[bytes], None]):
+    def subscribe_raw(self, topic: Union[int, str], callback: Callable[[bytes], None],
+                       pair: bool = False, pair_id: int = 0):
         topic_id = self._topic_id_for(topic)
+        self._register_pair(topic_id, pair, pair_id)
         t = self._transport_for(topic_id)
         self._declared_topics.add(topic_id)
         self._subscribed_topics.add(topic_id)
@@ -636,9 +705,25 @@ class RelinkNode:
             # lists.
             groups = []  # list of (transport, topics)
             if not self._multiplex and self._topic_transports:
-                demuxed = set(self._topic_transports.keys())
-                for tid, t in self._topic_transports.items():
-                    groups.append((t, [tid]))
+                # Bucket by transport OBJECT, not by iterating
+                # self._topic_transports's own entries directly: a
+                # paired group of topics all resolves to the SAME dict
+                # entry (same group key, see _group_key()), so "one dict
+                # entry == one topic" no longer holds once pairing is in
+                # use -- recompute each declared topic's group key here
+                # and group by the transport it resolves to, so a paired
+                # topic's peers all end up correctly listed together in
+                # one registration/beacon.
+                by_transport = {}  # id(transport) -> (transport, [topic_id, ...])
+                demuxed = set()
+                for tid in self._declared_topics:
+                    t = self._topic_transports.get(self._group_key(tid))
+                    if t is None:
+                        continue
+                    by_transport.setdefault(id(t), (t, []))[1].append(tid)
+                    demuxed.add(tid)
+                for t, group_topics in by_transport.values():
+                    groups.append((t, group_topics))
                 leftover = [tid for tid in self._declared_topics if tid not in demuxed]
                 if leftover:
                     groups.append((self._transport, leftover))
@@ -736,9 +821,20 @@ class RelinkNode:
                 self._transport.start()
             else:
                 self._transport.start()
+                # group_ip AND group_port are BOTH derived from
+                # self._network_id (see set_network_id()) -- the
+                # default network_id=0 reproduces today's fixed
+                # address/port exactly. Port must vary too, not just
+                # the address -- see derive_multicast_port()'s
+                # docstring for the SO_REUSEPORT reason why address
+                # alone does not isolate two network_ids sharing a host.
+                group_ip = derive_multicast_group(self._network_id)
+                group_port = derive_multicast_port(self._network_id)
                 cfg = MulticastDiscoveryConfig(
+                    group_ip=group_ip,
+                    group_port=group_port,
                     self_ip=_detect_local_ip_for_peer(
-                        ipv4_to_host_order(DEFAULT_MULTICAST_GROUP), DEFAULT_MULTICAST_PORT),
+                        ipv4_to_host_order(group_ip), group_port),
                     port_groups=[PortGroup(t.local_port, group_topics) for t, group_topics in groups],
                 )
                 self._mcast = MulticastDiscovery(cfg)

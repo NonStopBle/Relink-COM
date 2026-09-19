@@ -18,6 +18,7 @@
 #include "relink/beacon.hpp"
 #include "relink/topic_directory.hpp"
 #include <atomic>
+#include <cstdio>
 #include <thread>
 #include <mutex>
 #include <unordered_map>
@@ -28,6 +29,7 @@
 #include <functional>
 #include <cstring>
 #include <stdexcept>
+#include <string>
 
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -38,6 +40,59 @@ namespace relink {
 
 inline constexpr char kDefaultMulticastGroup[] = "239.255.0.1";
 inline constexpr uint16_t kDefaultMulticastPort = 7400;
+
+// Derives a distinct multicast GROUP ADDRESS per network_id, so nodes
+// configured with different network_ids never even receive each
+// other's beacons at the OS/kernel level -- true isolation, unlike a
+// payload field a node would have to decode-then-discard. This is
+// RelinkNode's ROS_DOMAIN_ID-style equivalent (see
+// RelinkNode::set_network_id()). network_id=0 (the default) maps to
+// exactly today's fixed kDefaultMulticastGroup, so existing
+// single-domain deployments that never call set_network_id() see zero
+// behavior change -- every other network_id maps to a distinct
+// 239.255.x.y address, offset by +1 so no non-zero network_id can ever
+// collide with the reserved network_id=0 address (239.255.0.1).
+// No wire-format change: the beacon packet itself is untouched.
+//
+// IMPORTANT: address alone is NOT sufficient isolation and must always
+// be paired with derive_multicast_port() below -- see that function's
+// comment for why (a real, reproduced Linux SO_REUSEPORT + multicast
+// kernel behavior, not a theoretical concern).
+inline std::string derive_multicast_group(uint16_t network_id) {
+    if (network_id == 0) return kDefaultMulticastGroup;
+    uint32_t computed = static_cast<uint32_t>(network_id) + 1;
+    unsigned hi = (computed >> 8) & 0xFF;
+    unsigned lo = computed & 0xFF;
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "239.255.%u.%u", hi, lo);
+    return std::string(buf);
+}
+
+// Derives a distinct multicast PORT per network_id -- REQUIRED, not
+// just cosmetic: MulticastDiscovery's listener socket sets
+// SO_REUSEPORT (so several ReLink nodes can share one host on the same
+// multicast port), and on Linux, SO_REUSEPORT's hash-based delivery
+// selection is scoped by LOCAL PORT ONLY -- two sockets bound to the
+// same port but joined to DIFFERENT multicast group addresses were
+// directly observed (raw socket test, this machine, kernel default
+// config) to both receive a packet sent to only one of those groups.
+// Varying only the group address (derive_multicast_group() above)
+// does NOT isolate two network_ids that share a host; varying the port
+// too sidesteps the SO_REUSEPORT interaction entirely, since different
+// ports never join the same reuseport group in the first place.
+//
+// network_id=0 maps to kDefaultMulticastPort unchanged. Other values
+// map injectively for network_id in [1, 65535 - kDefaultMulticastPort]
+// (~58135 distinct domains); beyond that the mapping wraps (a network_id
+// and some other, much larger network_id could then share a port) --
+// an accepted, documented limit, same spirit as ROS_DOMAIN_ID's own
+// practical range limit from its port-arithmetic formula.
+inline uint16_t derive_multicast_port(uint16_t network_id) {
+    if (network_id == 0) return kDefaultMulticastPort;
+    constexpr uint32_t kRange = 65535 - kDefaultMulticastPort;  // ports stay <= 65535
+    uint32_t offset = (static_cast<uint32_t>(network_id) % kRange) + 1;  // 1..kRange, never 0
+    return static_cast<uint16_t>(kDefaultMulticastPort + offset);
+}
 
 struct PeerInfo {
     uint32_t ip;   // host byte order
