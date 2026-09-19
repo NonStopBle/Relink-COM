@@ -47,6 +47,11 @@ speak the exact same bytes on the wire and are interchangeable.
 
 ## Step 0 — What ReLink actually is
 
+**Description:** The core vocabulary and the why-this-exists case, before any code.
+**Tutorial Level:** Beginner
+
+**Next ▶:** [Step 1 — Get the code](#step-1--get-the-code)
+
 | Word | What it actually means |
 |---|---|
 | **Node** | Any process using `RelinkNode` (C++) or `RelinkNode` (Python). No node type distinction — every node can advertise, subscribe, and publish at once. |
@@ -80,6 +85,11 @@ between a planner and a driver — this is built specifically for that case.
 
 ## Step 1 — Get the code
 
+**Description:** Cloning the repo — there is no package manager install.
+**Tutorial Level:** Beginner
+
+**◀ Previous:** [Step 0 — What ReLink actually is](#step-0--what-relink-actually-is) &nbsp;|&nbsp; **Next ▶:** [Step 2 — Zero to one (run it)](#step-2--zero-to-one-run-it)
+
 ```bash
 git clone https://github.com/NonStopBle/Relink-COM.git
 cd Relink-COM
@@ -92,6 +102,11 @@ beyond a socket).
 ---
 
 ## Step 2 — Zero to one (run it)
+
+**Description:** Run the same tiny program twice and watch two nodes find each other with zero config.
+**Tutorial Level:** Beginner
+
+**◀ Previous:** [Step 1 — Get the code](#step-1--get-the-code) &nbsp;|&nbsp; **Next ▶:** [Step 3 — Pick a discovery mode](#step-3--pick-a-discovery-mode)
 
 The fastest way to see it work: run the same tiny program twice (two
 terminals, or two computers on the same network) and watch them find each
@@ -117,6 +132,11 @@ receive, and you're writing your own ReLink node.
 ---
 
 ## Step 3 — Pick a discovery mode
+
+**Description:** Choosing rlcore (Mode A) vs. multicast (Mode B), plus topic pairing and network_id domain isolation.
+**Tutorial Level:** Beginner
+
+**◀ Previous:** [Step 2 — Zero to one (run it)](#step-2--zero-to-one-run-it) &nbsp;|&nbsp; **Next ▶:** [Step 4 — Named topics](#step-4--named-topics)
 
 Every node picks exactly one, explicitly — there's no auto-detection,
 because silently falling back to a different discovery mechanism is
@@ -255,6 +275,11 @@ address/port a node's socket joins, not anything inside the packet.
 
 ## Step 4 — Named topics
 
+**Description:** Using human-readable topic names instead of hand-assigned numeric ids.
+**Tutorial Level:** Beginner
+
+**◀ Previous:** [Step 3 — Pick a discovery mode](#step-3--pick-a-discovery-mode) &nbsp;|&nbsp; **Next ▶:** [Step 5 — Quick start: C++](#step-5--quick-start-c)
+
 Topics can be a human-readable string instead of a hand-assigned number:
 
 ```cpp
@@ -312,6 +337,11 @@ node.subscribe<Float32>(101, [](const Float32& msg) { /* ... */ });
 ---
 
 ## Step 5 — Quick start: C++
+
+**Description:** A complete, runnable two-way pub/sub node in C++.
+**Tutorial Level:** Beginner
+
+**◀ Previous:** [Step 4 — Named topics](#step-4--named-topics) &nbsp;|&nbsp; **Next ▶:** [Step 6 — Quick start: Python](#step-6--quick-start-python)
 
 This is a real, complete, runnable program — not a snippet. Every
 ReLink node can publish and subscribe at the same time (there's no
@@ -374,6 +404,11 @@ publisher/subscriber files and custom message types.
 
 ## Step 6 — Quick start: Python
 
+**Description:** The same complete pub/sub node, in Python, wire-compatible with Step 5.
+**Tutorial Level:** Beginner
+
+**◀ Previous:** [Step 5 — Quick start: C++](#step-5--quick-start-c) &nbsp;|&nbsp; **Next ▶:** [Step 7 — Message types](#step-7--message-types)
+
 The same idea, same wire format — a Python copy and a C++ copy of this
 pattern talk to each other with zero changes on either side:
 
@@ -425,6 +460,11 @@ switches to Mode A (Step 9). See `python/relink_py/README.md` and
 
 ## Step 7 — Message types
 
+**Description:** Built-in std_msgs-style types and defining your own trivially-copyable message struct.
+**Tutorial Level:** Intermediate
+
+**◀ Previous:** [Step 6 — Quick start: Python](#step-6--quick-start-python) &nbsp;|&nbsp; **Next ▶:** [Step 8 — Sending images](#step-8--sending-images)
+
 `std_msgs`-style default types are built in (`Bool`, `Int32`, `Float32`,
 ...), plus **user-defined custom types**: any trivially-copyable struct
 just works, no registration, no schema exchange, no codegen step.
@@ -455,6 +495,11 @@ sides being built against the same generated message header.
 ---
 
 ## Step 8 — Sending images
+
+**Description:** Sending payloads larger than one UDP datagram with the built-in Image type.
+**Tutorial Level:** Intermediate
+
+**◀ Previous:** [Step 7 — Message types](#step-7--message-types) &nbsp;|&nbsp; **Next ▶:** [Step 9 — Running the rlcore daemon](#step-9--running-the-rlcore-daemon)
 
 Messages bigger than one UDP datagram use the built-in `Image` type:
 
@@ -487,6 +532,11 @@ receive — no hand-rolled chunking needed (see `camera_stream` in Step 10).
 ---
 
 ## Step 9 — Running the rlcore daemon
+
+**Description:** Building, running, and using relink-rlcore for Mode A discovery, including NAT traversal and rl_topic.
+**Tutorial Level:** Intermediate
+
+**◀ Previous:** [Step 8 — Sending images](#step-8--sending-images) &nbsp;|&nbsp; **Next ▶:** [Step 10 — All examples](#step-10--all-examples)
 
 Only needed for Mode A discovery (Step 3) — skip this whole section if
 you're using `use_multicast_discovery()` (Mode B).
@@ -731,6 +781,11 @@ A few things worth knowing:
 
 ## Step 10 — All examples
 
+**Description:** A tour of every example program shipped in cpp/examples/ and python/relink_py/examples/.
+**Tutorial Level:** Beginner
+
+**◀ Previous:** [Step 9 — Running the rlcore daemon](#step-9--running-the-rlcore-daemon) &nbsp;|&nbsp; **Next ▶:** [Step 11 — Testing](#step-11--testing)
+
 Every example is a complete, runnable program, not a snippet — each one
 exists in both C++ (`cpp/examples/`) and Python (`python/relink_py/examples/`).
 
@@ -751,6 +806,11 @@ you're comfortable with the basics, not a starting point.
 
 ## Step 11 — Testing
 
+**Description:** Running the unit and two-process correctness/interop test suites.
+**Tutorial Level:** Intermediate
+
+**◀ Previous:** [Step 10 — All examples](#step-10--all-examples) &nbsp;|&nbsp; **Next ▶:** [Step 12 — Benchmarks](#step-12--benchmarks)
+
 ```bash
 # C++ (each test is a standalone binary)
 g++ -std=c++17 -I cpp/relink/include -pthread cpp/tests/test_wire.cpp -o test_wire && ./test_wire
@@ -769,6 +829,11 @@ nodes actually interoperate over real sockets, not just in theory.
 ---
 
 ## Step 12 — Benchmarks
+
+**Description:** Measured latency/throughput numbers, head-to-head against ROS2, and the AF_XDP fast path.
+**Tutorial Level:** Advanced
+
+**◀ Previous:** [Step 11 — Testing](#step-11--testing) &nbsp;|&nbsp; **Next ▶:** [Step 13 — NAT traversal (cross-network nodes)](#step-13--nat-traversal-cross-network-nodes)
 
 **In plain terms**: using the C++ version, a message sent by one
 program typically arrives at the other in well under a millisecond —
@@ -972,6 +1037,11 @@ hold regardless.)
 
 ## Step 13 — NAT traversal (cross-network nodes)
 
+**Description:** How relink-rlcore --nat, hole punching, background re-punch, and the relay fallback work together.
+**Tutorial Level:** Advanced
+
+**◀ Previous:** [Step 12 — Benchmarks](#step-12--benchmarks) &nbsp;|&nbsp; **Next ▶:** [Step 14 — Troubleshooting](#step-14--troubleshooting)
+
 `relink-rlcore --nat` makes the daemon act as a rendezvous point: it hands
 out each node's real (NAT-mapped) public endpoint instead of its private
 LAN address, paired with client-side hole punching, so nodes on separate
@@ -1051,6 +1121,11 @@ through a relay would be expensive for little benefit; a dropped Image
 frame is already tolerated, see the troubleshooting table below).
 
 ## Step 14 — Troubleshooting
+
+**Description:** Common symptoms, what they mean, and the fix, in one table.
+**Tutorial Level:** Beginner
+
+**◀ Previous:** [Step 13 — NAT traversal (cross-network nodes)](#step-13--nat-traversal-cross-network-nodes)
 
 | What you see | What it means | Fix |
 |---|---|---|

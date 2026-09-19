@@ -621,9 +621,17 @@ private:
     // silently rebinding it to a new port out from under a caller who
     // may already be relying on the earlier port.
     void register_pair(uint32_t topic_id, bool pair, uint32_t pair_id) {
-        if (!pair) return;
         std::lock_guard<std::mutex> lock(state_mutex_);
         auto it = topic_pair_id_.find(topic_id);
+        if (!pair) {
+            if (it != topic_pair_id_.end()) {
+                throw std::runtime_error(
+                    "relink: topic " + std::to_string(topic_id) +
+                    " already paired under pair_id " + std::to_string(it->second) +
+                    ", cannot unpair it later");
+            }
+            return;
+        }
         if (it != topic_pair_id_.end() && it->second != pair_id) {
             throw std::runtime_error(
                 "relink: topic " + std::to_string(topic_id) +

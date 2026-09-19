@@ -383,9 +383,13 @@ class RelinkNode:
         unpaired) is almost certainly a bug -- fail loudly rather than
         silently rebinding it to a new port out from under a caller who
         may already be relying on the earlier port."""
-        if not pair:
-            return
         existing = self._topic_pair_id.get(topic_id)
+        if not pair:
+            if existing is not None:
+                raise RuntimeError(
+                    f"relink: topic {topic_id} already paired under pair_id "
+                    f"{existing}, cannot unpair it later")
+            return
         if existing is not None and existing != pair_id:
             raise RuntimeError(
                 f"relink: topic {topic_id} already paired under pair_id {existing}, "
