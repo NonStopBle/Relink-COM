@@ -20,6 +20,7 @@ from typing import List, NamedTuple, Optional, TYPE_CHECKING
 
 from .register import encode_register_request, decode_register_ack, RegisterAckPeer
 from .udp_transport import host_order_to_ipv4
+from .crypto import aes256gcm_seal, aes256gcm_open
 
 if TYPE_CHECKING:
     from .udp_transport import UdpTransport
@@ -35,7 +36,8 @@ def register_with_rlcore_on_socket(sock: socket.socket,
                                       self_ip_host_order: int, self_data_port: int,
                                       topic_ids: List[int],
                                       max_retries: int = 3, timeout_s: float = 0.5,
-                                      transport: Optional["UdpTransport"] = None) -> RegisterOutcome:
+                                      transport: Optional["UdpTransport"] = None,
+                                      encrypt_key: Optional[bytes] = None) -> RegisterOutcome:
     """`transport`: pass the owning UdpTransport when it may already have
     its dedicated recv thread running (i.e. this is a periodic
     re-registration call, not the initial pre-start() one). That thread
@@ -45,8 +47,16 @@ def register_with_rlcore_on_socket(sock: socket.socket,
     identical at 100Hz and 10000Hz). When `transport` is running, wait on
     its handoff queue instead of calling recvfrom() directly, closing that
     race. When `transport` is None or not yet started, recvfrom() here is
-    safe (nothing else reads this socket yet)."""
+    safe (nothing else reads this socket yet).
+
+    `encrypt_key`: when set (32 bytes, see crypto.py), the
+    RegisterRequest is sealed with AES-256-GCM before sending and the
+    RegisterAck is opened with the same key before decoding -- rlcore
+    must be running with the matching --encrypt-key or every request
+    from this node is silently dropped as malformed on its side."""
     request = encode_register_request(self_ip_host_order, self_data_port, topic_ids)
+    if encrypt_key is not None:
+        request = aes256gcm_seal(encrypt_key, request)
     server_addr = (host_order_to_ipv4(server_ip_host_order), server_port)
     use_transport_queue = transport is not None and transport.is_running()
 
@@ -76,6 +86,14 @@ def register_with_rlcore_on_socket(sock: socket.socket,
                     # rejects. See the matching note in udp_transport.py's
                     # _recv_and_dispatch().
                     data, _ = sock.recvfrom(65507)
+                if encrypt_key is not None:
+                    opened = aes256gcm_open(encrypt_key, data)
+                    if opened is None:
+                        print("register_with_rlcore: dropped RegisterAck that failed to decrypt "
+                              "(wrong --encrypt-key on rlcore, or a corrupted/spoofed reply)",
+                              file=sys.stderr)
+                        raise ValueError("RegisterAck failed to decrypt")
+                    data = opened
                 ack = decode_register_ack(data)
                 if ack.status == 0:
                     return RegisterOutcome(True, ack.peers)
@@ -96,7 +114,8 @@ def register_with_rlcore_on_socket(sock: socket.socket,
 def register_with_rlcore(server_ip_host_order: int, server_port: int,
                             self_ip_host_order: int, self_data_port: int,
                             topic_ids: List[int],
-                            max_retries: int = 3, timeout_s: float = 0.5) -> RegisterOutcome:
+                            max_retries: int = 3, timeout_s: float = 0.5,
+                            encrypt_key: Optional[bytes] = None) -> RegisterOutcome:
     """Convenience wrapper that opens its OWN throwaway socket -- fine
     for standalone/test use where NAT traversal isn't in play. RelinkNode
     uses register_with_rlcore_on_socket() with its transport's real
@@ -105,6 +124,6 @@ def register_with_rlcore(server_ip_host_order: int, server_port: int,
     try:
         return register_with_rlcore_on_socket(
             sock, server_ip_host_order, server_port, self_ip_host_order, self_data_port,
-            topic_ids, max_retries, timeout_s)
+            topic_ids, max_retries, timeout_s, encrypt_key=encrypt_key)
     finally:
         sock.close()

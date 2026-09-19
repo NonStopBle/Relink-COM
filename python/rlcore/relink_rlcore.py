@@ -33,6 +33,9 @@ import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "relink_py"))
 from relink import topic_directory as tdir
+from relink.crypto import (
+    generate_random_key32, key32_to_hex, hex_to_key32, aes256gcm_seal, aes256gcm_open,
+)
 
 DEFAULT_PORT = 8445
 
@@ -71,10 +74,28 @@ def encode_register_ack(status: int, peers) -> bytes:
 
 
 def main():
+    if "--generate-key" in sys.argv:
+        # Prints a fresh random AES-256 key and exits -- does not start
+        # the daemon. Run once, then pass the printed hex to both this
+        # daemon's --encrypt-key and every node's
+        # node.set_rlcore.set_encrypt_key(...); the same key must be
+        # used on both sides for registration to succeed.
+        print(key32_to_hex(generate_random_key32()))
+        return
+
     port = DEFAULT_PORT
     if "--port" in sys.argv:
         port = int(sys.argv[sys.argv.index("--port") + 1])
     nat_mode = "--nat" in sys.argv
+
+    encrypt_key = None
+    if "--encrypt-key" in sys.argv:
+        encrypt_key = hex_to_key32(sys.argv[sys.argv.index("--encrypt-key") + 1])
+        if encrypt_key is None:
+            print("relink-rlcore: --encrypt-key expects 64 hex characters "
+                  "(a 32-byte AES-256 key) -- generate one with --generate-key",
+                  file=sys.stderr)
+            sys.exit(1)
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.bind(("0.0.0.0", port))
@@ -213,7 +234,21 @@ def main():
         if role_kind == "role_reply":
             continue  # rlcore never queries anyone itself
 
-        decoded = decode_register_request(data)
+        # When --encrypt-key is set, every RegisterRequest must be an
+        # AES-256-GCM-sealed blob under that key -- opened here before
+        # decoding. A plaintext or wrong-key request fails to open and
+        # is dropped the same way a malformed one always was; this also
+        # authenticates the sender (GCM's tag), not just hides the payload.
+        req_data = data
+        if encrypt_key is not None:
+            opened = aes256gcm_open(encrypt_key, data)
+            if opened is None:
+                print("relink-rlcore: dropped RegisterRequest that failed to decrypt "
+                      "(missing/wrong key on the sending node?)", file=sys.stderr, flush=True)
+                continue
+            req_data = opened
+
+        decoded = decode_register_request(req_data)
         if decoded is None:
             print("relink-rlcore: dropped malformed RegisterRequest", file=sys.stderr, flush=True)
             continue
@@ -247,6 +282,8 @@ def main():
                 peers.append((ip, p, topic))
 
         ack = encode_register_ack(0, peers)
+        if encrypt_key is not None:
+            ack = aes256gcm_seal(encrypt_key, ack)
         sock.sendto(ack, addr)
 
         # self_entry's ip is stored host-byte-order (see

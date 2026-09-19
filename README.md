@@ -223,6 +223,33 @@ you've vendored `cpp/relink/include/`, and change the one
 `add_executable(...)` line to point at your own `.cpp` file(s) instead
 of `hello_relink.cpp`.
 
+### Building everything in this repo with CMake
+
+If you're working inside this repo rather than starting a new project,
+[`cpp/CMakeLists.txt`](cpp/CMakeLists.txt) builds the whole `cpp/`
+tree at once — the header-only core, `relink-rlcore`/`relink-relay`
+(via `cpp/rlcore/`'s own `CMakeLists.txt`), `rl_topic`, and every
+example and test — instead of compiling files one at a time:
+
+```bash
+cd cpp
+cmake -B build .
+cmake --build build
+ctest --test-dir build          # runs the 10 self-contained unit tests
+```
+
+`-DRELINK_BUILD_EXAMPLES=OFF`/`-DRELINK_BUILD_TESTS=OFF` skip those
+directories if you only want the daemon/relay/rl_topic. `camera_stream`
+(Step 8) is only built when `find_package(OpenCV)` succeeds — everything
+else builds with no extra dependencies either way. The same MinGW-w64
+toolchain file from `cpp/cmake_example/` cross-compiles this whole
+project for Windows too:
+
+```bash
+cmake -B build-win -DCMAKE_TOOLCHAIN_FILE=cmake_example/mingw-w64-toolchain.cmake .
+cmake --build build-win
+```
+
 Now that you have the code, let's run it.
 
 ---
@@ -1053,17 +1080,32 @@ node.set_rlcore.setEncryptKey("ef78d9acb11a87844e705a07ae66ddd7f0124c28899da2fa5
    ./relink-rlcore --port 8445 --encrypt-key ef78d9acb11a87844e705a07ae66ddd7f0124c28899da2fa56062a6367e42e3d
    ```
 
-4. **Give the SAME key to every C++ node** that will register with this
-   rlcore, right after pointing it at rlcore's address:
+4. **Give the SAME key to every node** that will register with this
+   rlcore, right after pointing it at rlcore's address — C++ and
+   Python nodes can mix freely against the same encrypted rlcore, in
+   either language, since both sides implement the identical
+   AES-256-GCM wire format:
 
    ```cpp
    node.set_rlcore.ip("203.0.113.10");
    node.set_rlcore.setEncryptKey("ef78d9acb11a87844e705a07ae66ddd7f0124c28899da2fa56062a6367e42e3d");
    ```
 
-   Order doesn't matter between `.ip(...)` and `.setEncryptKey(...)`,
-   but both must be called before `node.start()`/the first
-   `advertise()`/`subscribe()` call that triggers registration.
+   ```python
+   node.set_rlcore.ip("203.0.113.10")
+   node.set_rlcore.set_encrypt_key("ef78d9acb11a87844e705a07ae66ddd7f0124c28899da2fa56062a6367e42e3d")
+   ```
+
+   Order doesn't matter between `.ip(...)` and `setEncryptKey(...)`/
+   `set_encrypt_key(...)`, but both must be called before
+   `node.start()`/the first `advertise()`/`subscribe()` call that
+   triggers registration. `relink-rlcore.py --generate-key` and
+   `--encrypt-key` work identically to the C++ daemon's flags shown
+   above, if you're running the Python daemon instead:
+
+   ```bash
+   python3 python/rlcore/relink_rlcore.py --port 8445 --encrypt-key ef78d9acb11a87844e705a07ae66ddd7f0124c28899da2fa56062a6367e42e3d
+   ```
 
 5. **Verify it worked**: start rlcore first, then a node, and watch
    rlcore's own stdout. A successful encrypted registration prints the
@@ -1082,26 +1124,25 @@ node.set_rlcore.setEncryptKey("ef78d9acb11a87844e705a07ae66ddd7f0124c28899da2fa5
 | Node registration times out only after adding `--encrypt-key` | Node is missing `setEncryptKey(...)`, or the hex string doesn't match rlcore's byte-for-byte (copy/paste error, trailing whitespace/newline) |
 | `setEncryptKey` throws at startup | The string isn't exactly 64 hex characters — regenerate with `--generate-key` rather than hand-typing one |
 | Some nodes register fine, others don't, same rlcore | Only some nodes were updated with the new key after a key rotation — every node must be updated at the same time you restart rlcore with the new key, since there's no "accept either key" transition mode |
-| A Python node can't register with an `--encrypt-key`-protected rlcore | **Expected for now** — see the limitation below |
 
-#### Current limitation: C++ only
+#### C++ and Python interop
 
-This feature is implemented in the C++ core (`cpp/relink/include/relink/crypto.hpp`)
-only. The Python bindings (`relink_py/`, `python/rlcore/relink_rlcore.py`)
-have no AES-256-GCM implementation yet, so:
+Both languages implement the same AES-256-GCM wire format from
+scratch — `cpp/relink/include/relink/crypto.hpp` (C++) and
+`python/relink_py/relink/crypto.py` (Python), neither depending on a
+third-party crypto library (see "Implementation notes" below). A
+message sealed by one is verified to decrypt correctly with the other,
+and this was tested in both daemon/client combinations: a Python node
+registering with a C++ `relink-rlcore --encrypt-key ...`, and a C++
+node registering with a Python `relink_rlcore.py --encrypt-key ...`.
+There's no restriction on mixing languages in an encrypted fleet.
 
-- A Python node cannot register with a C++ `relink-rlcore` that has
-  `--encrypt-key` set — its plaintext RegisterRequest gets dropped the
-  same way a wrong key would.
-- A Python `relink_rlcore.py` daemon has no `--encrypt-key` equivalent
-  at all.
-
-If your fleet mixes C++ and Python nodes against the same rlcore,
-either leave `--encrypt-key` off entirely (plaintext registration,
-unchanged from before this feature existed), or keep encryption
-C++-only by running a separate rlcore instance for Python nodes. Adding
-the matching Python implementation is a natural next step but hasn't
-been done.
+Python's implementation is pure-stdlib (no `pycryptodome`/
+`cryptography` install needed, matching this project's "Python needs
+no build step at all" story) but noticeably slower per call than the
+C++ side — irrelevant here since, same as the C++ side, it only runs
+on registration/re-registration (once at startup, then every ~0.3s per
+node), never on the `publish()` hot path.
 
 #### Implementation notes
 

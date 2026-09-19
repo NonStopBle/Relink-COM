@@ -16,6 +16,7 @@ from .wire import is_wire_type, NAT_PUNCH_TOPIC_ID
 from .topic_hash import fnv1a32
 from .udp_transport import UdpTransport, PeerAddr, ipv4_to_host_order, host_order_to_ipv4
 from .rlcore_client import register_with_rlcore_on_socket
+from .crypto import hex_to_key32
 from .multicast_discovery import (
     MulticastDiscovery, MulticastDiscoveryConfig, PortGroup,
     DEFAULT_MULTICAST_GROUP, DEFAULT_MULTICAST_PORT,
@@ -62,6 +63,7 @@ class _RlCoreConfig:
         self._ip_set = False
         self._ip = 0
         self._port = RLCORE_DEFAULT_PORT
+        self._encrypt_key: Optional[bytes] = None
 
     def ip(self, addr: str):
         self._owner._select_mode(DiscoveryMode.RLCORE)
@@ -70,6 +72,22 @@ class _RlCoreConfig:
 
     def port(self, p: int = RLCORE_DEFAULT_PORT):
         self._port = p
+
+    def set_encrypt_key(self, hex_key: str):
+        """Sets the pre-shared AES-256 key (64 hex characters, e.g. the
+        output of `relink-rlcore --generate-key`) used to encrypt this
+        node's RegisterRequest/RegisterAck exchange with rlcore.
+        Mirrors the C++ API's set_rlcore.setEncryptKey(...) -- rlcore
+        must be started with the SAME key via --encrypt-key for
+        registration to succeed. Raises ValueError immediately if
+        `hex_key` isn't exactly 64 valid hex characters, rather than
+        silently registering unencrypted."""
+        key = hex_to_key32(hex_key)
+        if key is None:
+            raise ValueError(
+                "set_rlcore.set_encrypt_key: expected 64 hex characters (a 32-byte "
+                "AES-256 key) -- generate one with `relink-rlcore --generate-key`")
+        self._encrypt_key = key
 
     @property
     def ip_is_set(self) -> bool:
@@ -82,6 +100,10 @@ class _RlCoreConfig:
     @property
     def resolved_port(self) -> int:
         return self._port
+
+    @property
+    def encrypt_key(self) -> Optional[bytes]:
+        return self._encrypt_key
 
 
 class RelinkNode:
@@ -282,7 +304,8 @@ class RelinkNode:
                 outcome = register_with_rlcore_on_socket(
                     t.sock, self.set_rlcore.resolved_ip, self.set_rlcore.resolved_port,
                     self_ip, t.local_port, group_topics,
-                    max_retries=5, timeout_s=0.1, transport=t)
+                    max_retries=5, timeout_s=0.1, transport=t,
+                    encrypt_key=self.set_rlcore.encrypt_key)
                 if not outcome.ok:
                     return
                 for p in outcome.peers:
@@ -782,7 +805,8 @@ class RelinkNode:
                         t.sock,
                         self.set_rlcore.resolved_ip, self.set_rlcore.resolved_port,
                         self_ip, t.local_port, group_topics,
-                        max_retries=1, timeout_s=0.3, transport=t)
+                        max_retries=1, timeout_s=0.3, transport=t,
+                        encrypt_key=self.set_rlcore.encrypt_key)
                     if outcome.ok:
                         with self._peers_lock:
                             for p in outcome.peers:
