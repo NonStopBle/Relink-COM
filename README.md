@@ -17,6 +17,44 @@ encode/decode the identical byte layout, so a C++ publisher and a
 Python subscriber interoperate on the wire with no bridging layer —
 pick whichever language a given node needs.
 
+## Features
+
+- **Peer-to-peer pub/sub over UDP** — no broker/master process; nodes
+  exchange datagrams directly once discovery has resolved each other's
+  address.
+- **Two discovery modes** — LAN multicast (Mode B, no daemon) or a
+  small `rlcore` registration daemon (Mode A) for nodes that aren't on
+  the same broadcast domain (Step 3).
+- **NAT traversal** — UDP hole punching via `rlcore --nat`, with a
+  relay fallback (`relink-relay`) when direct punching fails (Step 9).
+- **Documented, fixed-layout wire format** — every packet's byte
+  layout is specified, not just implied by a struct; any language that
+  can open a UDP socket can implement a compatible node (Step 4).
+- **Cross-language interop by construction** — the C++ and Python
+  implementations encode/decode the identical wire format, so nodes in
+  either language talk to each other with no bridging layer.
+- **Built-in + ROS-familiar composite message types** — every
+  primitive type plus `std_msgs`/`geometry_msgs`/`sensor_msgs`/
+  `nav_msgs`/`diagnostic_msgs`/`trajectory_msgs`/`actionlib_msgs`
+  equivalents (Step 7), and custom user-defined message structs.
+- **Chunked image/binary transport** — `Image`/`CompressedImage`
+  types with reassembly across UDP's datagram size limit (Step 8).
+- **Optional transport-layer encryption** — AES-256-GCM on the
+  `rlcore` registration handshake (`--generate-key`/`--encrypt-key`),
+  implemented independently (and interoperably) in both C++ and
+  Python.
+- **Header-only C++ core** — no library to build or link against; drop
+  `include/relink/` into your own project and compile.
+- **Real-time-oriented transport internals** — dedicated data thread,
+  CPU pinning, and `SCHED_FIFO` scheduling to keep latency predictable
+  under load (Step 15).
+- **Topic inspection CLI** — `rl_topic list`/`info`/`echo`, a
+  `rostopic`-style tool for debugging live topics against a running
+  `rlcore`.
+- **Cross-platform** — Linux, macOS, and Windows (native or MinGW
+  cross-compiled), verified end-to-end including a native ↔ Wine
+  interop test.
+
 </div>
 
 ---
