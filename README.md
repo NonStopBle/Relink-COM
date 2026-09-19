@@ -10,9 +10,10 @@ faster and simpler than ROS1/ROS2.**
 ![Transport](https://img.shields.io/badge/transport-UDP-orange)
 ![Platform](https://img.shields.io/badge/platform-Linux-lightgrey)
 
-You do not need ROS installed. You do not need a master or a DDS
-implementation. Two reference implementations — **C++** and **Python** —
-speak the exact same bytes on the wire and are interchangeable.
+You do not need ROS installed, and you do not need any other extra
+software to make it work. It comes in two versions — **C++** and
+**Python** — that can talk to each other directly, so you can pick
+whichever language fits your project.
 
 </div>
 
@@ -20,6 +21,7 @@ speak the exact same bytes on the wire and are interchangeable.
 
 ## Table of contents
 
+- [Words you might not know yet](#words-you-might-not-know-yet)
 - [Step 0 — What ReLink actually is](#step-0--what-relink-actually-is)
 - [Step 1 — Get the code](#step-1--get-the-code)
 - [Step 2 — Zero to one (run it)](#step-2--zero-to-one-run-it)
@@ -46,6 +48,33 @@ speak the exact same bytes on the wire and are interchangeable.
 
 ---
 
+## Words you might not know yet
+
+If you've never touched networking or robotics before, a few words
+show up constantly below. Skim this once — you won't need to
+memorize it, just recognize the words when they show up.
+
+| Word | Plain-English meaning |
+|---|---|
+| **Network** | Computers that can send data to each other, like your laptop and phone on the same WiFi. |
+| **IP address** | A computer's "phone number" on a network, like `192.168.1.5`, so other computers know who to send data to. |
+| **Port** | A number (like an apartment number, on top of the "building address" that's the IP) that says which program on that computer the data is for. Lets one computer run many programs that each talk over the network without mixing up each other's data. |
+| **Socket** | The thing a program opens to actually send/receive data over the network — think of it as picking up the phone before you can make a call. |
+| **UDP** | One way computers send data over a network — fast, but with no guarantee a message arrives (compare: mailing a postcard). ReLink uses this. |
+| **TCP** | The other common way — slower, but guarantees the message arrives and arrives in order (compare: a phone call where you can ask "did you hear that?"). ReLink deliberately does not use this, for speed. |
+| **Daemon** | A program that just runs quietly in the background, not something you interact with directly — like an alarm clock app running while you do other things. |
+| **Multicast** | One computer sending a message that every other computer on the local network can hear at once, without addressing each one individually — like shouting in a room instead of calling each person. |
+| **NAT** | Short for Network Address Translation — the reason most home/phone networks let many devices share one public internet address, and also the reason two computers on different networks often can't reach each other directly without extra help (Step 13). |
+| **ROS** | "Robot Operating System" — the most widely-used existing toolkit for writing robot software. ReLink borrows some of its ideas (topics, messages) but is not ROS and doesn't need it installed. |
+| **Publish/subscribe** | A messaging pattern: one program "publishes" (sends) data on a named channel, and any number of other programs "subscribe" (listen) to that channel — neither side needs to know who else is on it. |
+| **Topic** | The name of that channel — e.g. `/temperature`. Anyone publishing or subscribing to the same topic name is talking about the same data. |
+| **Wire format** | The exact sequence of bytes (0s and 1s, grouped) sent over the network for a message — "wire" as in the physical/network wire the bits travel over. |
+| **Latency** | How long a message takes to arrive after it's sent — lower is faster/better. |
+
+Come back to this table any time a word below doesn't make sense yet.
+
+---
+
 ## Step 0 — What ReLink actually is
 
 **Description:** The core vocabulary and the why-this-exists case, before any code.
@@ -57,7 +86,7 @@ speak the exact same bytes on the wire and are interchangeable.
 |---|---|
 | **Node** | Any process using `RelinkNode` (C++) or `RelinkNode` (Python). No node type distinction — every node can advertise, subscribe, and publish at once. |
 | **Topic** | A named or numbered channel. One message type per topic, fixed at registration — not renegotiable later. |
-| **Discovery** | How nodes find each other's IP/port before they can exchange messages. ReLink has exactly two modes (Step 3) — no auto-negotiated QoS, no DDS-style SPDP. |
+| **Discovery** | How nodes find each other's address before they can exchange messages. ReLink has exactly two modes (Step 3), and you always pick one yourself — it's never guessed automatically. |
 | **Wire format** | The literal byte layout of every packet — documented, not just implied by a struct definition. A from-scratch reimplementation in any language that can open a UDP socket can speak ReLink. |
 | **rlcore** | The optional small daemon used for Mode A discovery. Not required — Mode B (multicast) needs no daemon at all. |
 
@@ -182,32 +211,25 @@ Not sure which to use? Try Mode B first (Step 2 already did). If it
 doesn't work on your network, switch to Mode A — see
 [Step 9](#step-9--running-the-rlcore-daemon).
 
-Either mode, a node shares one UDP socket across every topic by default
-(demultiplexed by topic id). Call `node.set_multiplex(false)` for ROS's
-one-port-per-topic model instead — see
-[Step 12's benchmarks](#step-12--benchmarks) for the throughput/latency
-tradeoff before reaching for it.
+By default, a node reuses one connection for every topic it has,
+which keeps things simple. Call `node.set_multiplex(false)` if you'd
+rather give each topic its own separate connection instead (some
+tools/firewalls expect this) — see
+[Step 12's benchmarks](#step-12--benchmarks) for the speed tradeoff
+before reaching for it.
 
-`rl_topic` (`python/rl_topic.py`/`cpp/rl_topic.cpp`, a `rostopic`-style CLI —
-`list`/`info`/`hz`/`bw`/`echo`/`pub`) needs no special flag or code
-change to work against a node running `set_multiplex(false)`: a
-demultiplexed node's beacon/registration already announces each topic's
-real per-topic port, so `rl_topic`'s own node (which stays on the
-default shared socket) discovers and talks to it exactly like any other
-peer. Verified against a `set_multiplex(false)` publisher: `list`
-discovers the topic, `hz`/`echo` correctly read it, and `pub` correctly
-reaches a `set_multiplex(false)` subscriber. The only failure mode
-encountered was the ordinary beacon-startup-timing race (see Step 14),
-unrelated to multiplex mode.
+`rl_topic` (a small command-line tool included in the repo for
+listing and inspecting topics — more in [Step 9](#using-rl_topic--listing-and-inspecting-topics))
+works fine either way, with no extra setup needed.
 
 ### Pairing topics onto one port under `set_multiplex(false)`
 
-`set_multiplex(false)` gives every topic its own dedicated UDP port —
-great for per-topic firewall rules or ROS-style tooling expectations,
-but wasteful when a node declares many small, related topics (a bank of
-IoT sensor/actuator topics, say) and doesn't want one socket per topic.
-`pair`/`pair_id` let you opt a *group* of topics into sharing one port
-while everything else on that node still gets its own:
+`set_multiplex(false)` gives every topic its own separate connection —
+useful sometimes, but wasteful if a node has many small, related
+topics (say, a bunch of sensors) and doesn't want a separate connection
+for every single one. `pair`/`pair_id` let you group a few topics back
+onto one shared connection, while everything else on that node still
+gets its own:
 
 ```cpp
 node.set_multiplex(false);
@@ -226,15 +248,11 @@ node.advertise("/room/light/3", Int16)  # unpaired -- still gets its own port
 Same `pair`/`pair_id` parameters exist on `subscribe`/`advertise_raw`/
 `subscribe_raw` in both languages.
 
-**Pairing is a purely local decision — nothing goes on the wire for
-it.** A `RegisterRequest`/beacon already lists every topic sharing a
-port alongside that port, regardless of *why* they share it, so there's
-no protocol change and no requirement that a peer's pub or sub side
-make the same pairing choice: discovery already resolves each peer by
-topic id, not by port. Verified live: a C++ publisher packing two
-topics onto one port was received correctly by an independent Python
-subscriber that left those same two topics on two separate ports of its
-own — pairing on one side doesn't need to be mirrored on the other.
+**Pairing is a purely local decision — the other side doesn't need to
+know or match it.** A publisher grouping two topics onto one
+connection was correctly received by a subscriber that kept those same
+two topics on separate connections of its own — this choice never has
+to be mirrored on both ends.
 
 Re-declaring a topic under a different `pair_id` (or paired, then later
 unpaired) raises/throws rather than silently rebinding it — almost
@@ -242,13 +260,12 @@ certainly a bug if it happens.
 
 ### `network_id` — domain isolation for Mode B (multicast)
 
-Mode A (rlcore) already isolates independent deployments — each
-`relink-rlcore` daemon is its own rendezvous point. Mode B's multicast
-beacon has no equivalent by default: every ReLink node defaults to the
-same multicast address, so two unrelated deployments sharing a LAN
-could cross-discover each other if their topic ids happen to overlap.
-`set_network_id(uint16_t)` gives Mode B a ROS_DOMAIN_ID-style fix —
-call it before `use_multicast_discovery()`:
+Mode A (rlcore) naturally keeps separate deployments apart, since each
+runs its own daemon. Mode B (multicast) doesn't do this by default —
+every ReLink node listens on the same shared address, so two unrelated
+projects running on the same network could accidentally hear each
+other. `set_network_id(uint16_t)` fixes that by giving each deployment
+its own private "channel" — call it before `use_multicast_discovery()`:
 
 ```cpp
 node.set_network_id(42);
