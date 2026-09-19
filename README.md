@@ -10,10 +10,12 @@ high-frequency control loops between a known set of nodes on a LAN.**
 ![Transport](https://img.shields.io/badge/transport-UDP-orange)
 ![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20Windows-lightgrey)
 
-You do not need ROS installed, and you do not need any other extra
-software to make it work. It comes in two versions — **C++** and
-**Python** — that can talk to each other directly, so you can pick
-whichever language fits your project.
+No middleware, broker, or master process — nodes exchange raw UDP
+datagrams directly, peer-to-peer, over a self-describing wire format
+(Step 4). Two independent implementations, **C++** and **Python**,
+encode/decode the identical byte layout, so a C++ publisher and a
+Python subscriber interoperate on the wire with no bridging layer —
+pick whichever language a given node needs.
 
 </div>
 
