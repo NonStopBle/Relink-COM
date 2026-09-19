@@ -19,3 +19,6 @@ __pycache__/
 relink-com-spec.md
 relink_com_implement.md
 relink-com-spec.md
+
+# pip editable-install metadata
+*.egg-info/

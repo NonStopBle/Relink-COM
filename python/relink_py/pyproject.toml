@@ -9,5 +9,10 @@ description = "ReLink -- lightweight ROS-like pub/sub protocol over UDP (Python 
 requires-python = ">=3.8"
 dependencies = []
 
+[project.scripts]
+rlcore = "relink.cli.rlcore:main"
+rltopic = "relink.cli.rl_topic:main"
+relink-relay = "relink.cli.relay:main"
+
 [tool.setuptools.packages.find]
 include = ["relink*"]

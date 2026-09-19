@@ -31,9 +31,8 @@ import struct
 import sys
 import time
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "relink_py"))
-from relink import topic_directory as tdir
-from relink.crypto import (
+from .. import topic_directory as tdir
+from ..crypto import (
     generate_random_key32, key32_to_hex, hex_to_key32, aes256gcm_seal, aes256gcm_open,
 )
 

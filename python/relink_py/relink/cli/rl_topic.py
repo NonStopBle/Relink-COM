@@ -38,10 +38,9 @@ import struct
 import sys
 import time
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "relink_py"))
-from relink import topic_directory as tdir
-from relink import RelinkNode
-from relink import msg_schema
+from .. import topic_directory as tdir
+from .. import RelinkNode
+from .. import msg_schema
 
 DEFAULT_MULTICAST_GROUP = "239.255.0.1"
 DEFAULT_MULTICAST_PORT = 7400

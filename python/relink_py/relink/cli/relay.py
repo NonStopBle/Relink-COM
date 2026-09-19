@@ -21,8 +21,7 @@ import socket
 import sys
 import time
 
-sys.path.insert(0, __file__.rsplit("/", 2)[0] + "/relink_py")
-from relink.relay_wire import RELAY_DEFAULT_PORT, decode_relay_register, peek_frame_topic_id
+from ..relay_wire import RELAY_DEFAULT_PORT, decode_relay_register, peek_frame_topic_id
 
 MEMBER_TTL_SECONDS = 30  # must outlive the client's re-register interval
 

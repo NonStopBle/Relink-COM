@@ -17,6 +17,10 @@ encode/decode the identical byte layout, so a C++ publisher and a
 Python subscriber interoperate on the wire with no bridging layer —
 pick whichever language a given node needs.
 
+</div>
+
+---
+
 ## Features
 
 - **Peer-to-peer pub/sub over UDP** — no broker/master process; nodes
@@ -54,8 +58,6 @@ pick whichever language a given node needs.
 - **Cross-platform** — Linux, macOS, and Windows (native or MinGW
   cross-compiled), verified end-to-end including a native ↔ Wine
   interop test.
-
-</div>
 
 ---
 
@@ -1036,7 +1038,7 @@ cd cpp/rlcore && cmake -B build . && cmake --build build
 # binaries land in cpp/rlcore/build/relink-rlcore and cpp/rlcore/build/relink-relay
 
 # Python — no build step at all, pure stdlib
-python3 python/rlcore/relink_rlcore.py --port 8445 [--nat]
+pip install -e python/relink_py && rlcore --port 8445 [--nat]
 ```
 
 ### Running it
@@ -1100,7 +1102,7 @@ g++ -std=c++17 -O2 -I cpp/include -pthread cpp/rlcore/relink_relay.cpp -o relink
 ./relink-relay [port]   # default 8446
 
 # Python
-python3 python/rlcore/relink_relay.py [port]
+relink-relay [port]   # after: pip install -e python/relink_py
 ```
 
 **Stress-tested**: 30 concurrent nodes registering, punching, and
@@ -1196,12 +1198,12 @@ node.set_rlcore.setEncryptKey("ef78d9acb11a87844e705a07ae66ddd7f0124c28899da2fa5
    Order doesn't matter between `.ip(...)` and `setEncryptKey(...)`/
    `set_encrypt_key(...)`, but both must be called before
    `node.start()`/the first `advertise()`/`subscribe()` call that
-   triggers registration. `relink-rlcore.py --generate-key` and
+   triggers registration. Python's `rlcore --generate-key` and
    `--encrypt-key` work identically to the C++ daemon's flags shown
    above, if you're running the Python daemon instead:
 
    ```bash
-   python3 python/rlcore/relink_rlcore.py --port 8445 --encrypt-key ef78d9acb11a87844e705a07ae66ddd7f0124c28899da2fa56062a6367e42e3d
+   rlcore --port 8445 --encrypt-key ef78d9acb11a87844e705a07ae66ddd7f0124c28899da2fa56062a6367e42e3d
    ```
 
 5. **Verify it worked**: start rlcore first, then a node, and watch
@@ -1328,7 +1330,7 @@ find you" problem so your actual code doesn't have to.
 
 ### Using `rl_topic` — listing and inspecting topics
 
-`rl_topic` (`python/rl_topic.py` / `cpp/tools/rl_topic.cpp`, built the
+`rl_topic` (Python: `rltopic`, installed via `pip install -e python/relink_py`; C++: `cpp/tools/rl_topic.cpp`, built the
 same way as any other example in [Step 10](#step-10--all-examples)) is a
 `rostopic`-style CLI for asking "what topics exist right now, and who's
 using them" without writing any code. `list` and `info` are the two most
