@@ -261,6 +261,50 @@ if you'd rather not type the cmake invocations yourself:
 ./cpp/build.sh --help          # full option list
 ```
 
+### Copying the C++ library into your own project
+
+ReLink's C++ core is header-only — there's no library to build or link,
+just one directory to copy. This is all you need to use it outside
+this repo:
+
+1. **Copy `cpp/include/relink/`** into your own project (nothing else
+   in this repo — `rlcore/`, `examples/`, `tests/` — is required just
+   to use ReLink as a library):
+
+   ```bash
+   cp -r cpp/include/relink /path/to/your_project/third_party/relink
+   ```
+
+2. **Point your build's include path at the PARENT directory** you
+   copied it into (`third_party`, not `third_party/relink`), since
+   every header includes its siblings as `#include "relink/xyz.hpp"`:
+
+   ```bash
+   g++ -std=c++17 -I third_party -pthread my_node.cpp -o my_node
+   ```
+
+   ```cmake
+   target_include_directories(my_target PRIVATE third_party)
+   ```
+
+3. **`#include "relink/relink.hpp"`** and use `RelinkNode` — see
+   [`cpp/src/pub.cpp`](cpp/src/pub.cpp)/[`cpp/src/sub.cpp`](cpp/src/sub.cpp)
+   for the smallest working example.
+
+4. **Windows** additionally needs `-lws2_32` (or
+   `target_link_libraries(... ws2_32)` in CMake) — the same headers
+   work unmodified on Linux, macOS, and Windows otherwise.
+
+Verified: copying just `cpp/include/relink/` to a throwaway directory
+outside this repo and compiling/running a small node against it with
+the exact `g++` command above works with no other changes. If you'd
+rather start from a working project than wire this up by hand, copy
+[`cpp/cmake_example/`](cpp/cmake_example/) instead — it's already set
+up this way, just pointed at `../include` inside this repo instead of
+a copied `third_party/relink/`. See [`cpp/README.md`](cpp/README.md#copying-relink-into-your-own-project)
+for the same walkthrough alongside the rest of the C++ directory's
+documentation.
+
 Now that you have the code, let's run it.
 
 ---
