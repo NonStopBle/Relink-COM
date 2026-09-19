@@ -250,6 +250,17 @@ cmake -B build-win -DCMAKE_TOOLCHAIN_FILE=cmake_example/mingw-w64-toolchain.cmak
 cmake --build build-win
 ```
 
+[`cpp/build.sh`](cpp/build.sh) wraps all of the above into one script,
+if you'd rather not type the cmake invocations yourself:
+
+```bash
+./cpp/build.sh                 # native build
+./cpp/build.sh --windows       # cross-compile for Windows (needs g++-mingw-w64-x86-64-posix)
+./cpp/build.sh --test          # native build, then run ctest
+./cpp/build.sh --clean         # wipe build/ and build-win/ first
+./cpp/build.sh --help          # full option list
+```
+
 Now that you have the code, let's run it.
 
 ---

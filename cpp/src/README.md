@@ -27,6 +27,10 @@ cmake --build build
 ./build/src/pub      # or: ./build/src/sub, ./build/src/pubsub, ./build/src/main
 ```
 
+Or use [`../build.sh`](../build.sh), a thin wrapper around the same
+commands: `./build.sh`, `./build.sh --windows` (cross-compile), or
+`./build.sh --test` to also run the unit tests.
+
 Or compile a single file directly with `g++`/`clang++`, the same way
 as any other example in this repo:
 
