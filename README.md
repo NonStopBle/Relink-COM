@@ -640,6 +640,39 @@ Now that you can write a two-way node in either language, let's look at message 
 ...), plus **user-defined custom types**: any trivially-copyable struct
 just works, no registration, no schema exchange, no codegen step.
 
+### Built-in types
+
+Every one of these wraps a single `data` field, byte-identical in both
+languages (see `wire.hpp` / `wire.py`) — reach for a custom type (below)
+only once one of these doesn't fit:
+
+| Type | C++ | Python (`ctypes`) | Size |
+|---|---|---|---|
+| `Bool` | `uint8_t` (0/1) | `c_uint8` | 1 byte |
+| `Byte` | `uint8_t` | `c_uint8` | 1 byte |
+| `Char` | `uint8_t` | `c_uint8` | 1 byte |
+| `Int8` | `int8_t` | `c_int8` | 1 byte |
+| `Int16` | `int16_t` | `c_int16` | 2 bytes |
+| `Int32` | `int32_t` | `c_int32` | 4 bytes |
+| `Int64` | `int64_t` | `c_int64` | 8 bytes |
+| `UInt8` | `uint8_t` | `c_uint8` | 1 byte |
+| `UInt16` | `uint16_t` | `c_uint16` | 2 bytes |
+| `UInt32` | `uint32_t` | `c_uint32` | 4 bytes |
+| `UInt64` | `uint64_t` | `c_uint64` | 8 bytes |
+| `Float32` | `float` | `c_float` | 4 bytes |
+| `Float64` | `double` | `c_double` | 8 bytes |
+
+`builtin_types_pubsub` (Step 10) publishes and subscribes every one of
+these on its own topic in a single runnable file, and doubles as this
+table's live proof — verified cross-language (C++ ↔ Python) as well as
+same-language.
+
+There's also a much larger set of ROS-familiar composite types
+(`std_msgs::Header`, `geometry_msgs::Pose`, `sensor_msgs::Imu`, `nav_msgs::Odometry`,
+...) built out of these primitives — see `standard_msgs.hpp`/`standard_msgs.py`
+for the full list; they're built from the same rules as any other
+custom type below, just already written for you.
+
 ```cpp
 #pragma pack(push, 1)
 struct ImuReading { float ax, ay, az; uint64_t timestamp_us; };
@@ -990,6 +1023,7 @@ exists in both C++ (`cpp/examples/`) and Python (`python/relink_py/examples/`).
 | **`pubsub`** | `talker` + `listener` combined into one file/process — both roles at once, interoperable with either standalone binary above. | `./pubsub` (run twice, or against `talker`/`listener`) |
 | **`rlcore_pubsub`** | Mode A (daemon) discovery, a custom message type alongside a default type, one process as publisher and one as subscriber. | `./rlcore_pubsub pub <daemon_ip>` and `... sub <daemon_ip>`, daemon already running |
 | **`multicast_pubsub`** | Same pub/sub shape as `rlcore_pubsub`, but Mode B — shows the two discovery modes are interchangeable from the application's point of view. | `./multicast_pubsub pub` and `... sub` |
+| **`builtin_types_pubsub`** | Every built-in message type ReLink ships (Step 7's table), one topic per type, in a single runnable file — a live reference list, not just documentation. | `./builtin_types_pubsub` (run twice, or against the Python copy) |
 | **`custom_types_pubsub`** | "Any message type" made concrete: one node publishing/subscribing a built-in type (`Bool`) alongside two user-defined custom types at once — a small struct (`Pose2D`) and a struct containing fixed-size arrays (`Waypoints`). Verified interoperable both same-language and cross-language (C++ ↔ Python). | `./custom_types_pubsub` (run twice, or against the Python copy) |
 | **`camera_stream`** | A real webcam streamed over ReLink two ways at once (`image_raw`, `image_compressed`) using the built-in `Image` type. **Requires OpenCV**, installed yourself — not a ReLink dependency. | `./camera_stream pub` and `... sub` |
 
