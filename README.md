@@ -697,9 +697,14 @@ since a full image doesn't fit one UDP datagram (Step 8). Every other
 type in the table above is a normal, single-datagram message.
 
 `standard_msgs_pubsub` (Step 10) publishes and subscribes every one of
-these 46 types (everything except `Image`/`CompressedImage`) on its
+these 49 types (everything except `Image`/`CompressedImage`) on its
 own topic in a single runnable file — a live reference for the whole
 table, verified cross-language (C++ ↔ Python) as well as same-language.
+Each package also has its own standalone example (`std_msgs_pubsub`,
+`geometry_msgs_pubsub`, `sensor_msgs_pubsub`, `nav_msgs_pubsub`,
+`diagnostic_msgs_pubsub`, `trajectory_msgs_pubsub`,
+`actionlib_msgs_pubsub` — Step 10) if you only want to see one
+package's shapes without the other six.
 
 ```cpp
 #pragma pack(push, 1)
@@ -1052,7 +1057,14 @@ exists in both C++ (`cpp/examples/`) and Python (`python/relink_py/examples/`).
 | **`rlcore_pubsub`** | Mode A (daemon) discovery, a custom message type alongside a default type, one process as publisher and one as subscriber. | `./rlcore_pubsub pub <daemon_ip>` and `... sub <daemon_ip>`, daemon already running |
 | **`multicast_pubsub`** | Same pub/sub shape as `rlcore_pubsub`, but Mode B — shows the two discovery modes are interchangeable from the application's point of view. | `./multicast_pubsub pub` and `... sub` |
 | **`builtin_types_pubsub`** | Every built-in primitive message type ReLink ships (Step 7's built-in types table), one topic per type, in a single runnable file — a live reference list, not just documentation. | `./builtin_types_pubsub` (run twice, or against the Python copy) |
-| **`standard_msgs_pubsub`** | Every ROS-familiar composite type ReLink ships (Step 7's `std_msgs`/`geometry_msgs`/`sensor_msgs`/`nav_msgs`/`diagnostic_msgs`/`trajectory_msgs`/`actionlib_msgs` table) — all 46 non-image types, one topic per type, in a single runnable file. | `./standard_msgs_pubsub` (run twice, or against the Python copy) |
+| **`standard_msgs_pubsub`** | Every ROS-familiar composite type ReLink ships (Step 7's `std_msgs`/`geometry_msgs`/`sensor_msgs`/`nav_msgs`/`diagnostic_msgs`/`trajectory_msgs`/`actionlib_msgs` table) — all 49 non-image types, one topic per type, in a single runnable file. | `./standard_msgs_pubsub` (run twice, or against the Python copy) |
+| **`std_msgs_pubsub`** | Just the `std_msgs` package split out of `standard_msgs_pubsub` above: `Empty`, `Time`, `Duration`, `ColorRGBA`, `Header`, `String`, plus the `*MultiArray` family (`Byte`/`Int8`/`Int16`/`Int32`/`Int64`/`UInt8`/`UInt16`/`UInt32`/`UInt64`/`Float32`/`Float64MultiArray` — 11 types, user-defined here since `standard_msgs.hpp`/`.py` only document the underlying layout, not ready-made structs). | `./std_msgs_pubsub` (run twice, or against the Python copy) |
+| **`geometry_msgs_pubsub`** | Just the `geometry_msgs` package: `Vector3`, `Point`, `Point32`, `Quaternion`, `Pose`, `Twist`, `Accel`, `Wrench`, `PoseStamped`, `TwistStamped`, `Transform`, `TransformStamped`, `PoseWithCovariance`, `TwistWithCovariance`, `PoseArray`, `Polygon`. | `./geometry_msgs_pubsub` (run twice, or against the Python copy) |
+| **`sensor_msgs_pubsub`** | Just the `sensor_msgs` package (everything except `Image`/`CompressedImage`, which need `advertise_image`, see `camera_stream` below): `Imu`, `NavSatStatus`, `NavSatFix`, `MagneticField`, `Temperature`, `Range`, `RegionOfInterest`, `CameraInfo`, `PointField`, `PointCloud2`, `LaserScan`, `JointState`. | `./sensor_msgs_pubsub` (run twice, or against the Python copy) |
+| **`nav_msgs_pubsub`** | Just the `nav_msgs` package: `Odometry`, `MapMetaData`, `Path`, `OccupancyGrid`, `GridCells`. | `./nav_msgs_pubsub` (run twice, or against the Python copy) |
+| **`diagnostic_msgs_pubsub`** | Just the `diagnostic_msgs` package: `KeyValue`, `DiagnosticStatus`, `DiagnosticArray`. | `./diagnostic_msgs_pubsub` (run twice, or against the Python copy) |
+| **`trajectory_msgs_pubsub`** | Just the `trajectory_msgs` package: `JointTrajectoryPoint`, `JointTrajectory`, `MultiDOFJointTrajectoryPoint`, `MultiDOFJointTrajectory`. | `./trajectory_msgs_pubsub` (run twice, or against the Python copy) |
+| **`actionlib_msgs_pubsub`** | Just the `actionlib_msgs` package: `GoalID`, `GoalStatus`, `GoalStatusArray`. | `./actionlib_msgs_pubsub` (run twice, or against the Python copy) |
 | **`custom_types_pubsub`** | "Any message type" made concrete: one node publishing/subscribing a built-in type (`Bool`) alongside two user-defined custom types at once — a small struct (`Pose2D`) and a struct containing fixed-size arrays (`Waypoints`). Verified interoperable both same-language and cross-language (C++ ↔ Python). | `./custom_types_pubsub` (run twice, or against the Python copy) |
 | **`camera_stream`** | A real webcam streamed over ReLink two ways at once (`image_raw`, `image_compressed`) using the built-in `Image` type. **Requires OpenCV**, installed yourself — not a ReLink dependency. | `./camera_stream pub` and `... sub` |
 

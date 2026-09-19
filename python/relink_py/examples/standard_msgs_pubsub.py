@@ -5,7 +5,7 @@ itself calls "NoROSLib" naming), one topic per type, in a single
 runnable file. Wire-compatible with cpp/examples/standard_msgs_pubsub.cpp
 -- run one copy of each and they talk to each other with zero changes.
 
-Types covered (46 total, everything in standard_msgs.py except
+Types covered (49 total, everything in standard_msgs.py except
 sensor_msgs.ImageChunk, which needs advertise_image/publish_image/
 subscribe_image instead of plain advertise/publish/subscribe -- see
 the README's "Sending images" step and camera_stream.py):

@@ -9,7 +9,7 @@
 // float32 instead of float64 for geometry_msgs, fixed-capacity arrays
 // instead of unbounded ones).
 //
-// Types covered (46 total, everything in standard_msgs.hpp except
+// Types covered (49 total, everything in standard_msgs.hpp except
 // sensor_msgs::ImageChunk, which needs advertise_image/publish_image/
 // subscribe_image instead of plain advertise/publish/subscribe -- see
 // the README's "Sending images" step and camera_stream.cpp):
