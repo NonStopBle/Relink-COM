@@ -1044,9 +1044,17 @@ pip install -e python/relink_py && rlcore --port 8445 [--nat]
 ### Running it
 
 ```bash
-./relink-rlcore --port 8445          # plain mode: LAN-only discovery
-./relink-rlcore --port 8445 --nat    # adds cross-network / NAT punching, see below
+./relink-rlcore --port 8445                    # plain mode: LAN-only discovery, all interfaces
+./relink-rlcore --port 8445 --ip 10.0.0.5      # bind one specific local address instead of 0.0.0.0
+./relink-rlcore --port 8445 --nat              # adds cross-network / NAT punching, see below
+./relink-rlcore --help                          # full flag list
 ```
+
+`--port`/`--ip` are the same flags on the Python build (`rlcore --port
+8445 --ip 10.0.0.5`). If the daemon fails with `bind: Address already
+in use`, another process (often a previous rlcore you forgot was
+running) already owns that port — check with `ss -ulnp | grep 8445`
+and either stop it or pick a different `--port`.
 
 Either the C++ or Python build works with either language's client
 nodes — same wire protocol, pick whichever is more convenient to run

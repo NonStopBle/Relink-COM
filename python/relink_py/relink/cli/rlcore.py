@@ -72,7 +72,23 @@ def encode_register_ack(status: int, peers) -> bytes:
     return bytes(out)
 
 
+def print_usage():
+    print(f"usage: rlcore [--port <port>] [--ip <address>] [--nat]\n"
+          f"              [--encrypt-key <64-hex>] [--generate-key] [-h|--help]\n"
+          f"\n"
+          f"  --port <port>       UDP port to listen on (default {DEFAULT_PORT})\n"
+          f"  --ip <address>      local address to bind to (default 0.0.0.0, all interfaces)\n"
+          f"  --nat                enable NAT traversal / UDP hole punching\n"
+          f"  --encrypt-key <hex>  require AES-256-GCM encrypted registration (64 hex chars)\n"
+          f"  --generate-key       print a fresh AES-256 key and exit\n"
+          f"  -h, --help           show this help and exit")
+
+
 def main():
+    if "-h" in sys.argv or "--help" in sys.argv:
+        print_usage()
+        return
+
     if "--generate-key" in sys.argv:
         # Prints a fresh random AES-256 key and exits -- does not start
         # the daemon. Run once, then pass the printed hex to both this
@@ -85,6 +101,9 @@ def main():
     port = DEFAULT_PORT
     if "--port" in sys.argv:
         port = int(sys.argv[sys.argv.index("--port") + 1])
+    bind_ip = "0.0.0.0"
+    if "--ip" in sys.argv:
+        bind_ip = sys.argv[sys.argv.index("--ip") + 1]
     nat_mode = "--nat" in sys.argv
 
     encrypt_key = None
@@ -97,9 +116,15 @@ def main():
             sys.exit(1)
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.bind(("0.0.0.0", port))
+    try:
+        sock.bind((bind_ip, port))
+    except OSError as e:
+        print(f"relink-rlcore: could not bind to {bind_ip}:{port} -- {e}\n"
+              f"relink-rlcore: another process may already be listening there "
+              f"(try --port <other-port>, or check `ss -ulnp`)", file=sys.stderr)
+        sys.exit(1)
     suffix = " (NAT traversal enabled)" if nat_mode else ""
-    print(f"relink-rlcore (Python) listening on 0.0.0.0:{port}{suffix}", flush=True)
+    print(f"relink-rlcore (Python) listening on {bind_ip}:{port}{suffix}", flush=True)
 
     table = {}  # topic_id -> set of (ip, port)
 

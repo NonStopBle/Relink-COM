@@ -60,13 +60,31 @@ static double now_sec() {
         std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
+static void print_usage(const char* argv0) {
+    std::printf(
+        "usage: %s [--port <port>] [--ip <address>] [--nat]\n"
+        "           [--encrypt-key <64-hex>] [--generate-key] [-h|--help]\n"
+        "\n"
+        "  --port <port>       UDP port to listen on (default %u)\n"
+        "  --ip <address>      local address to bind to (default 0.0.0.0, all interfaces)\n"
+        "  --nat                enable NAT traversal / UDP hole punching\n"
+        "  --encrypt-key <hex>  require AES-256-GCM encrypted registration (64 hex chars)\n"
+        "  --generate-key       print a fresh AES-256 key and exit\n"
+        "  -h, --help           show this help and exit\n",
+        argv0, static_cast<unsigned>(kRlCoreDefaultPort));
+}
+
 int main(int argc, char** argv) {
     uint16_t port = kRlCoreDefaultPort;
+    const char* bind_ip = nullptr;
     bool nat_mode = false;
     bool has_encrypt_key = false;
     uint8_t encrypt_key[kAesKeyBytes] = {};
     for (int i = 1; i < argc; ++i) {
-        if (std::strcmp(argv[i], "--generate-key") == 0) {
+        if (std::strcmp(argv[i], "-h") == 0 || std::strcmp(argv[i], "--help") == 0) {
+            print_usage(argv[0]);
+            return 0;
+        } else if (std::strcmp(argv[i], "--generate-key") == 0) {
             // Prints a fresh random AES-256 key and exits -- does not
             // start the daemon. Run once, then pass the printed hex to
             // both this daemon's --encrypt-key and every node's
@@ -78,6 +96,8 @@ int main(int argc, char** argv) {
             return 0;
         } else if (std::strcmp(argv[i], "--port") == 0 && i + 1 < argc) {
             port = static_cast<uint16_t>(std::atoi(argv[++i]));
+        } else if (std::strcmp(argv[i], "--ip") == 0 && i + 1 < argc) {
+            bind_ip = argv[++i];
         } else if (std::strcmp(argv[i], "--nat") == 0) {
             nat_mode = true;
         } else if (std::strcmp(argv[i], "--encrypt-key") == 0 && i + 1 < argc) {
@@ -87,6 +107,9 @@ int main(int argc, char** argv) {
                 return 1;
             }
             has_encrypt_key = true;
+        } else {
+            std::fprintf(stderr, "relink-rlcore: unrecognized argument '%s' (see --help)\n", argv[i]);
+            return 1;
         }
     }
 
@@ -95,14 +118,25 @@ int main(int argc, char** argv) {
 
     struct sockaddr_in addr{};
     addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = INADDR_ANY;
+    if (bind_ip != nullptr) {
+        if (::inet_pton(AF_INET, bind_ip, &addr.sin_addr) != 1) {
+            std::fprintf(stderr, "relink-rlcore: --ip '%s' is not a valid IPv4 address\n", bind_ip);
+            return 1;
+        }
+    } else {
+        addr.sin_addr.s_addr = INADDR_ANY;
+    }
     addr.sin_port = htons(port);
     if (::bind(sock, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) < 0) {
         std::perror("bind");
+        std::fprintf(stderr, "relink-rlcore: could not bind to %s:%u -- another process may "
+                     "already be listening there (try --port <other-port>, or check `ss -ulnp`)\n",
+                     bind_ip != nullptr ? bind_ip : "0.0.0.0", port);
         return 1;
     }
 
-    std::printf("relink-rlcore (C++) listening on 0.0.0.0:%u%s\n", port,
+    std::printf("relink-rlcore (C++) listening on %s:%u%s\n",
+                bind_ip != nullptr ? bind_ip : "0.0.0.0", port,
                 nat_mode ? " (NAT traversal enabled)" : "");
 
     // topic_id -> set of peers registered for it
