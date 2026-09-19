@@ -81,6 +81,15 @@ evolution, ROS2/DDS is the more complete answer. If your system needs a
 of nodes on a LAN — sensor fusion, joint-state streaming, a control loop
 between a planner and a driver — this is built specifically for that case.
 
+### Review
+
+- **Node** — a process, running `RelinkNode`, that can advertise, subscribe, and publish at once.
+- **Topic** — a named or numbered channel, one message type, fixed at registration.
+- **Discovery** — exactly two modes, chosen explicitly, never auto-negotiated (Step 3).
+- **rlcore** — the optional daemon for Mode A; Mode B (multicast) needs none.
+
+Now that you understand what ReLink actually is, let's get the code and run it.
+
 ---
 
 ## Step 1 — Get the code
@@ -98,6 +107,8 @@ cd Relink-COM
 This is currently the only way to install it — there is no package
 manager entry, on purpose (see Step 0: no codegen, no dependency surface
 beyond a socket).
+
+Now that you have the code, let's run it.
 
 ---
 
@@ -128,6 +139,13 @@ see [Step 14 — Troubleshooting](#step-14--troubleshooting).
 read it — the whole API surface is `advertise`, `subscribe`, `publish`,
 `spin`. Change `TOPIC_HELLO`, the message type, or what happens on
 receive, and you're writing your own ReLink node.
+
+### Review
+
+- `advertise`/`subscribe`/`publish`/`spin` is the entire API surface needed to get two nodes talking.
+- No daemon, no config file, no manual IP address — Mode B (multicast) discovery finds peers on its own.
+
+Now that you've seen it work, let's look at how discovery mode selection actually works.
 
 ---
 
@@ -271,6 +289,15 @@ Python subscriber) discovers and delivers correctly; different
 beacon wire-format change — isolation is entirely about which
 address/port a node's socket joins, not anything inside the packet.
 
+### Review
+
+- **Mode A (rlcore)** — one daemon, works everywhere; **Mode B (multicast)** — no daemon, needs multicast allowed.
+- `set_multiplex(false)` moves a node from one shared socket to one-port-per-topic, ROS-style.
+- `pair`/`pair_id` let specific topics share one port again under `set_multiplex(false)`, purely locally.
+- `set_network_id(uint16_t)` isolates independent deployments on Mode B, like `ROS_DOMAIN_ID`.
+
+Now that you understand discovery, let's look at naming topics.
+
 ---
 
 ## Step 4 — Named topics
@@ -333,6 +360,14 @@ node.subscribe<Float32>(101, [](const Float32& msg) { /* ... */ });
 > multi-hundred-kHz burst rates in Step 12, that difference is exactly
 > the kind of per-message tax that determines whether the sender or
 > receiver becomes the bottleneck first — resolve once, publish by id.
+
+### Review
+
+- A string topic name is hashed (FNV-1a) to the numeric id that actually goes on the wire.
+- Both sides just need the same string — no shared header/constant required.
+- Resolve a string topic once with `topic_id_for()`/`_topic_id_for()` and publish by id in a hot loop.
+
+Now, let's write a complete node in C++.
 
 ---
 
@@ -585,6 +620,13 @@ switches to Mode A (Step 9). See `python/relink_py/README.md` and
 `python/relink_py/examples/` (Step 10) for more programs, including custom
 `ctypes.Structure` message types.
 
+### Review
+
+- `subscribe`/`advertise`/`publish`/`spin_once` is the same four-call API surface in both languages.
+- Both the C++ and Python `pubsub` programs speak the exact same wire format and can talk to each other with zero changes.
+
+Now that you can write a two-way node in either language, let's look at message types beyond the built-ins.
+
 ---
 
 ## Step 7 — Message types
@@ -620,6 +662,13 @@ node.advertise("/relink/imu", ImuReading)
 Both sides must independently define the identical byte layout — ReLink
 does no schema negotiation between nodes, same as ROS relies on both
 sides being built against the same generated message header.
+
+### Review
+
+- Built-in `std_msgs`-style types cover the common cases; a custom type is just a packed struct.
+- No codegen, no `.msg` file, no schema exchange — both sides just need to define the same layout independently.
+
+Now that you know how to define a message type, let's send something bigger than one UDP datagram.
 
 ---
 
@@ -657,6 +706,14 @@ receive — no hand-rolled chunking needed (see `camera_stream` in Step 10).
 > `image_compressed`-style payloads over raw frames for anything
 > real-time: a dropped chunk drops the whole image (no retransmission),
 > and fewer chunks per frame means fewer chances to drop one.
+
+### Review
+
+- `advertise_image`/`publish_image`/`subscribe_image` chunk and reassemble automatically — no hand-rolled chunking.
+- A larger socket buffer trades drops for latency on short bursts; it doesn't fix a slow subscriber callback.
+- Prefer `image_compressed` over raw frames for anything real-time.
+
+Now, let's look at running the rlcore daemon for Mode A discovery.
 
 ---
 
@@ -905,6 +962,14 @@ A few things worth knowing:
 - **`hz`/`bw`/`pub`** round out the CLI (rate, bandwidth, and manual
   publish by `--hex`/`--text`) — run `rl_topic.py <subcommand> --help`
   for the full flag list on any of them.
+
+### Review
+
+- `relink-rlcore` is a rendezvous point only — actual message traffic never passes through it.
+- `--nat` enables cross-network discovery via hole punching; `relink-relay` is the fallback for NAT types punching can't cross.
+- `rl_topic` (`list`/`info`/`hz`/`bw`/`echo`/`pub`) is the `rostopic`-equivalent CLI for inspecting a running system without writing code.
+
+Now that discovery and daemons are covered, let's tour every example program in the repo.
 
 ---
 
