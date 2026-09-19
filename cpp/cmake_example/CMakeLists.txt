@@ -31,7 +31,7 @@ endif()
 # Points at this repo's header-only core -- in your own project, this
 # would instead be wherever you've vendored/installed ReLink's
 # cpp/relink/include directory.
-set(RELINK_INCLUDE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../relink/include)
+set(RELINK_INCLUDE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 
 add_executable(hello_relink ${CMAKE_CURRENT_SOURCE_DIR}/../examples/hello_relink.cpp)
 target_include_directories(hello_relink PRIVATE ${RELINK_INCLUDE_DIR})

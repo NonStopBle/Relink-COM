@@ -1,7 +1,8 @@
 # Top-level CMake project for ReLink's C++ core -- builds the header-
-# only library target, cpp/rlcore/'s daemon + relay, cpp/rl_topic.cpp,
-# and every example/test under cpp/examples/ and cpp/tests/, all from
-# one `cmake -B build .` in this directory.
+# only library target, cpp/rlcore/'s daemon + relay, cpp/tools/
+# (rl_topic, relink_example, relink_benchmark), and every example/test
+# under cpp/examples/ and cpp/tests/, all from one `cmake -B build .`
+# in this directory.
 #
 # Usage:
 #   cmake -B build .
@@ -35,7 +36,7 @@ option(RELINK_BUILD_TESTS "Build cpp/tests/*.cpp" ON)
 # platform libs (ws2_32 on Windows, pthread elsewhere) with no
 # per-target boilerplate repeated at every add_executable() call.
 add_library(relink INTERFACE)
-target_include_directories(relink INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/relink/include)
+target_include_directories(relink INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_compile_features(relink INTERFACE cxx_std_17)
 if(WIN32)
     target_link_libraries(relink INTERFACE ws2_32)
@@ -48,8 +49,14 @@ endif()
 # standalone -- see Step 9's "Building it" in the README).
 add_subdirectory(rlcore)
 
-add_executable(rl_topic rl_topic.cpp)
+add_executable(rl_topic tools/rl_topic.cpp)
 target_link_libraries(rl_topic PRIVATE relink)
+
+add_executable(relink_example tools/relink_example.cpp)
+target_link_libraries(relink_example PRIVATE relink)
+
+add_executable(relink_benchmark tools/relink_benchmark.cpp)
+target_link_libraries(relink_benchmark PRIVATE relink)
 
 if(RELINK_BUILD_EXAMPLES)
     set(RELINK_EXAMPLES

@@ -22,7 +22,7 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 set(CMAKE_CXX_FLAGS_RELEASE "-O2")
 
-set(RELINK_INCLUDE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../relink/include)
+set(RELINK_INCLUDE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 
 add_executable(relink-rlcore relink_rlcore.cpp)
 target_include_directories(relink-rlcore PRIVATE ${RELINK_INCLUDE_DIR})

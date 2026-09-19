@@ -130,7 +130,7 @@ beyond a socket).
 
 ### Building the C++ library, per OS
 
-The C++ side is header-only (`cpp/relink/include/`) — there's no
+The C++ side is header-only (`cpp/include/`) — there's no
 library to link, just headers to compile against. Python needs no
 build step at all on any OS (pure stdlib). `camera_stream.cpp` is the
 one exception below: it needs OpenCV, installed separately, on every
@@ -140,7 +140,7 @@ OS.
 
 ```bash
 sudo apt-get install -y g++          # if you don't already have one
-g++ -std=c++17 -I cpp/relink/include -pthread cpp/examples/hello_relink.cpp -o hello_relink
+g++ -std=c++17 -I cpp/include -pthread cpp/examples/hello_relink.cpp -o hello_relink
 ```
 
 **macOS** — Apple Clang (from Xcode Command Line Tools) works as-is;
@@ -148,7 +148,7 @@ no `-pthread` flag needed (macOS links pthreads by default):
 
 ```bash
 xcode-select --install                # if you don't already have the toolchain
-clang++ -std=c++17 -I cpp/relink/include cpp/examples/hello_relink.cpp -o hello_relink
+clang++ -std=c++17 -I cpp/include cpp/examples/hello_relink.cpp -o hello_relink
 ```
 
 macOS shares the same POSIX sockets code path as Linux. The one
@@ -166,12 +166,12 @@ hardware — if you hit something, please open an issue.
 # Option A: MSYS2/MinGW-w64 (recommended -- closest to the Linux/macOS
 # build commands above, no Visual Studio needed)
 pacman -S mingw-w64-x86_64-gcc
-g++ -std=c++17 -I cpp/relink/include cpp/examples/hello_relink.cpp -o hello_relink.exe -lws2_32
+g++ -std=c++17 -I cpp/include cpp/examples/hello_relink.cpp -o hello_relink.exe -lws2_32
 
 # Option B: cross-compile FROM Linux/WSL for Windows (what this
 # project's own CI/verification used -- see Step 11)
 sudo apt-get install -y g++-mingw-w64-x86-64-posix
-x86_64-w64-mingw32-g++ -std=c++17 -I cpp/relink/include hello_relink.cpp -o hello_relink.exe -lws2_32
+x86_64-w64-mingw32-g++ -std=c++17 -I cpp/include hello_relink.cpp -o hello_relink.exe -lws2_32
 ```
 
 `-lws2_32` (Winsock) is required on Windows — there's no equivalent
@@ -219,7 +219,7 @@ wine build-win/hello_relink.exe   # or copy the .exe to a real Windows machine
 
 To use this as a template for your own project: copy the
 `cpp/cmake_example/` directory, change `RELINK_INCLUDE_DIR` to wherever
-you've vendored `cpp/relink/include/`, and change the one
+you've vendored `cpp/include/`, and change the one
 `add_executable(...)` line to point at your own `.cpp` file(s) instead
 of `hello_relink.cpp`.
 
@@ -267,7 +267,7 @@ other and start talking — no daemon, no config file, no manual IP address.
 
 | | C++ | Python |
 |---|---|---|
-| **Build** | `g++ -std=c++17 -I cpp/relink/include -pthread cpp/examples/hello_relink.cpp -o hello_relink` | nothing to build — pure stdlib |
+| **Build** | `g++ -std=c++17 -I cpp/include -pthread cpp/examples/hello_relink.cpp -o hello_relink` | nothing to build — pure stdlib |
 | **Run (in two terminals)** | `./hello_relink` | `python3 python/relink_py/examples/hello_relink.py` |
 
 Within a second or two, each window prints `sent: N (to 1 peer(s))` and
@@ -576,10 +576,10 @@ not an error.
 ### Building your node
 
 ```bash
-g++ -std=c++17 -I cpp/relink/include -pthread pubsub.cpp -o pubsub
+g++ -std=c++17 -I cpp/include -pthread pubsub.cpp -o pubsub
 ```
 
-Build against `cpp/relink/include/` — header-only, no linking step
+Build against `cpp/include/` — header-only, no linking step
 beyond `-pthread`. `node.set_rlcore.ip("10.0.0.5")` instead of
 `use_multicast_discovery()` switches to Mode A (Step 9), needed if your
 network blocks multicast or the two nodes aren't on the same LAN.
@@ -999,7 +999,7 @@ which case you're in.
 
 ```bash
 # Build + run the relay (plain sockets, no AF_XDP -- see below)
-g++ -std=c++17 -O2 -I cpp/relink/include -pthread cpp/rlcore/relink_relay.cpp -o relink-relay
+g++ -std=c++17 -O2 -I cpp/include -pthread cpp/rlcore/relink_relay.cpp -o relink-relay
 ./relink-relay [port]   # default 8446
 
 # Python
@@ -1128,7 +1128,7 @@ node.set_rlcore.setEncryptKey("ef78d9acb11a87844e705a07ae66ddd7f0124c28899da2fa5
 #### C++ and Python interop
 
 Both languages implement the same AES-256-GCM wire format from
-scratch — `cpp/relink/include/relink/crypto.hpp` (C++) and
+scratch — `cpp/include/relink/crypto.hpp` (C++) and
 `python/relink_py/relink/crypto.py` (Python), neither depending on a
 third-party crypto library (see "Implementation notes" below). A
 message sealed by one is verified to decrypt correctly with the other,
@@ -1231,8 +1231,8 @@ find you" problem so your actual code doesn't have to.
 
 ### Using `rl_topic` — listing and inspecting topics
 
-`rl_topic` (`python/rl_topic.py` / `cpp/rl_topic.cpp`, built the same way
-as any other example in [Step 10](#step-10--all-examples)) is a
+`rl_topic` (`python/rl_topic.py` / `cpp/tools/rl_topic.cpp`, built the
+same way as any other example in [Step 10](#step-10--all-examples)) is a
 `rostopic`-style CLI for asking "what topics exist right now, and who's
 using them" without writing any code. `list` and `info` are the two most
 common subcommands:
@@ -1331,9 +1331,9 @@ exists in both C++ (`cpp/examples/`) and Python (`python/relink_py/examples/`).
 | **`custom_types_pubsub`** | "Any message type" made concrete: one node publishing/subscribing a built-in type (`Bool`) alongside two user-defined custom types at once — a small struct (`Pose2D`) and a struct containing fixed-size arrays (`Waypoints`). Verified interoperable both same-language and cross-language (C++ ↔ Python). | `./custom_types_pubsub` (run twice, or against the Python copy) |
 | **`camera_stream`** | A real webcam streamed over ReLink two ways at once (`image_raw`, `image_compressed`) using the built-in `Image` type. **Requires OpenCV**, installed yourself — not a ReLink dependency. | `./camera_stream pub` and `... sub` |
 
-There's also a performance test harness (`relink_benchmark.cpp` at the
-repo root) used to produce the numbers in Step 12 — worth reading once
-you're comfortable with the basics, not a starting point.
+There's also a performance test harness (`cpp/tools/relink_benchmark.cpp`)
+used to produce the numbers in Step 12 — worth reading once you're
+comfortable with the basics, not a starting point.
 
 ---
 
@@ -1346,7 +1346,7 @@ you're comfortable with the basics, not a starting point.
 
 ```bash
 # C++ (each test is a standalone binary)
-g++ -std=c++17 -I cpp/relink/include -pthread cpp/tests/test_wire.cpp -o test_wire && ./test_wire
+g++ -std=c++17 -I cpp/include -pthread cpp/tests/test_wire.cpp -o test_wire && ./test_wire
 
 # Python
 python3 python/relink_py/tests/test_relink.py
@@ -1827,7 +1827,8 @@ never ambiguous which build tooling a given file needs.
 
 ```
 cpp/
-  relink/include/relink/       C++ library (header-only)
+  CMakeLists.txt                Top-level CMake project -- builds everything below in one shot
+  include/relink/               C++ library (header-only)
     wire.hpp                     byte-exact structs: RelinkHeader, BeaconPacket, default types
     topic_hash.hpp                FNV-1a 32-bit hash for named topics
     ring_buffer.hpp               fixed-capacity, drop-oldest-on-overflow
@@ -1837,17 +1838,19 @@ cpp/
     beacon.hpp / multicast_discovery.hpp    mode B (multicast) client
     relink.hpp                    RelinkNode -- the public API
     relay_wire.hpp                 relay fallback wire helpers (Step 13)
+    crypto.hpp                     AES-256-GCM for the rlcore signaling handshake
 
-  rlcore/                       C++ daemons, CMake project (Step 9)
+  rlcore/                       C++ daemons (Step 9)
     relink_rlcore.cpp             registration daemon
     relink_relay.cpp              relay fallback daemon (Step 13)
-    CMakeLists.txt                 -DRELINK_ENABLE_XDP=ON for the AF_XDP fast path (Step 12)
+    CMakeLists.txt                 also buildable standalone; -DRELINK_ENABLE_XDP=ON for AF_XDP (Step 12)
     xdp/                           AF_XDP socket + eBPF kernel program
 
+  tools/                        rl_topic.cpp, relink_example.cpp, relink_benchmark.cpp
   examples/                     C++ usage examples (Step 10)
   tests/                        unit tests + two-process correctness tests (Step 11)
-  cpp/ros2_compare/                  ROS2 Humble comparison benchmark package
-  relink_benchmark.cpp, relink_example.cpp, rl_topic.cpp
+  cmake_example/                minimal standalone CMake template for consuming ReLink from your own project
+  ros2_compare/                  ROS2 Humble comparison benchmark package
 
 python/
   relink_py/relink/             Python library (stdlib-only: ctypes + socket + struct)
