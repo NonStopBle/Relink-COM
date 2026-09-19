@@ -1,6 +1,6 @@
 <div align="center">
 
-# ReLink
+# ReLink-COM
 
 **A lightweight, ROS-like publish/subscribe protocol over UDP — built to be
 faster and simpler than ROS1/ROS2.**
