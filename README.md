@@ -8,7 +8,7 @@ faster and simpler than ROS1/ROS2.**
 ![C++17](https://img.shields.io/badge/C%2B%2B-17-blue)
 ![Python](https://img.shields.io/badge/Python-3.8%2B-blue)
 ![Transport](https://img.shields.io/badge/transport-UDP-orange)
-![Platform](https://img.shields.io/badge/platform-Linux-lightgrey)
+![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20Windows-lightgrey)
 
 You do not need ROS installed, and you do not need any other extra
 software to make it work. It comes in two versions — **C++** and

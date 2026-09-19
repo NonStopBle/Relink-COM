@@ -26,7 +26,6 @@
 #include <thread>
 #include <memory>
 #include <cstring>
-#include <unistd.h>
 #include <functional>
 
 namespace relink {
@@ -821,7 +820,8 @@ private:
                         uint8_t announce_buf[kTopicDirMaxPacket];
                         size_t announce_len = 0;
                         if (encode_topic_dir_announce(chunk, announce_buf, sizeof(announce_buf), &announce_len)) {
-                            ::sendto(transport_.native_handle(), announce_buf, announce_len, 0,
+                            ::sendto(transport_.native_handle(), reinterpret_cast<const char*>(announce_buf),
+                                     static_cast<int>(announce_len), 0,
                                      reinterpret_cast<struct sockaddr*>(&dest), sizeof(dest));
                         }
                     }
@@ -972,8 +972,8 @@ private:
     }
 
     static uint32_t detect_local_ip_for_peer(uint32_t peer_ip_host, uint16_t peer_port) {
-        int sock = ::socket(AF_INET, SOCK_DGRAM, 0);
-        if (sock < 0) throw std::runtime_error("detect_local_ip_for_peer: socket() failed");
+        socket_t sock = ::socket(AF_INET, SOCK_DGRAM, 0);
+        if (sock == kInvalidSocket) throw std::runtime_error("detect_local_ip_for_peer: socket() failed");
 
         struct sockaddr_in peer{};
         peer.sin_family = AF_INET;
@@ -988,7 +988,7 @@ private:
                 local_ip = ntohl(local.sin_addr.s_addr);
             }
         }
-        ::close(sock);
+        relink::close_socket(sock);
         return local_ip;
     }
 
@@ -1106,7 +1106,7 @@ private:
                 dest.sin_family = AF_INET;
                 dest.sin_addr.s_addr = htonl(relay_ip_);
                 dest.sin_port = htons(relay_port_);
-                ::sendto(g.first->native_handle(), buf, len, 0,
+                ::sendto(g.first->native_handle(), reinterpret_cast<const char*>(buf), static_cast<int>(len), 0,
                          reinterpret_cast<struct sockaddr*>(&dest), sizeof(dest));
             }
         }
@@ -1217,7 +1217,8 @@ private:
                                 dst.sin_family = AF_INET;
                                 dst.sin_addr.s_addr = htonl(set_rlcore.resolved_ip());
                                 dst.sin_port = htons(set_rlcore.resolved_port());
-                                ::sendto(g.first->native_handle(), buf, len, 0,
+                                ::sendto(g.first->native_handle(), reinterpret_cast<const char*>(buf),
+                                         static_cast<int>(len), 0,
                                          reinterpret_cast<sockaddr*>(&dst), sizeof(dst));
                             }
                         }

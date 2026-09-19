@@ -30,6 +30,11 @@ target_include_directories(relink-rlcore PRIVATE ${RELINK_INCLUDE_DIR})
 add_executable(relink-relay relink_relay.cpp)
 target_include_directories(relink-relay PRIVATE ${RELINK_INCLUDE_DIR})
 
+if(WIN32)
+    target_link_libraries(relink-rlcore PRIVATE ws2_32)
+    target_link_libraries(relink-relay PRIVATE ws2_32)
+endif()
+
 if(RELINK_ENABLE_XDP)
     find_package(PkgConfig REQUIRED)
     pkg_check_modules(LIBBPF libbpf)

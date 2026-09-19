@@ -16,17 +16,13 @@
 
 #include "relink/register.hpp"
 #include "relink/udp_transport.hpp"
+#include "relink/platform.hpp"
 #include <cstdio>
 #include <cstdint>
 #include <vector>
 #include <chrono>
 #include <thread>
 #include <stdexcept>
-
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
-#include <unistd.h>
 
 namespace relink {
 
@@ -53,7 +49,7 @@ struct RegisterOutcome {
 // not yet started, recvfrom() here is safe (nothing else reads this
 // socket yet).
 inline RegisterOutcome register_with_rlcore_on_socket(
-    int sock,
+    socket_t sock,
     uint32_t server_ip_host_order, uint16_t server_port,
     uint32_t self_ip_host_order, uint16_t self_data_port,
     const uint32_t* topic_ids, uint16_t topic_count,
@@ -99,14 +95,12 @@ inline RegisterOutcome register_with_rlcore_on_socket(
 
     for (int attempt = 0; attempt < max_retries; ++attempt) {
         if (!use_transport_queue) {
-            struct timeval tv{};
-            tv.tv_sec = backoff_ms / 1000;
-            tv.tv_usec = (backoff_ms % 1000) * 1000;
-            ::setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+            set_recv_timeout_ms(sock, backoff_ms);
         }
 
-        ssize_t sent = ::sendto(sock, req_buf, req_len, 0,
-                                 reinterpret_cast<struct sockaddr*>(&server), sizeof(server));
+        ssize_t sent = static_cast<ssize_t>(::sendto(sock,
+                                 reinterpret_cast<const char*>(req_buf), static_cast<int>(req_len), 0,
+                                 reinterpret_cast<struct sockaddr*>(&server), sizeof(server)));
         if (sent != static_cast<ssize_t>(req_len)) {
             std::fprintf(stderr, "register_with_rlcore: attempt %d/%d timed out, retrying...\n",
                          attempt + 1, max_retries);
@@ -125,8 +119,9 @@ inline RegisterOutcome register_with_rlcore_on_socket(
         } else {
             struct sockaddr_in src{};
             socklen_t src_len = sizeof(src);
-            ssize_t n = ::recvfrom(sock, resp_buf, sizeof(resp_buf), 0,
-                                    reinterpret_cast<struct sockaddr*>(&src), &src_len);
+            ssize_t n = static_cast<ssize_t>(::recvfrom(sock,
+                                    reinterpret_cast<char*>(resp_buf), static_cast<int>(sizeof(resp_buf)), 0,
+                                    reinterpret_cast<struct sockaddr*>(&src), &src_len));
             if (n > 0) {
                 resp_data = resp_buf;
                 resp_len = static_cast<size_t>(n);
@@ -165,12 +160,12 @@ inline RegisterOutcome register_with_rlcore(
     uint32_t self_ip_host_order, uint16_t self_data_port,
     const uint32_t* topic_ids, uint16_t topic_count,
     int max_retries = 3, int timeout_ms = 500) {
-    int sock = ::socket(AF_INET, SOCK_DGRAM, 0);
-    if (sock < 0) throw std::runtime_error("register_with_rlcore: socket() failed");
+    socket_t sock = ::socket(AF_INET, SOCK_DGRAM, 0);
+    if (sock == kInvalidSocket) throw std::runtime_error("register_with_rlcore: socket() failed");
     RegisterOutcome outcome = register_with_rlcore_on_socket(
         sock, server_ip_host_order, server_port, self_ip_host_order, self_data_port,
         topic_ids, topic_count, max_retries, timeout_ms);
-    ::close(sock);
+    relink::close_socket(sock);
     return outcome;
 }
 

@@ -17,6 +17,7 @@
 
 #include "relink/beacon.hpp"
 #include "relink/topic_directory.hpp"
+#include "relink/platform.hpp"
 #include <atomic>
 #include <cstdio>
 #include <thread>
@@ -30,11 +31,6 @@
 #include <cstring>
 #include <stdexcept>
 #include <string>
-
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
-#include <unistd.h>
 
 namespace relink {
 
@@ -167,8 +163,8 @@ public:
         if (!running_.exchange(false)) return;
         if (sender_thread_.joinable()) sender_thread_.join();
         if (listener_thread_.joinable()) listener_thread_.join();
-        if (send_sock_ >= 0) { ::close(send_sock_); send_sock_ = -1; }
-        if (recv_sock_ >= 0) { ::close(recv_sock_); recv_sock_ = -1; }
+        if (send_sock_ != kInvalidSocket) { relink::close_socket(send_sock_); send_sock_ = kInvalidSocket; }
+        if (recv_sock_ != kInvalidSocket) { relink::close_socket(recv_sock_); recv_sock_ = kInvalidSocket; }
     }
 
     // Snapshot of the current peer table for one topic (empty if none).
@@ -204,28 +200,26 @@ public:
 private:
     void setup_send_socket() {
         send_sock_ = ::socket(AF_INET, SOCK_DGRAM, 0);
-        if (send_sock_ < 0) throw std::runtime_error("MulticastDiscovery: send socket() failed");
+        if (send_sock_ == kInvalidSocket) throw std::runtime_error("MulticastDiscovery: send socket() failed");
 
         // Loop back to this host too -- required so localhost-only tests
         // (both "nodes" as threads in the same process/machine) can see
         // their own multicast traffic; real deployments across machines
         // don't depend on this flag.
         unsigned char loop = 1;
-        ::setsockopt(send_sock_, IPPROTO_IP, IP_MULTICAST_LOOP, &loop, sizeof(loop));
+        ::setsockopt(send_sock_, IPPROTO_IP, IP_MULTICAST_LOOP, reinterpret_cast<const char*>(&loop), sizeof(loop));
 
         int ttl = 1; // stay on the local subnet, per typical LAN discovery use
-        ::setsockopt(send_sock_, IPPROTO_IP, IP_MULTICAST_TTL, &ttl, sizeof(ttl));
+        ::setsockopt(send_sock_, IPPROTO_IP, IP_MULTICAST_TTL, reinterpret_cast<const char*>(&ttl), sizeof(ttl));
     }
 
     void setup_recv_socket() {
         recv_sock_ = ::socket(AF_INET, SOCK_DGRAM, 0);
-        if (recv_sock_ < 0) throw std::runtime_error("MulticastDiscovery: recv socket() failed");
+        if (recv_sock_ == kInvalidSocket) throw std::runtime_error("MulticastDiscovery: recv socket() failed");
 
         int reuse = 1;
-        ::setsockopt(recv_sock_, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
-#ifdef SO_REUSEPORT
-        ::setsockopt(recv_sock_, SOL_SOCKET, SO_REUSEPORT, &reuse, sizeof(reuse));
-#endif
+        ::setsockopt(recv_sock_, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char*>(&reuse), sizeof(reuse));
+        enable_port_reuse_if_available(recv_sock_);
 
         struct sockaddr_in bind_addr{};
         bind_addr.sin_family = AF_INET;
@@ -238,17 +232,14 @@ private:
         struct ip_mreq mreq{};
         ::inet_pton(AF_INET, cfg_.group_ip.c_str(), &mreq.imr_multiaddr);
         mreq.imr_interface.s_addr = INADDR_ANY;
-        if (::setsockopt(recv_sock_, IPPROTO_IP, IP_ADD_MEMBERSHIP, &mreq, sizeof(mreq)) < 0) {
+        if (::setsockopt(recv_sock_, IPPROTO_IP, IP_ADD_MEMBERSHIP, reinterpret_cast<const char*>(&mreq), sizeof(mreq)) < 0) {
             throw std::runtime_error("MulticastDiscovery: IP_ADD_MEMBERSHIP failed");
         }
 
         // Bounded recv timeout, same rationale as UdpTransport: lets the
         // listener loop check the stop flag promptly instead of blocking
         // forever.
-        struct timeval tv{};
-        tv.tv_sec = 0;
-        tv.tv_usec = 50 * 1000;
-        ::setsockopt(recv_sock_, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        set_recv_timeout_ms(recv_sock_, 50);
     }
 
     void send_beacon_once() {
@@ -266,7 +257,8 @@ private:
                                             static_cast<uint16_t>(g.topics.size()),
                                             buf, sizeof(buf), &len);
             if (er != BeaconEncodeResult::Ok) continue;
-            ::sendto(send_sock_, buf, len, 0, reinterpret_cast<struct sockaddr*>(&dest), sizeof(dest));
+            ::sendto(send_sock_, reinterpret_cast<const char*>(buf), static_cast<int>(len), 0,
+                     reinterpret_cast<struct sockaddr*>(&dest), sizeof(dest));
         }
     }
 
@@ -310,8 +302,9 @@ private:
         while (running_.load()) {
             struct sockaddr_in src{};
             socklen_t src_len = sizeof(src);
-            ssize_t n = ::recvfrom(recv_sock_, buf, sizeof(buf), 0,
-                                    reinterpret_cast<struct sockaddr*>(&src), &src_len);
+            ssize_t n = static_cast<ssize_t>(::recvfrom(recv_sock_,
+                                    reinterpret_cast<char*>(buf), static_cast<int>(sizeof(buf)), 0,
+                                    reinterpret_cast<struct sockaddr*>(&src), &src_len));
             if (n <= 0) continue;
 
             // rl_topic's name-directory protocol shares this port but is
@@ -325,7 +318,7 @@ private:
                     uint8_t reply_buf[kTopicDirMaxPacket];
                     size_t reply_len = 0;
                     if (encode_topic_dir_reply(entries, reply_buf, sizeof(reply_buf), &reply_len)) {
-                        ::sendto(send_sock_, reply_buf, reply_len, 0,
+                        ::sendto(send_sock_, reinterpret_cast<const char*>(reply_buf), static_cast<int>(reply_len), 0,
                                  reinterpret_cast<struct sockaddr*>(&src), src_len);
                     }
                 }
@@ -380,8 +373,8 @@ private:
     std::unordered_set<uint16_t> self_ports_;
 
     std::atomic<bool> running_{false};
-    int send_sock_ = -1;
-    int recv_sock_ = -1;
+    socket_t send_sock_ = kInvalidSocket;
+    socket_t recv_sock_ = kInvalidSocket;
     std::thread sender_thread_;
     std::thread listener_thread_;
 

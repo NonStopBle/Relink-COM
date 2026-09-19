@@ -15,6 +15,7 @@
 //
 // usage: relink-relay [port]
 #include "relink/relay_wire.hpp"
+#include "relink/platform.hpp"
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -22,20 +23,21 @@
 #include <unordered_map>
 #include <vector>
 #include <algorithm>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
-#include <unistd.h>
-#include <poll.h>
 
-#ifdef RELINK_ENABLE_XDP
+// AF_XDP is a Linux-only fast path (see below); it's never built on
+// Windows regardless of RELINK_ENABLE_XDP, since the whole mechanism
+// (eBPF, UMEM, native XDP sockets) doesn't exist there -- plain
+// sockets are the only relay path on that platform.
+#if defined(RELINK_ENABLE_XDP) && !defined(_WIN32)
+#define RELINK_XDP_ACTIVE 1
+#include <poll.h>
 #include "xdp/relay_xdp.hpp"
 #include <csignal>
 #endif
 
 using namespace relink;
 
-#ifdef RELINK_ENABLE_XDP
+#ifdef RELINK_XDP_ACTIVE
 namespace {
 // Global only so the signal handler (which can't take a capture) can
 // reach it -- detach() is idempotent, so double-calling on a
@@ -68,7 +70,7 @@ bool same_addr(const struct sockaddr_in& a, const struct sockaddr_in& b) {
 // arrived via plain recvfrom() or the AF_XDP fast path -- both loops
 // below call this so REGISTER bookkeeping, forwarding, and TTL sweep
 // logic exist exactly once.
-void handle_packet(int sock, std::unordered_map<uint32_t, std::vector<Member>>& groups,
+void handle_packet(relink::socket_t sock, std::unordered_map<uint32_t, std::vector<Member>>& groups,
                     const uint8_t* buf, size_t n, const struct sockaddr_in& src,
                     time_t& last_sweep) {
     uint32_t topic_id = 0;
@@ -86,7 +88,7 @@ void handle_packet(int sock, std::unordered_map<uint32_t, std::vector<Member>>& 
         if (it != groups.end()) {
             for (const auto& m : it->second) {
                 if (same_addr(m.addr, src)) continue; // never echo back to the sender
-                ::sendto(sock, buf, n, 0,
+                ::sendto(sock, reinterpret_cast<const char*>(buf), static_cast<int>(n), 0,
                          reinterpret_cast<const struct sockaddr*>(&m.addr), sizeof(m.addr));
             }
         }
@@ -111,8 +113,8 @@ void handle_packet(int sock, std::unordered_map<uint32_t, std::vector<Member>>& 
 int main(int argc, char** argv) {
     uint16_t port = (argc > 1) ? static_cast<uint16_t>(std::atoi(argv[1])) : kRelayDefaultPort;
 
-    int sock = ::socket(AF_INET, SOCK_DGRAM, 0);
-    if (sock < 0) {
+    socket_t sock = ::socket(AF_INET, SOCK_DGRAM, 0);
+    if (sock == kInvalidSocket) {
         std::perror("socket");
         return 1;
     }
@@ -129,7 +131,7 @@ int main(int argc, char** argv) {
     std::unordered_map<uint32_t, std::vector<Member>> groups;
     time_t last_sweep = std::time(nullptr);
 
-#ifdef RELINK_ENABLE_XDP
+#ifdef RELINK_XDP_ACTIVE
     // Fast path: an XDP program on the NIC redirects packets addressed
     // to `port` straight into this AF_XDP socket's UMEM, bypassing the
     // kernel's normal UDP receive path entirely (see xdp/relay_xdp.hpp
@@ -168,8 +170,9 @@ int main(int argc, char** argv) {
             if (pfds[1].revents & POLLIN) {
                 struct sockaddr_in src{};
                 socklen_t src_len = sizeof(src);
-                ssize_t n = ::recvfrom(sock, plain_buf, sizeof(plain_buf), 0,
-                                        reinterpret_cast<struct sockaddr*>(&src), &src_len);
+                ssize_t n = static_cast<ssize_t>(::recvfrom(sock,
+                                        reinterpret_cast<char*>(plain_buf), static_cast<int>(sizeof(plain_buf)), 0,
+                                        reinterpret_cast<struct sockaddr*>(&src), &src_len));
                 if (n > 0) handle_packet(sock, groups, plain_buf, static_cast<size_t>(n), src, last_sweep);
             }
 
@@ -220,8 +223,9 @@ int main(int argc, char** argv) {
     for (;;) {
         struct sockaddr_in src{};
         socklen_t src_len = sizeof(src);
-        ssize_t n = ::recvfrom(sock, buf, sizeof(buf), 0,
-                                reinterpret_cast<struct sockaddr*>(&src), &src_len);
+        ssize_t n = static_cast<ssize_t>(::recvfrom(sock,
+                                reinterpret_cast<char*>(buf), static_cast<int>(sizeof(buf)), 0,
+                                reinterpret_cast<struct sockaddr*>(&src), &src_len));
         if (n <= 0) continue;
         handle_packet(sock, groups, buf, static_cast<size_t>(n), src, last_sweep);
     }

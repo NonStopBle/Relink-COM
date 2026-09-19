@@ -26,6 +26,7 @@
 
 #include "relink/register.hpp"
 #include "relink/topic_directory.hpp"
+#include "relink/platform.hpp"
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
@@ -33,12 +34,6 @@
 #include <map>
 #include <set>
 #include <tuple>
-
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
-#include <unistd.h>
-#include <sys/time.h>
 #include <chrono>
 
 using namespace relink;
@@ -75,8 +70,8 @@ int main(int argc, char** argv) {
         }
     }
 
-    int sock = ::socket(AF_INET, SOCK_DGRAM, 0);
-    if (sock < 0) { std::perror("socket"); return 1; }
+    socket_t sock = ::socket(AF_INET, SOCK_DGRAM, 0);
+    if (sock == kInvalidSocket) { std::perror("socket"); return 1; }
 
     struct sockaddr_in addr{};
     addr.sin_family = AF_INET;
@@ -138,8 +133,7 @@ int main(int argc, char** argv) {
     // Wake up periodically even with no incoming traffic, purely to run
     // prune_stale() -- otherwise a fleet that goes quiet keeps every last
     // registration "alive" forever, since nothing else ever calls it.
-    struct timeval recv_timeout{1, 0};
-    ::setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &recv_timeout, sizeof(recv_timeout));
+    set_recv_timeout_ms(sock, 1000);
 
     // topic_id -> name, accumulated from RLNM announces sent by any node
     // registered here (see topic_directory.hpp) -- lets rl_topic.py ask
@@ -163,8 +157,9 @@ int main(int argc, char** argv) {
     while (true) {
         struct sockaddr_in src{};
         socklen_t src_len = sizeof(src);
-        ssize_t n = ::recvfrom(sock, recv_buf, sizeof(recv_buf), 0,
-                                reinterpret_cast<struct sockaddr*>(&src), &src_len);
+        ssize_t n = static_cast<ssize_t>(::recvfrom(sock,
+                                reinterpret_cast<char*>(recv_buf), static_cast<int>(sizeof(recv_buf)), 0,
+                                reinterpret_cast<struct sockaddr*>(&src), &src_len));
         prune_stale();
         if (n <= 0) continue;
 
@@ -208,7 +203,7 @@ int main(int argc, char** argv) {
             for (const auto& chunk : chunks) {
                 size_t reply_len = 0;
                 if (encode_topic_dir_reply(chunk, send_buf, sizeof(send_buf), &reply_len)) {
-                    ::sendto(sock, send_buf, reply_len, 0,
+                    ::sendto(sock, reinterpret_cast<const char*>(send_buf), static_cast<int>(reply_len), 0,
                              reinterpret_cast<struct sockaddr*>(&src), src_len);
                 }
             }
@@ -247,7 +242,7 @@ int main(int argc, char** argv) {
             for (const auto& chunk : chunks) {
                 size_t reply_len = 0;
                 if (encode_role_reply(chunk, send_buf, sizeof(send_buf), &reply_len)) {
-                    ::sendto(sock, send_buf, reply_len, 0,
+                    ::sendto(sock, reinterpret_cast<const char*>(send_buf), static_cast<int>(reply_len), 0,
                              reinterpret_cast<struct sockaddr*>(&src), src_len);
                 }
             }
@@ -301,7 +296,7 @@ int main(int argc, char** argv) {
             continue;
         }
 
-        ::sendto(sock, send_buf, out_len, 0,
+        ::sendto(sock, reinterpret_cast<const char*>(send_buf), static_cast<int>(out_len), 0,
                  reinterpret_cast<struct sockaddr*>(&src), src_len);
 
         struct in_addr ia{};
@@ -311,6 +306,6 @@ int main(int argc, char** argv) {
                     nat_mode ? " [observed]" : "", peers.size());
     }
 
-    ::close(sock);
+    relink::close_socket(sock);
     return 0;
 }

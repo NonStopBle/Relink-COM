@@ -18,6 +18,7 @@
 #pragma once
 
 #include "relink/frame.hpp"
+#include "relink/platform.hpp"
 #include <atomic>
 #include <thread>
 #include <functional>
@@ -29,14 +30,6 @@
 #include <cstring>
 #include <stdexcept>
 #include <string>
-
-#include <sys/socket.h>
-#include <sys/uio.h>
-#include <sched.h>
-#include <pthread.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
-#include <unistd.h>
 
 namespace relink {
 
@@ -60,7 +53,7 @@ public:
     // setup call, not on the hot path.
     void bind(uint16_t bind_port) {
         sock_ = ::socket(AF_INET, SOCK_DGRAM, 0);
-        if (sock_ < 0) {
+        if (sock_ == kInvalidSocket) {
             throw std::runtime_error("UdpTransport: socket() failed");
         }
 
@@ -68,10 +61,7 @@ public:
         // stop flag periodically instead of blocking forever -- this is
         // the "non-blocking or tight-timeout recv loop" rule from the
         // spec's Performance target section.
-        struct timeval tv{};
-        tv.tv_sec = 0;
-        tv.tv_usec = 50 * 1000; // 50ms poll interval for stop responsiveness
-        ::setsockopt(sock_, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        set_recv_timeout_ms(sock_, 50); // 50ms poll interval for stop responsiveness
 
         // Only enlarge the buffer if this node actually uses Image (set
         // via enable_large_buffers(), called by advertise<ImageChunk>/
@@ -93,8 +83,8 @@ public:
         addr.sin_port = htons(bind_port);
 
         if (::bind(sock_, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) < 0) {
-            ::close(sock_);
-            sock_ = -1;
+            relink::close_socket(sock_);
+            sock_ = kInvalidSocket;
             throw std::runtime_error("UdpTransport: bind() failed");
         }
 
@@ -121,7 +111,7 @@ public:
     // using Image.
     void enable_large_buffers() {
         want_large_buffers_ = true;
-        if (sock_ >= 0) apply_large_buffers();
+        if (sock_ != kInvalidSocket) apply_large_buffers();
     }
 
     // Exposes the underlying socket fd, needed ONLY so callers (namely
@@ -131,7 +121,7 @@ public:
     // this transport will actually receive data on. Safe to use before
     // start() launches the dedicated data thread; not meant for general
     // use once the thread is running (it owns recv from that point on).
-    int native_handle() const { return sock_; }
+    socket_t native_handle() const { return sock_; }
 
     // Register the raw-bytes handler for a topic_id. Must be called
     // before start() for the topics this node will receive traffic on
@@ -188,8 +178,9 @@ public:
         dest.sin_addr.s_addr = htonl(peer.ip_host_order);
         dest.sin_port = htons(peer.port);
 
-        ssize_t sent = ::sendto(sock_, send_buf_, frame_len, 0,
-                                 reinterpret_cast<struct sockaddr*>(&dest), sizeof(dest));
+        ssize_t sent = static_cast<ssize_t>(::sendto(sock_,
+                                 reinterpret_cast<const char*>(send_buf_), static_cast<int>(frame_len), 0,
+                                 reinterpret_cast<struct sockaddr*>(&dest), sizeof(dest)));
         return sent == static_cast<ssize_t>(frame_len);
     }
 
@@ -219,7 +210,7 @@ public:
         uint8_t start = kStartByte;
         uint8_t stop = kStopByte;
 
-        struct iovec iov[5];
+        relink::iovec iov[5];
         int n = 0;
         iov[n].iov_base = &start; iov[n].iov_len = 1; ++n;
         iov[n].iov_base = &header; iov[n].iov_len = sizeof(header); ++n;
@@ -236,14 +227,8 @@ public:
         dest.sin_addr.s_addr = htonl(peer.ip_host_order);
         dest.sin_port = htons(peer.port);
 
-        struct msghdr msg{};
-        msg.msg_name = &dest;
-        msg.msg_namelen = sizeof(dest);
-        msg.msg_iov = iov;
-        msg.msg_iovlen = n;
-
         size_t frame_len = 1 + sizeof(header) + payload_len + 1;
-        ssize_t sent = ::sendmsg(sock_, &msg, 0);
+        ssize_t sent = relink::sendmsg_to(sock_, iov, n, dest);
         return sent == static_cast<ssize_t>(frame_len);
     }
 
@@ -305,34 +290,23 @@ public:
 private:
     void apply_large_buffers() {
         int bufsize = 1024 * 1024;
-        ::setsockopt(sock_, SOL_SOCKET, SO_RCVBUF, &bufsize, sizeof(bufsize));
-        ::setsockopt(sock_, SOL_SOCKET, SO_SNDBUF, &bufsize, sizeof(bufsize));
+        ::setsockopt(sock_, SOL_SOCKET, SO_RCVBUF, reinterpret_cast<const char*>(&bufsize), sizeof(bufsize));
+        ::setsockopt(sock_, SOL_SOCKET, SO_SNDBUF, reinterpret_cast<const char*>(&bufsize), sizeof(bufsize));
     }
 
     void close_socket() {
-        if (sock_ >= 0) {
-            ::close(sock_);
-            sock_ = -1;
+        if (sock_ != kInvalidSocket) {
+            relink::close_socket(sock_);
+            sock_ = kInvalidSocket;
         }
     }
 
     void run_loop() {
-        if (pin_to_core_ >= 0) {
-            cpu_set_t cpuset;
-            CPU_ZERO(&cpuset);
-            CPU_SET(pin_to_core_, &cpuset);
-            ::pthread_setaffinity_np(pthread_self(), sizeof(cpuset), &cpuset);
-        }
+        // Best-effort: pinning/real-time priority failing is never
+        // fatal, on either platform (see relink/platform.hpp).
+        relink::pin_thread_to_core(pin_to_core_);
         if (use_realtime_) {
-            struct sched_param param{};
-            param.sched_priority = rt_priority_;
-            int rc = ::pthread_setschedparam(pthread_self(), SCHED_FIFO, &param);
-            if (rc != 0) {
-                std::fprintf(stderr,
-                    "UdpTransport: SCHED_FIFO request failed (%s) -- continuing at normal "
-                    "scheduling priority. Run with CAP_SYS_NICE or as root to enable it.\n",
-                    std::strerror(rc));
-            }
+            relink::set_thread_realtime(rt_priority_);
         }
         while (running_.load(std::memory_order_relaxed)) {
             recv_and_dispatch();
@@ -354,8 +328,9 @@ private:
         // decode_register_ack() rejects -- which looks exactly like
         // "rlcore never replied" from the caller's side even though
         // rlcore's own log shows it did.
-        ssize_t n = ::recvfrom(sock_, recv_buf_, sizeof(recv_buf_), 0,
-                                reinterpret_cast<struct sockaddr*>(&src), &src_len);
+        ssize_t n = static_cast<ssize_t>(::recvfrom(sock_,
+                                reinterpret_cast<char*>(recv_buf_), static_cast<int>(sizeof(recv_buf_)), 0,
+                                reinterpret_cast<struct sockaddr*>(&src), &src_len));
         if (n <= 0) {
             return false; // timeout or error -- not fatal, loop again
         }
@@ -394,7 +369,7 @@ private:
         return false; // no subscriber for this topic -- drop
     }
 
-    int sock_ = -1;
+    socket_t sock_ = kInvalidSocket;
     bool want_large_buffers_ = false;
     uint16_t local_port_ = 0;
     std::atomic<bool> running_{false};

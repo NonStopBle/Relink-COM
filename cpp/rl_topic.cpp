@@ -31,12 +31,12 @@
 #include <algorithm>
 #include <csignal>
 
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
-#include <unistd.h>
+#include "relink/platform.hpp"
 #include <sys/stat.h>
+#ifndef _WIN32
 #include <pwd.h>
+#include <unistd.h>
+#endif
 
 using namespace relink;
 
@@ -107,12 +107,24 @@ static Args parse_args(int argc, char** argv) {
 // write it without a JSON library: one "id": "name" pair per line).
 // --------------------------------------------------------------------
 static std::string cache_path() {
+#ifdef _WIN32
+    // Forward slashes work fine in Windows file APIs (CreateFile,
+    // fopen, mkdir) and let the '/'-splitting mkdir-p logic below stay
+    // identical on both platforms.
+    const char* home = std::getenv("LOCALAPPDATA");
+    if (!home) home = std::getenv("USERPROFILE");
+    if (!home) home = "C:/Temp";
+    std::string h(home);
+    for (char& c : h) if (c == '\\') c = '/';
+    return h + "/relink/topic_names.json";
+#else
     const char* home = std::getenv("HOME");
     if (!home) {
         struct passwd* pw = getpwuid(getuid());
         home = pw ? pw->pw_dir : "/tmp";
     }
     return std::string(home) + "/.cache/relink/topic_names.json";
+#endif
 }
 
 static std::string json_escape(const std::string& s) {
@@ -160,7 +172,11 @@ static void save_cache(const std::map<uint32_t, std::string>& cache) {
         while (std::getline(ss, part, '/')) {
             if (part.empty()) { accum += "/"; continue; }
             accum += part + "/";
+#ifdef _WIN32
+            ::mkdir(accum.c_str());
+#else
             ::mkdir(accum.c_str(), 0755);
+#endif
         }
     }
     std::ofstream f(path, std::ios::trunc);
@@ -179,12 +195,9 @@ static void save_cache(const std::map<uint32_t, std::string>& cache) {
 // --------------------------------------------------------------------
 static std::map<uint32_t, std::string> query_rlcore(const std::string& ip, uint16_t port, double timeout_s) {
     std::map<uint32_t, std::string> out;
-    int s = ::socket(AF_INET, SOCK_DGRAM, 0);
-    if (s < 0) return out;
-    struct timeval tv{};
-    tv.tv_sec = static_cast<time_t>(timeout_s);
-    tv.tv_usec = static_cast<suseconds_t>((timeout_s - tv.tv_sec) * 1e6);
-    ::setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    socket_t s = ::socket(AF_INET, SOCK_DGRAM, 0);
+    if (s == kInvalidSocket) return out;
+    set_recv_timeout_ms(s, static_cast<long>(timeout_s * 1000));
 
     struct sockaddr_in dest{};
     dest.sin_family = AF_INET;
@@ -194,7 +207,8 @@ static std::map<uint32_t, std::string> query_rlcore(const std::string& ip, uint1
     uint8_t query_buf[8];
     size_t query_len = 0;
     encode_topic_dir_query(query_buf, sizeof(query_buf), &query_len);
-    ::sendto(s, query_buf, query_len, 0, reinterpret_cast<struct sockaddr*>(&dest), sizeof(dest));
+    ::sendto(s, reinterpret_cast<const char*>(query_buf), static_cast<int>(query_len), 0,
+             reinterpret_cast<struct sockaddr*>(&dest), sizeof(dest));
 
     // rlcore chunks its reply into multiple RLNR packets when it knows
     // more than kTopicDirMaxEntries (512) names (a real large-topic-
@@ -206,7 +220,8 @@ static std::map<uint32_t, std::string> query_rlcore(const std::string& ip, uint1
     bool got_any = false;
     while (true) {
         uint8_t buf[kTopicDirMaxPacket];
-        ssize_t n = ::recvfrom(s, buf, sizeof(buf), 0, nullptr, nullptr);
+        ssize_t n = static_cast<ssize_t>(::recvfrom(s, reinterpret_cast<char*>(buf),
+                                          static_cast<int>(sizeof(buf)), 0, nullptr, nullptr));
         if (n <= 0) break; // timed out -- done collecting chunks
         if (topic_dir_packet_kind(buf, static_cast<size_t>(n)) != TopicDirKind::Reply) continue;
         std::vector<TopicDirEntry> entries;
@@ -214,30 +229,23 @@ static std::map<uint32_t, std::string> query_rlcore(const std::string& ip, uint1
             got_any = true;
             for (const auto& e : entries) out[e.topic_id] = e.name;
         }
-        struct timeval quiet{};
         double quiet_s = timeout_s < 0.3 ? timeout_s : 0.3;
-        quiet.tv_sec = static_cast<time_t>(quiet_s);
-        quiet.tv_usec = static_cast<suseconds_t>((quiet_s - quiet.tv_sec) * 1e6);
-        ::setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &quiet, sizeof(quiet));
+        set_recv_timeout_ms(s, static_cast<long>(quiet_s * 1000));
     }
     if (!got_any) {
         std::fprintf(stderr, "rl_topic: no reply from rlcore at %s:%u\n", ip.c_str(), port);
     }
-    ::close(s);
+    relink::close_socket(s);
     return out;
 }
 
 static std::map<uint32_t, std::string> query_multicast(const std::string& group, uint16_t port, double timeout_s) {
     std::map<uint32_t, std::string> out;
-    int s = ::socket(AF_INET, SOCK_DGRAM, 0);
-    if (s < 0) return out;
+    socket_t s = ::socket(AF_INET, SOCK_DGRAM, 0);
+    if (s == kInvalidSocket) return out;
     int reuse = 1;
-    ::setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
-
-    struct timeval tv{};
-    tv.tv_sec = static_cast<time_t>(timeout_s);
-    tv.tv_usec = static_cast<suseconds_t>((timeout_s - tv.tv_sec) * 1e6);
-    ::setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    ::setsockopt(s, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char*>(&reuse), sizeof(reuse));
+    set_recv_timeout_ms(s, static_cast<long>(timeout_s * 1000));
 
     struct sockaddr_in dest{};
     dest.sin_family = AF_INET;
@@ -247,12 +255,14 @@ static std::map<uint32_t, std::string> query_multicast(const std::string& group,
     uint8_t query_buf[8];
     size_t query_len = 0;
     encode_topic_dir_query(query_buf, sizeof(query_buf), &query_len);
-    ::sendto(s, query_buf, query_len, 0, reinterpret_cast<struct sockaddr*>(&dest), sizeof(dest));
+    ::sendto(s, reinterpret_cast<const char*>(query_buf), static_cast<int>(query_len), 0,
+             reinterpret_cast<struct sockaddr*>(&dest), sizeof(dest));
 
     auto deadline = std::chrono::steady_clock::now() + std::chrono::duration<double>(timeout_s);
     while (std::chrono::steady_clock::now() < deadline) {
         uint8_t buf[kTopicDirMaxPacket];
-        ssize_t n = ::recvfrom(s, buf, sizeof(buf), 0, nullptr, nullptr);
+        ssize_t n = static_cast<ssize_t>(::recvfrom(s, reinterpret_cast<char*>(buf),
+                                          static_cast<int>(sizeof(buf)), 0, nullptr, nullptr));
         if (n <= 0) break; // timed out
         if (topic_dir_packet_kind(buf, static_cast<size_t>(n)) != TopicDirKind::Reply) continue;
         std::vector<TopicDirEntry> entries;
@@ -260,7 +270,7 @@ static std::map<uint32_t, std::string> query_multicast(const std::string& group,
             for (const auto& e : entries) out[e.topic_id] = e.name;
         }
     }
-    ::close(s);
+    relink::close_socket(s);
     return out;
 }
 
@@ -277,12 +287,9 @@ struct RolePeer {
 static std::map<uint32_t, std::vector<RolePeer>> query_rlcore_roles(
     const std::string& ip, uint16_t port, double timeout_s) {
     std::map<uint32_t, std::vector<RolePeer>> out;
-    int s = ::socket(AF_INET, SOCK_DGRAM, 0);
-    if (s < 0) return out;
-    struct timeval tv{};
-    tv.tv_sec = static_cast<time_t>(timeout_s);
-    tv.tv_usec = static_cast<suseconds_t>((timeout_s - tv.tv_sec) * 1e6);
-    ::setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    socket_t s = ::socket(AF_INET, SOCK_DGRAM, 0);
+    if (s == kInvalidSocket) return out;
+    set_recv_timeout_ms(s, static_cast<long>(timeout_s * 1000));
 
     struct sockaddr_in dest{};
     dest.sin_family = AF_INET;
@@ -292,11 +299,13 @@ static std::map<uint32_t, std::vector<RolePeer>> query_rlcore_roles(
     uint8_t query_buf[8];
     size_t query_len = 0;
     encode_role_query(query_buf, sizeof(query_buf), &query_len);
-    ::sendto(s, query_buf, query_len, 0, reinterpret_cast<struct sockaddr*>(&dest), sizeof(dest));
+    ::sendto(s, reinterpret_cast<const char*>(query_buf), static_cast<int>(query_len), 0,
+             reinterpret_cast<struct sockaddr*>(&dest), sizeof(dest));
 
     while (true) {
         uint8_t buf[kRoleMaxPacket];
-        ssize_t n = ::recvfrom(s, buf, sizeof(buf), 0, nullptr, nullptr);
+        ssize_t n = static_cast<ssize_t>(::recvfrom(s, reinterpret_cast<char*>(buf),
+                                          static_cast<int>(sizeof(buf)), 0, nullptr, nullptr));
         if (n <= 0) break;
         if (role_packet_kind(buf, static_cast<size_t>(n)) != RoleDirKind::Reply) continue;
         std::vector<RolePeerEntry> entries;
@@ -307,13 +316,10 @@ static std::map<uint32_t, std::vector<RolePeer>> query_rlcore_roles(
                 out[e.topic_id].push_back(RolePeer{inet_ntoa(ia), e.port, e.role});
             }
         }
-        struct timeval quiet{};
         double quiet_s = timeout_s < 0.3 ? timeout_s : 0.3;
-        quiet.tv_sec = static_cast<time_t>(quiet_s);
-        quiet.tv_usec = static_cast<suseconds_t>((quiet_s - quiet.tv_sec) * 1e6);
-        ::setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &quiet, sizeof(quiet));
+        set_recv_timeout_ms(s, static_cast<long>(quiet_s * 1000));
     }
-    ::close(s);
+    relink::close_socket(s);
     return out;
 }
 
