@@ -662,10 +662,12 @@ only once one of these doesn't fit:
 | `Float32` | `float` | `c_float` | 4 bytes |
 | `Float64` | `double` | `c_double` | 8 bytes |
 
-`builtin_types_pubsub` (Step 10) publishes and subscribes every one of
-these on its own topic in a single runnable file, and doubles as this
-table's live proof — verified cross-language (C++ ↔ Python) as well as
-same-language.
+[`builtin_types_pubsub`](#step-10--all-examples)
+([C++](cpp/examples/builtin_types_pubsub.cpp) /
+[Python](python/relink_py/examples/builtin_types_pubsub.py)) publishes
+and subscribes every one of these on its own topic in a single
+runnable file, and doubles as this table's live proof — verified
+cross-language (C++ ↔ Python) as well as same-language.
 
 ### ROS-familiar composite types ("NoROSLib")
 
@@ -696,15 +698,25 @@ large-blob type that goes through `advertise_image`/`publish_image`/
 since a full image doesn't fit one UDP datagram (Step 8). Every other
 type in the table above is a normal, single-datagram message.
 
-`standard_msgs_pubsub` (Step 10) publishes and subscribes every one of
-these 49 types (everything except `Image`/`CompressedImage`) on its
-own topic in a single runnable file — a live reference for the whole
-table, verified cross-language (C++ ↔ Python) as well as same-language.
-Each package also has its own standalone example (`std_msgs_pubsub`,
-`geometry_msgs_pubsub`, `sensor_msgs_pubsub`, `nav_msgs_pubsub`,
-`diagnostic_msgs_pubsub`, `trajectory_msgs_pubsub`,
-`actionlib_msgs_pubsub` — Step 10) if you only want to see one
-package's shapes without the other six.
+[`standard_msgs_pubsub`](#step-10--all-examples)
+([C++](cpp/examples/standard_msgs_pubsub.cpp) /
+[Python](python/relink_py/examples/standard_msgs_pubsub.py)) publishes
+and subscribes every one of these 49 types (everything except
+`Image`/`CompressedImage`) on its own topic in a single runnable file —
+a live reference for the whole table, verified cross-language
+(C++ ↔ Python) as well as same-language. Each package also has its own
+standalone example (Step 10) if you only want to see one package's
+shapes without the other six:
+
+| Package | Example |
+|---|---|
+| `std_msgs` (+ `*MultiArray` family) | [`std_msgs_pubsub`](#step-10--all-examples) ([C++](cpp/examples/std_msgs_pubsub.cpp) / [Python](python/relink_py/examples/std_msgs_pubsub.py)) |
+| `geometry_msgs` | [`geometry_msgs_pubsub`](#step-10--all-examples) ([C++](cpp/examples/geometry_msgs_pubsub.cpp) / [Python](python/relink_py/examples/geometry_msgs_pubsub.py)) |
+| `sensor_msgs` | [`sensor_msgs_pubsub`](#step-10--all-examples) ([C++](cpp/examples/sensor_msgs_pubsub.cpp) / [Python](python/relink_py/examples/sensor_msgs_pubsub.py)) |
+| `nav_msgs` | [`nav_msgs_pubsub`](#step-10--all-examples) ([C++](cpp/examples/nav_msgs_pubsub.cpp) / [Python](python/relink_py/examples/nav_msgs_pubsub.py)) |
+| `diagnostic_msgs` | [`diagnostic_msgs_pubsub`](#step-10--all-examples) ([C++](cpp/examples/diagnostic_msgs_pubsub.cpp) / [Python](python/relink_py/examples/diagnostic_msgs_pubsub.py)) |
+| `trajectory_msgs` | [`trajectory_msgs_pubsub`](#step-10--all-examples) ([C++](cpp/examples/trajectory_msgs_pubsub.cpp) / [Python](python/relink_py/examples/trajectory_msgs_pubsub.py)) |
+| `actionlib_msgs` | [`actionlib_msgs_pubsub`](#step-10--all-examples) ([C++](cpp/examples/actionlib_msgs_pubsub.cpp) / [Python](python/relink_py/examples/actionlib_msgs_pubsub.py)) |
 
 ```cpp
 #pragma pack(push, 1)
@@ -724,6 +736,12 @@ class ImuReading(ctypes.LittleEndianStructure):
 
 node.advertise("/relink/imu", ImuReading)
 ```
+
+See [`custom_types_pubsub`](#step-10--all-examples)
+([C++](cpp/examples/custom_types_pubsub.cpp) /
+[Python](python/relink_py/examples/custom_types_pubsub.py)) for a full
+runnable version of this pattern — a built-in type and two custom
+types (one plain, one with a fixed-size array field) on the same node.
 
 Both sides must independently define the identical byte layout — ReLink
 does no schema negotiation between nodes, same as ROS relies on both
