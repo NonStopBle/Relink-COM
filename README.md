@@ -998,21 +998,91 @@ node.set_rlcore.ip("203.0.113.10");
 node.set_rlcore.setEncryptKey("ef78d9acb11a87844e705a07ae66ddd7f0124c28899da2fa56062a6367e42e3d");
 ```
 
-`setEncryptKey` throws immediately if the string isn't exactly 64 hex
-characters (a 32-byte key) — a typo'd key fails loudly at startup
-instead of quietly registering unencrypted. If rlcore has a key
-configured and a node doesn't (or the two keys don't match), every
-RegisterRequest from that node is dropped as undecryptable and the node
-never gets peers — check both sides' key when registration mysteriously
-times out after adding `--encrypt-key`. Leaving `--encrypt-key` off
-`relink-rlcore` and never calling `setEncryptKey` on any node keeps the
-old plaintext behavior, unchanged, for existing deployments.
+#### Step-by-step setup
+
+1. **Build `relink-rlcore`** if you haven't already (Step 9's
+   "Building it" section above) — encryption support is compiled in by
+   default, no extra flag needed.
+
+2. **Generate one key** — run this once, anywhere, not once per node:
+
+   ```bash
+   ./relink-rlcore --generate-key
+   # ef78d9acb11a87844e705a07ae66ddd7f0124c28899da2fa56062a6367e42e3d
+   ```
+
+   Treat this string like a password: whoever has it can register fake
+   peers with your rlcore, or read who's registering what. Don't commit
+   it to source control or paste it somewhere public.
+
+3. **Start rlcore with that key**:
+
+   ```bash
+   ./relink-rlcore --port 8445 --encrypt-key ef78d9acb11a87844e705a07ae66ddd7f0124c28899da2fa56062a6367e42e3d
+   ```
+
+4. **Give the SAME key to every C++ node** that will register with this
+   rlcore, right after pointing it at rlcore's address:
+
+   ```cpp
+   node.set_rlcore.ip("203.0.113.10");
+   node.set_rlcore.setEncryptKey("ef78d9acb11a87844e705a07ae66ddd7f0124c28899da2fa56062a6367e42e3d");
+   ```
+
+   Order doesn't matter between `.ip(...)` and `.setEncryptKey(...)`,
+   but both must be called before `node.start()`/the first
+   `advertise()`/`subscribe()` call that triggers registration.
+
+5. **Verify it worked**: start rlcore first, then a node, and watch
+   rlcore's own stdout. A successful encrypted registration prints the
+   normal `relink-rlcore: registered <ip>:<port> (N topics)...` line —
+   there's no separate "encrypted" indicator, because from rlcore's
+   side a correctly-decrypted request looks identical to always. If the
+   key is wrong or missing on one side, rlcore instead prints
+   `dropped RegisterRequest that failed to decrypt` for every attempt,
+   and the node's own stderr shows it retrying and eventually giving up
+   (`register_with_rlcore: giving up after 3 attempts`).
+
+#### Troubleshooting
+
+| Symptom | Likely cause |
+|---|---|
+| Node registration times out only after adding `--encrypt-key` | Node is missing `setEncryptKey(...)`, or the hex string doesn't match rlcore's byte-for-byte (copy/paste error, trailing whitespace/newline) |
+| `setEncryptKey` throws at startup | The string isn't exactly 64 hex characters — regenerate with `--generate-key` rather than hand-typing one |
+| Some nodes register fine, others don't, same rlcore | Only some nodes were updated with the new key after a key rotation — every node must be updated at the same time you restart rlcore with the new key, since there's no "accept either key" transition mode |
+| A Python node can't register with an `--encrypt-key`-protected rlcore | **Expected for now** — see the limitation below |
+
+#### Current limitation: C++ only
+
+This feature is implemented in the C++ core (`cpp/relink/include/relink/crypto.hpp`)
+only. The Python bindings (`relink_py/`, `python/rlcore/relink_rlcore.py`)
+have no AES-256-GCM implementation yet, so:
+
+- A Python node cannot register with a C++ `relink-rlcore` that has
+  `--encrypt-key` set — its plaintext RegisterRequest gets dropped the
+  same way a wrong key would.
+- A Python `relink_rlcore.py` daemon has no `--encrypt-key` equivalent
+  at all.
+
+If your fleet mixes C++ and Python nodes against the same rlcore,
+either leave `--encrypt-key` off entirely (plaintext registration,
+unchanged from before this feature existed), or keep encryption
+C++-only by running a separate rlcore instance for Python nodes. Adding
+the matching Python implementation is a natural next step but hasn't
+been done.
+
+#### Implementation notes
 
 The AES-256-GCM implementation is self-contained (no OpenSSL/libcrypto
-dependency), so it doesn't affect the Windows/macOS build steps above —
-verified byte-for-byte interoperable with OpenSSL's own AES-256-GCM
-during development, and with a live encrypted registration exchange
-between a native Linux node and `relink-rlcore.exe` running under Wine.
+dependency) rather than linking a system crypto library, so it doesn't
+affect the Windows/macOS build steps above — MinGW has no standard
+OpenSSL package, and depending on one would have silently broken the
+Windows cross-compile. Verified byte-for-byte interoperable with
+OpenSSL's own AES-256-GCM (encrypt with one, decrypt with the other, in
+both directions) during development, plus tamper detection (flipping
+one ciphertext byte is rejected) and a live encrypted registration
+exchange between a native Linux node and `relink-rlcore.exe` running
+under Wine.
 
 ### AF_XDP — optional, and fully detachable
 
