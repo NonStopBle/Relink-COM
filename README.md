@@ -38,6 +38,7 @@ speak the exact same bytes on the wire and are interchangeable.
 - [Step 12 — Benchmarks](#step-12--benchmarks)
 - [Step 13 — NAT traversal (cross-network nodes)](#step-13--nat-traversal-cross-network-nodes)
 - [Step 14 — Troubleshooting](#step-14--troubleshooting)
+- [Step 15 — Technical deep dive](#step-15--technical-deep-dive)
 - [Reference](#reference)
   - [Feature matrix](#feature-matrix)
   - [Repository layout](#repository-layout)
@@ -60,20 +61,15 @@ speak the exact same bytes on the wire and are interchangeable.
 | **Wire format** | The literal byte layout of every packet — documented, not just implied by a struct definition. A from-scratch reimplementation in any language that can open a UDP socket can speak ReLink. |
 | **rlcore** | The optional small daemon used for Mode A discovery. Not required — Mode B (multicast) needs no daemon at all. |
 
-> **Why this exists:** ROS1's TCPROS pays a per-message connection-management
-> tax and depends on a single master. ROS2's DDS fixes the master but
-> replaces it with continuous multicast re-announcement (SPDP) that scales
-> as O(N²) with node count and grows the longer a system stays up. Neither
-> was designed around a hard real-time latency floor — both were designed
-> around generality (arbitrary QoS, arbitrary transports, arbitrary
-> serialization), and generality has a cost. ReLink gives up that
-> generality — one message type per topic, no reliable-transport path in
-> v1, no schema evolution — in exchange for a fixed-layout message over
-> raw UDP, discovered once (not re-announced forever), serialized by a
-> straight `memcpy`, dispatched on a dedicated thread with no lock in the
-> hot path. Measured head-to-head against ROS2 Humble on identical
-> hardware/payload/rate (Step 12): **~3x lower average latency, ~10x lower
-> worst-case tail latency**.
+> **Why this exists, in short:** ROS1 and ROS2 are built to be general —
+> any transport, any QoS policy, any serialization — and that generality
+> costs speed and simplicity. ReLink gives up most of that generality on
+> purpose (one fixed message type per topic, no built-in retry) to get a
+> much simpler, much faster path instead. Measured head-to-head against
+> ROS2 Humble on identical hardware/payload/rate (Step 12): **~3x lower
+> average latency, ~10x lower worst-case tail latency**. The full
+> technical reasoning is in [Step 15 — Technical deep
+> dive](#step-15--technical-deep-dive).
 
 If your system needs TCP reliability, arbitrary QoS policies, or schema
 evolution, ROS2/DDS is the more complete answer. If your system needs a
@@ -265,29 +261,14 @@ node.use_multicast_discovery()
 ```
 
 Nodes with different `network_id` values don't just ignore each other's
-beacons after decoding them — they join **different multicast group
-addresses *and* different ports**, so the isolation happens at the
-OS/kernel level; a node configured for `network_id=42` never receives a
-single byte from a `network_id=7` deployment on the same LAN. Both the
-address and the port must vary together: an earlier address-only design
-(mirroring the address-shifting half of how ROS assigns domains) turned
-out to leak across domains on Linux specifically because
-`MulticastDiscovery`'s listener socket sets `SO_REUSEPORT` (needed so
-several ReLink nodes can share one host on the same multicast port) —
-and `SO_REUSEPORT`'s delivery selection is scoped by port only, so two
-sockets bound to the *same port* but joined to *different* multicast
-addresses still both received a beacon meant for only one of them, a
-directly-reproduced kernel behavior on this project's own test machine.
-Varying the port too sidesteps it entirely.
-
+beacons — they join **different multicast group addresses *and*
+different ports**, so a node on `network_id=42` never receives a single
+byte from a `network_id=7` deployment on the same LAN, even accidentally.
 `network_id=0` (the default — i.e. never calling `set_network_id()`)
-reproduces today's fixed address/port exactly, so existing
-single-domain deployments see no behavior change. Verified: same
-`network_id` on both sides (including cross-language, C++ publisher to
-Python subscriber) discovers and delivers correctly; different
-`network_id` values produce zero cross-talk in either direction. No
-beacon wire-format change — isolation is entirely about which
-address/port a node's socket joins, not anything inside the packet.
+behaves exactly like today, so existing single-domain setups see no
+change. Why both the address *and* the port have to change together
+(not just one) is a Linux kernel quirk explained in [Step 15 —
+Technical deep dive](#step-15--technical-deep-dive).
 
 ### Review
 
@@ -335,16 +316,11 @@ node.subscribe<Float32>(101, [](const Float32& msg) { /* ... */ });
 ```
 
 > **Performance note — resolve the string once, outside the hot loop.**
-> Every call to the string overload (`publish<T>(name, ...)`,
-> `advertise<T>(name, ...)`, `subscribe<T>(name, ...)`) re-hashes the
-> string (FNV-1a over every character), takes the node's internal lock,
-> and does a registry lookup+comparison — every single call, not just the
-> first. That's fine for `advertise`/`subscribe` (called once at startup),
-> but calling the *string* overload of `publish()` inside a tight publish
-> loop pays that cost on every message. Resolve the name to its numeric
-> id once with `topic_id_for()` (C++) / `_topic_id_for()` (Python) —
-> idempotent, always returns the same id for the same name — and call the
-> numeric overload of `publish()` in the loop instead:
+> Calling `publish()` with a string name looks up and re-hashes that
+> string on every single call, which is fine once at startup but wastes
+> time if you do it on every message in a fast loop. Resolve the name to
+> its numeric id once with `topic_id_for()` (C++) / `_topic_id_for()`
+> (Python), then publish by that id instead:
 >
 > ```cpp
 > uint32_t topic_id = node.topic_id_for("/relink/temperature"); // once
@@ -353,13 +329,9 @@ node.subscribe<Float32>(101, [](const Float32& msg) { /* ... */ });
 > }
 > ```
 >
-> Measured effect (microbenchmark, no peers attached, isolating just the
-> resolution cost): the numeric overload costs **~26 ns/call**, the string
-> overload **~49 ns/call** — the FNV-1a hash + lock + registry lookup
-> roughly **doubles** per-call overhead versus a bare numeric id. At the
-> multi-hundred-kHz burst rates in Step 12, that difference is exactly
-> the kind of per-message tax that determines whether the sender or
-> receiver becomes the bottleneck first — resolve once, publish by id.
+> Roughly twice as fast per call as publishing by name — see [Step 15 —
+> Technical deep dive](#step-15--technical-deep-dive) for the measured
+> numbers.
 
 ### Review
 
@@ -909,29 +881,24 @@ type can and can't be punched through).
 
 ### AF_XDP — optional, and fully detachable
 
-`relink-relay` has an opt-in fast-path build flag,
-`-DRELINK_ENABLE_XDP`, that lets it bypass the Linux kernel's normal
-UDP receive path for lower latency (Step 12 has real measured numbers:
-~400-550 µs faster per round trip). It needs `libbpf`, `clang`, and
-Linux ≥ 5.1 to build, and root/`CAP_NET_ADMIN` to run.
-
-**You do not need any of this to use `relink-relay`.** It's off by
-default, and detaching it again is a matter of not passing the flag —
-there's no code to remove, no separate binary to maintain:
+`relink-relay` has an optional "fast mode" (`-DRELINK_ENABLE_XDP`) that
+makes it a bit faster (~400-550 µs per round trip, Step 12 has the
+numbers) at the cost of needing extra build tools and root access. It's
+off by default and safe to ignore — plain mode works everywhere with no
+extra setup:
 
 ```bash
 cd rlcore
-cmake -B build .                       # plain relay -- no AF_XDP, no extra dependencies
-cmake -B build . -DRELINK_ENABLE_XDP=ON  # same relay, faster RX path, needs libbpf + clang
+cmake -B build .                       # plain relay -- no extra dependencies
+cmake -B build . -DRELINK_ENABLE_XDP=ON  # same relay, faster, needs libbpf + clang
 cmake --build build
 ```
 
-If AF_XDP is enabled but the running kernel, NIC driver, or permissions
-don't actually support it, `relink-relay` detects that at startup and
-falls back to plain sockets automatically — it never hard-fails
-because AF_XDP isn't available. Missing build dependencies fail
-`cmake`'s configure step with the exact `apt-get install` line needed,
-rather than a confusing compile error.
+If fast mode is turned on but the machine can't actually support it,
+`relink-relay` notices at startup and quietly falls back to plain mode
+— it never refuses to run. See [Step 15 — Technical deep
+dive](#step-15--technical-deep-dive) for how it actually works under
+the hood.
 
 ### rlcore in plain terms
 
@@ -1413,7 +1380,7 @@ frame is already tolerated, see the troubleshooting table below).
 **Description:** Common symptoms, what they mean, and the fix, in one table.
 **Tutorial Level:** Beginner
 
-**◀ Previous:** [Step 13 — NAT traversal (cross-network nodes)](#step-13--nat-traversal-cross-network-nodes)
+**◀ Previous:** [Step 13 — NAT traversal (cross-network nodes)](#step-13--nat-traversal-cross-network-nodes) &nbsp;|&nbsp; **Next ▶:** [Step 15 — Technical deep dive](#step-15--technical-deep-dive)
 
 | What you see | What it means | Fix |
 |---|---|---|
@@ -1424,6 +1391,86 @@ frame is already tolerated, see the troubleshooting table below).
 | High packet loss at a high send rate | The receiver (especially Python) can't drain the socket as fast as it's being filled | Reduce the rate, or move that node to C++ (Step 12) — a bigger socket buffer only postpones this, see Step 8 |
 | A dropped/corrupted image frame | `Image` chunks have no retransmission — one lost UDP datagram drops the whole frame | Prefer a compressed payload (`image_compressed`) over raw frames (Step 8), and keep the subscriber callback fast |
 | `rl_topic` reports "no peers" right after starting a fresh node/tool pair | Multicast beacons only burst 3x in the first ~400ms, then go silent for 30-60s — starting the two sides even slightly apart can miss that window entirely | Start both sides together, or pass a longer `--timeout` to `rl_topic` so it catches the next sparse re-announce |
+
+---
+
+## Step 15 — Technical deep dive
+
+**Description:** The harder internals behind earlier steps — kernel-level details, exact measured numbers, and design tradeoffs — kept separate from the plain-language walkthrough above.
+**Tutorial Level:** Advanced
+
+**◀ Previous:** [Step 14 — Troubleshooting](#step-14--troubleshooting)
+
+Nothing here is required to use ReLink. Every earlier step works fully
+without reading this one — this is for when you want to know exactly
+*why*, not just *how*.
+
+### Why ReLink gives up ROS's generality
+
+ROS1's TCPROS pays a per-message connection-management tax and depends
+on a single master. ROS2's DDS fixes the master but replaces it with
+continuous multicast re-announcement (SPDP) that scales as O(N²) with
+node count and grows the longer a system stays up. Neither was designed
+around a hard real-time latency floor — both were designed around
+generality (arbitrary QoS, arbitrary transports, arbitrary
+serialization), and generality has a cost. ReLink gives up that
+generality — one message type per topic, no reliable-transport path in
+v1, no schema evolution — in exchange for a fixed-layout message over
+raw UDP, discovered once (not re-announced forever), serialized by a
+straight `memcpy`, dispatched on a dedicated thread with no lock in the
+hot path. See [Step 0](#step-0--what-relink-actually-is) for the
+plain-language summary and [Step 12](#step-12--benchmarks) for the
+measured numbers this buys.
+
+### `network_id` — why both the address and the port have to change
+
+Mode B's multicast domain isolation ([Step 3](#step-3--pick-a-discovery-mode))
+makes nodes with different `network_id` values join different
+multicast group addresses *and* different ports. Both have to vary
+together: an earlier design that only shifted the address (mirroring
+the address-shifting half of how ROS assigns domains) turned out to
+leak across domains on Linux specifically, because
+`MulticastDiscovery`'s listener socket sets `SO_REUSEPORT` (needed so
+several ReLink nodes can share one host on the same multicast port) —
+and `SO_REUSEPORT`'s delivery selection is scoped by port only, so two
+sockets bound to the *same port* but joined to *different* multicast
+addresses still both received a beacon meant for only one of them, a
+directly-reproduced kernel behavior on this project's own test machine.
+Varying the port too sidesteps it entirely. No beacon wire-format
+change — isolation is entirely about which address/port a node's
+socket joins, not anything inside the packet. Verified: same
+`network_id` on both sides (including cross-language, C++ publisher to
+Python subscriber) discovers and delivers correctly; different values
+produce zero cross-talk in either direction.
+
+### Named-topic resolution cost (Step 4)
+
+Every call to the string overload (`publish<T>(name, ...)`,
+`advertise<T>(name, ...)`, `subscribe<T>(name, ...)`) re-hashes the
+string (FNV-1a over every character), takes the node's internal lock,
+and does a registry lookup+comparison — every single call, not just the
+first. Measured effect (microbenchmark, no peers attached, isolating
+just the resolution cost): the numeric overload costs **~26 ns/call**,
+the string overload **~49 ns/call** — the FNV-1a hash + lock + registry
+lookup roughly **doubles** per-call overhead versus a bare numeric id.
+At the multi-hundred-kHz burst rates in [Step 12](#step-12--benchmarks),
+that difference is exactly the kind of per-message tax that determines
+whether the sender or receiver becomes the bottleneck first — resolve
+once with `topic_id_for()`/`_topic_id_for()`, publish by id.
+
+### AF_XDP fast path, under the hood
+
+`cpp/rlcore/relink_relay.cpp`, built with `-DRELINK_ENABLE_XDP`, has
+the relay bypass the Linux kernel's normal UDP receive path for matched
+traffic via a native/driver-mode XDP program + AF_XDP socket (falls
+back to a plain socket automatically if the kernel/driver/toolchain
+don't support it — see `cpp/rlcore/xdp/relay_xdp.hpp`). It needs
+`libbpf`, `clang`, and Linux ≥ 5.1 to build, and root/`CAP_NET_ADMIN`
+to run — none of which are needed for the plain-socket relay ([Step
+9](#step-9--running-the-rlcore-daemon)). Missing build dependencies
+fail `cmake`'s configure step with the exact `apt-get install` line
+needed, rather than a confusing compile error. Measured numbers for
+this path are in [Step 12's AF_XDP section](#af_xdp-fast-path).
 
 ---
 
