@@ -2,8 +2,8 @@
 
 # ReLink-COM
 
-**A lightweight, ROS-like publish/subscribe protocol over UDP — built to be
-faster and simpler than ROS1/ROS2.**
+**A lightweight publish/subscribe protocol over UDP for sub-millisecond,
+high-frequency control loops between a known set of nodes on a LAN.**
 
 ![C++17](https://img.shields.io/badge/C%2B%2B-17-blue)
 ![Python](https://img.shields.io/badge/Python-3.8%2B-blue)
@@ -85,14 +85,16 @@ Come back to this table any time a word below doesn't make sense yet.
 | **Wire format** | The literal byte layout of every packet — documented, not just implied by a struct definition. A from-scratch reimplementation in any language that can open a UDP socket can speak ReLink. |
 | **rlcore** | The optional small daemon used for Mode A discovery. Not required — Mode B (multicast) needs no daemon at all. |
 
-> **Why this exists, in short:** ROS1 and ROS2 are built to be general —
-> any transport, any QoS policy, any serialization — and that generality
-> costs speed and simplicity. ReLink gives up most of that generality on
-> purpose (one fixed message type per topic, no built-in retry) to get a
-> much simpler, much faster path instead. Measured head-to-head against
-> ROS2 Humble on identical hardware/payload/rate (Step 12): **~3x lower
-> average latency, ~10x lower worst-case tail latency**. The full
-> technical reasoning is in [Step 15 — Technical deep
+> **Why this exists, in short:** high-frequency control loops (sensor
+> fusion, joint-state streaming, a planner talking to a driver) need
+> predictable, low tail latency more than they need general-purpose
+> transport flexibility. ReLink is built around that one requirement —
+> one fixed message type per topic, no built-in retry, a documented
+> fixed-layout wire format — to get a simple, fast, predictable path for
+> exactly that workload. Measured on identical hardware/payload/rate
+> against a general-purpose pub/sub stack (Step 12): **~3x lower average
+> latency, ~10x lower worst-case tail latency**. The full technical
+> reasoning is in [Step 15 — Technical deep
 > dive](#step-15--technical-deep-dive).
 
 If your system needs TCP reliability, arbitrary QoS policies, or schema
