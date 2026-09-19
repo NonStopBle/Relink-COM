@@ -27,8 +27,8 @@ class ImuReading(ctypes.Structure):
     ]
 
 
-TOPIC_IMU = 100
-TOPIC_TEMP = 101
+TOPIC_IMU = "/relink/imu"
+TOPIC_TEMP = "/relink/temp"
 
 
 def now_us() -> int:
@@ -40,7 +40,7 @@ def main():
         print(f"usage: {sys.argv[0]} [pub|sub] [rlcore_ip]", file=sys.stderr)
         return 1
     is_publisher = sys.argv[1] == "pub"
-    rlcore_ip = sys.argv[2] if len(sys.argv) > 2 else "10.0.0.5"
+    rlcore_ip = sys.argv[2] if len(sys.argv) > 2 else "127.0.0.1"
 
     node = RelinkNode()
     node.set_rlcore.ip(rlcore_ip)

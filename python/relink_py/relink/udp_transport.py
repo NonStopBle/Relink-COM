@@ -12,6 +12,7 @@ core for the performance target.
 """
 
 import collections
+import queue
 import socket
 import struct
 import threading
@@ -56,6 +57,18 @@ class UdpTransport:
         # catches a duplicate arriving reasonably out of order.
         self._recent_seqs: Dict[int, "collections.deque"] = {}  # topic_id -> deque[seq_num]
         self._want_large_buffers = False
+        # Once start() launches _run_loop, that thread owns recvfrom() on
+        # this socket and will win the race against any other caller
+        # blocking on recvfrom() of the same fd (e.g. a periodic rlcore
+        # re-registration call waiting for its RegisterAck) essentially
+        # every time, regardless of traffic rate -- confirmed happening
+        # identically at 100Hz and 10000Hz, so it's a two-readers-one-
+        # socket race, not a load/GIL effect. A RegisterAck/RegisterAck-
+        # shaped packet fails decode_frame() (not spec's wire format), so
+        # _recv_and_dispatch() hands it to this queue instead of silently
+        # dropping it, and a waiting registration call reads from here
+        # instead of calling recvfrom() itself. See get_register_reply().
+        self._register_reply_queue: "queue.Queue[bytes]" = queue.Queue()
 
     def enable_large_buffers(self):
         """Opts this node's socket into a larger send/receive buffer.
@@ -114,6 +127,19 @@ class UdpTransport:
     def set_topic_handler(self, topic_id: int, callback: RawTopicCallback):
         with self._handlers_lock:
             self._handlers[topic_id] = callback
+
+    def is_running(self) -> bool:
+        return self._running.is_set()
+
+    def get_register_reply(self, timeout: float) -> Optional[bytes]:
+        """Blocks for up to `timeout` seconds for a non-frame packet (a
+        RegisterAck) that arrived on this socket after start(), handed
+        off by _recv_and_dispatch() instead of raced for directly. See
+        the note on _register_reply_queue in __init__."""
+        try:
+            return self._register_reply_queue.get(timeout=timeout)
+        except queue.Empty:
+            return None
 
     def next_seq(self) -> int:
         """Draws a fresh seq_num without sending -- so a caller that will
@@ -220,7 +246,21 @@ class UdpTransport:
 
     def _recv_and_dispatch(self) -> bool:
         try:
-            data, _addr = self._sock.recvfrom(MAX_FRAME_BYTES)
+            # NOT MAX_FRAME_BYTES here: this socket also carries
+            # RegisterAck replies (see _register_reply_queue above),
+            # which have no relation to the data-frame payload cap
+            # (MAX_PAYLOAD_BYTES=1400) -- a rlcore reply listing many
+            # peers (e.g. 1000 topics x offered peers) can be several KB.
+            # recvfrom()'s length argument is a hard truncation point for
+            # UDP (the kernel discards anything past it, silently, no
+            # error), so a too-small buffer here doesn't just clip a
+            # frame, it corrupts a legitimate large RegisterAck into
+            # something decode_register_ack() rejects -- which look
+            # exactly like "rlcore never replied" from the caller's side
+            # even though rlcore's own log shows it did. 65507 is the
+            # largest possible UDP datagram (IPv4), so this can never
+            # truncate anything real.
+            data, _addr = self._sock.recvfrom(65507)
         except socket.timeout:
             return False
         except OSError:
@@ -229,7 +269,15 @@ class UdpTransport:
         try:
             frame = decode_frame(data)
         except FrameError:
-            return False  # drop silently, per spec
+            # Not a data frame -- most likely a RegisterAck reply for a
+            # register_with_rlcore_on_socket() call waiting on this same
+            # socket (see _register_reply_queue). Hand it off instead of
+            # dropping so that call doesn't lose the race for recvfrom().
+            try:
+                self._register_reply_queue.put_nowait(data)
+            except queue.Full:
+                pass
+            return False
 
         if self._relay_dedup_enabled and self._is_recent_duplicate(frame.topic_id, frame.seq_num):
             return True  # exact duplicate (direct + relay both delivered it) -- drop

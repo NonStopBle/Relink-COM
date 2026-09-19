@@ -29,11 +29,20 @@ import os
 import socket
 import struct
 import sys
+import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "relink_py"))
 from relink import topic_directory as tdir
 
 DEFAULT_PORT = 8445
+
+# A live node re-registers every 0.3s for as long as it's running (see
+# node.py's _rlcore_reregister_interval) -- a registration this stale
+# means the process exited (or died) without rlcore ever finding out,
+# since there's no unregister-on-close message on this wire protocol.
+# ~10x the reregister interval gives plenty of margin for a slow/missed
+# tick without treating a genuinely dead node as still alive for long.
+REGISTRATION_TTL_S = 3.0
 
 REQ_HEADER_FMT = "<IHH"     # node_ip, node_port, topic_count
 REQ_HEADER_LEN = struct.calcsize(REQ_HEADER_FMT)
@@ -74,6 +83,13 @@ def main():
 
     table = {}  # topic_id -> set of (ip, port)
 
+    # (topic_id, ip, port) -> time.time() of its most recent
+    # RegisterRequest -- lets prune_stale() below evict a registration
+    # once its owning node stops re-registering (closed/crashed), so
+    # `rl_topic.py list`/`info` and peer discovery both stop treating a
+    # dead node's topics as live. See REGISTRATION_TTL_S.
+    last_seen = {}
+
     # topic_id -> name, accumulated from RLNM announces sent by any node
     # registered here (see relink_py/relink/topic_directory.py) -- lets
     # rl_topic.py ask rlcore for every topic name any node in this fleet
@@ -81,8 +97,54 @@ def main():
     # node individually.
     topic_names = {}
 
+    # (topic_id, ip, port) -> role bitmask (tdir.ROLE_PUBLISHER |
+    # tdir.ROLE_SUBSCRIBER), from periodic RLPA role announces -- lets
+    # `rl_topic.py info` show who's publishing vs subscribing a topic
+    # (see topic_directory.py's role-directory section for the wire
+    # protocol). Pruned by the same prune_stale() / TTL as registrations,
+    # via its own last-seen map below, since role announces are sent on
+    # the same periodic cadence as reregistration.
+    role_table = {}
+    role_last_seen = {}
+
+    def prune_stale():
+        now = time.time()
+        for topic in list(table.keys()):
+            live = {(ip, p) for (ip, p) in table[topic]
+                    if now - last_seen.get((topic, ip, p), 0.0) <= REGISTRATION_TTL_S}
+            for (ip, p) in table[topic] - live:
+                last_seen.pop((topic, ip, p), None)
+            if live:
+                table[topic] = live
+            else:
+                del table[topic]
+        for key in [k for k, ts in role_last_seen.items() if now - ts > REGISTRATION_TTL_S]:
+            role_last_seen.pop(key, None)
+            role_table.pop(key, None)
+
+    # Wake up periodically even with no incoming traffic, purely to run
+    # prune_stale() -- otherwise a fleet that goes quiet keeps every last
+    # registration "alive" forever, since nothing else ever calls it.
+    sock.settimeout(1.0)
+
     while True:
-        data, addr = sock.recvfrom(max(2048, tdir.MAX_PACKET))
+        # 65507 (largest possible UDP/IPv4 datagram), not
+        # max(2048, tdir.MAX_PACKET) (8192): a large RegisterRequest
+        # (many topics) or an RLNM announce chunk (up to
+        # tdir.MAX_ENTRIES=512 names) can legitimately exceed 8192 bytes
+        # -- e.g. 500 real topic names measured at 13506 bytes here --
+        # and recvfrom()'s length argument silently truncates anything
+        # past it at the kernel level for UDP, with no error raised.
+        # That corrupted the packet into something decode_entries()/
+        # decode_register_request() correctly rejects as malformed, so
+        # a real large-topic-count node's announce was dropped with no
+        # error printed anywhere, even though it was sent successfully.
+        try:
+            data, addr = sock.recvfrom(65507)
+        except socket.timeout:
+            prune_stale()
+            continue
+        prune_stale()
 
         kind = tdir.packet_kind(data)
         if kind == "announce":
@@ -92,13 +154,63 @@ def main():
                     topic_names[e.topic_id] = e.name
             continue
         if kind == "query":
-            entries = [tdir.TopicDirEntry(tid, name) for tid, name in topic_names.items()]
-            try:
-                sock.sendto(tdir.encode_reply(entries), addr)
-            except (ValueError, OSError):
-                pass
+            # tdir.chunk_entries(), not a raw MAX_ENTRIES slice: at real
+            # large-topic-count scale (e.g. ~1000 topics across a fleet)
+            # topic_names can need multiple RLNR reply packets, and
+            # MAX_ENTRIES alone doesn't guarantee each chunk's encoded
+            # size stays under MAX_PACKET once names have real-world
+            # length -- see chunk_entries()'s docstring. rl_topic.py's
+            # query_rlcore() collects every chunk sent here.
+            #
+            # Include every topic id `table` currently has a LIVE
+            # registration for (prune_stale() already dropped anything
+            # past REGISTRATION_TTL_S), not just ones that got a name via
+            # RLNM -- a topic advertised/subscribed with a raw numeric id
+            # (no string name) is real and actively routed, but would
+            # otherwise be completely invisible to `rl_topic.py list`.
+            # Such ids are sent with an empty name (wire format already
+            # supports name_len=0); topic_names still wins for anything
+            # named. Deliberately NOT unioned with topic_names' own keys:
+            # a name whose topic has no live registrant left (the node
+            # that announced it exited) must stop being listed too --
+            # that's the whole point of this bug fix.
+            entries = [tdir.TopicDirEntry(tid, topic_names.get(tid, "")) for tid in table.keys()]
+            for chunk in (tdir.chunk_entries(entries) or [[]]):
+                try:
+                    sock.sendto(tdir.encode_reply(chunk), addr)
+                except (ValueError, OSError):
+                    pass
             continue
         if kind == "reply":
+            continue  # rlcore never queries anyone itself
+
+        role_kind = tdir.role_packet_kind(data)
+        if role_kind == "role_announce":
+            # Always the OBSERVED UDP source, regardless of --nat -- this
+            # is purely diagnostic ("who is really talking to me on this
+            # topic"), and the observed source is always the true
+            # endpoint for that purpose, unlike node_ip/node_port in a
+            # RegisterRequest payload which self-reports a possibly
+            # private/unroutable address.
+            entries = tdir.decode_role_announce(data)
+            if entries is not None:
+                observed_ip = struct.unpack(">I", socket.inet_aton(addr[0]))[0]
+                now = time.time()
+                for e in entries:
+                    key = (e.topic_id, observed_ip, addr[1])
+                    role_table[key] = e.role
+                    role_last_seen[key] = now
+            continue
+        if role_kind == "role_query":
+            entries = [tdir.RolePeerEntry(tid, role, ip, port)
+                       for (tid, ip, port), role in role_table.items()]
+            for chunk in (tdir.chunk_role_peer_entries(entries) or [[]]):
+                try:
+                    sock.sendto(tdir.encode_role_reply(chunk), addr)
+                except (ValueError, OSError):
+                    pass
+            continue
+        if role_kind == "role_reply":
             continue  # rlcore never queries anyone itself
 
         decoded = decode_register_request(data)
@@ -122,8 +234,10 @@ def main():
         else:
             self_entry = (node_ip, node_port)
 
+        now = time.time()
         for topic in topics:
             table.setdefault(topic, set()).add(self_entry)
+            last_seen[(topic,) + self_entry] = now
 
         peers = []
         for topic in topics:

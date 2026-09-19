@@ -67,7 +67,10 @@ static void run_publisher(RelinkNode& node) {
     node.advertise_image(TOPIC_IMAGE_COMPRESSED);
     node.spin_once();
 
-    cv::VideoCapture cap(0);
+    // Force V4L2 explicitly -- OpenCV's default backend probing on some
+    // systems picks GStreamer, whose pipeline can fail outright at
+    // resolution/fps combinations V4L2 handles fine on the same camera.
+    cv::VideoCapture cap(0, cv::CAP_V4L2);
     if (!cap.isOpened()) {
         std::fprintf(stderr, "camera_stream: could not open /dev/video0\n");
         return;

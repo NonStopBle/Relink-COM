@@ -108,6 +108,40 @@ inline bool encode_topic_dir_reply(const std::vector<TopicDirEntry>& entries,
     return encode_topic_dir_entries(kTopicDirReplyMagic, entries, out, out_capacity, out_len);
 }
 
+// Splits `entries` into groups each safe to pass to
+// encode_topic_dir_announce()/encode_topic_dir_reply() in one packet --
+// respecting BOTH kTopicDirMaxEntries (a count cap) AND
+// kTopicDirMaxPacket (a byte-size cap), which are not automatically
+// consistent with each other: kTopicDirMaxEntries=512 entries of
+// real-length topic names (e.g. "/relink/stress/a2b_042") can easily
+// encode to ~13-14KB, well over kTopicDirMaxPacket=8192 -- so chunking
+// by kTopicDirMaxEntries alone can still hand encode_topic_dir_announce()
+// a batch that decode_topic_dir_entries() on the other end rejects
+// outright for being oversized. A caller with many entries and no idea
+// how long the names are has no other safe way to chunk. Returns an
+// empty vector for empty input (caller decides whether that still means
+// "send one empty packet" or "send nothing").
+inline std::vector<std::vector<TopicDirEntry>> chunk_topic_dir_entries(
+    const std::vector<TopicDirEntry>& entries) {
+    constexpr size_t kHeaderLen = kTopicDirMagicLen + sizeof(uint16_t);
+    std::vector<std::vector<TopicDirEntry>> chunks;
+    std::vector<TopicDirEntry> current;
+    size_t current_len = kHeaderLen;
+    for (const auto& e : entries) {
+        size_t entry_len = sizeof(uint32_t) + 1 + e.name.size();
+        if (!current.empty() &&
+            (current.size() >= kTopicDirMaxEntries || current_len + entry_len > kTopicDirMaxPacket)) {
+            chunks.push_back(std::move(current));
+            current = std::vector<TopicDirEntry>();
+            current_len = kHeaderLen;
+        }
+        current.push_back(e);
+        current_len += entry_len;
+    }
+    if (!current.empty()) chunks.push_back(std::move(current));
+    return chunks;
+}
+
 // Decodes an Announce or Reply payload (caller already checked the magic
 // via topic_dir_packet_kind). Returns false on any malformed/truncated
 // packet -- never partially fills `out`.
@@ -133,6 +167,196 @@ inline bool decode_topic_dir_entries(const uint8_t* buf, size_t len, std::vector
         entries.push_back(std::move(e));
     }
     if (off != len) return false; // trailing garbage: reject rather than silently accept
+    *out = std::move(entries);
+    return true;
+}
+
+// --- Topic role directory: WHO (ip:port) is publishing/subscribing a
+// topic, separate from the name directory above (which only ever
+// carries a topic_id -> name mapping, never per-peer addresses or
+// roles). Answers `rl_topic.py info`'s "show p2p connection details"
+// need. See topic_directory.py's identical section for the full
+// rationale (kept there since Python mirrors this byte-for-byte).
+//
+// Wire shape:
+//   RLPA (role announce, node -> rlcore, periodic): magic(4) count(u16)
+//     + count * { topic_id(u32) role(u8) }
+//   RLPQ (role query, rl_topic -> rlcore): magic(4), nothing else
+//   RLPR (role reply, rlcore -> rl_topic): magic(4) count(u16)
+//     + count * { topic_id(u32) role(u8) ip(u32, host order) port(u16) }
+
+inline constexpr char kRoleAnnounceMagic[kTopicDirMagicLen] = {'R', 'L', 'P', 'A'};
+inline constexpr char kRoleQueryMagic[kTopicDirMagicLen]    = {'R', 'L', 'P', 'Q'};
+inline constexpr char kRoleReplyMagic[kTopicDirMagicLen]    = {'R', 'L', 'P', 'R'};
+
+inline constexpr uint8_t kRolePublisher = 1;
+inline constexpr uint8_t kRoleSubscriber = 2;
+
+inline constexpr size_t kRoleMaxEntries = 2048;
+inline constexpr size_t kRoleMaxPacket = 8192;
+
+enum class RoleDirKind { Announce, Query, Reply, Unknown };
+
+inline RoleDirKind role_packet_kind(const uint8_t* buf, size_t len) {
+    if (len < kTopicDirMagicLen) return RoleDirKind::Unknown;
+    if (std::memcmp(buf, kRoleAnnounceMagic, kTopicDirMagicLen) == 0) return RoleDirKind::Announce;
+    if (std::memcmp(buf, kRoleQueryMagic, kTopicDirMagicLen) == 0) return RoleDirKind::Query;
+    if (std::memcmp(buf, kRoleReplyMagic, kTopicDirMagicLen) == 0) return RoleDirKind::Reply;
+    return RoleDirKind::Unknown;
+}
+
+inline bool encode_role_query(uint8_t* out, size_t out_capacity, size_t* out_len) {
+    if (out_capacity < kTopicDirMagicLen) return false;
+    std::memcpy(out, kRoleQueryMagic, kTopicDirMagicLen);
+    *out_len = kTopicDirMagicLen;
+    return true;
+}
+
+struct RoleAnnounceEntry {
+    uint32_t topic_id;
+    uint8_t role;
+};
+
+struct RolePeerEntry {
+    uint32_t topic_id;
+    uint8_t role;
+    uint32_t ip;
+    uint16_t port;
+};
+
+inline std::vector<std::vector<RoleAnnounceEntry>> chunk_role_announce_entries(
+    const std::vector<RoleAnnounceEntry>& entries) {
+    constexpr size_t kEntryLen = sizeof(uint32_t) + 1;
+    constexpr size_t kHeaderLen = kTopicDirMagicLen + sizeof(uint16_t);
+    std::vector<std::vector<RoleAnnounceEntry>> chunks;
+    std::vector<RoleAnnounceEntry> current;
+    size_t current_len = kHeaderLen;
+    for (const auto& e : entries) {
+        if (!current.empty() &&
+            (current.size() >= kRoleMaxEntries || current_len + kEntryLen > kRoleMaxPacket)) {
+            chunks.push_back(std::move(current));
+            current = std::vector<RoleAnnounceEntry>();
+            current_len = kHeaderLen;
+        }
+        current.push_back(e);
+        current_len += kEntryLen;
+    }
+    if (!current.empty()) chunks.push_back(std::move(current));
+    return chunks;
+}
+
+inline bool encode_role_announce(const std::vector<RoleAnnounceEntry>& entries,
+                                  uint8_t* out, size_t out_capacity, size_t* out_len) {
+    if (entries.size() > kRoleMaxEntries) return false;
+    size_t off = 0;
+    if (out_capacity < kTopicDirMagicLen + sizeof(uint16_t)) return false;
+    std::memcpy(out + off, kRoleAnnounceMagic, kTopicDirMagicLen);
+    off += kTopicDirMagicLen;
+    uint16_t count = static_cast<uint16_t>(entries.size());
+    std::memcpy(out + off, &count, sizeof(count));
+    off += sizeof(count);
+    for (const auto& e : entries) {
+        constexpr size_t kEntryLen = sizeof(uint32_t) + 1;
+        if (off + kEntryLen > out_capacity) return false;
+        std::memcpy(out + off, &e.topic_id, sizeof(e.topic_id));
+        off += sizeof(e.topic_id);
+        out[off++] = e.role;
+    }
+    *out_len = off;
+    return true;
+}
+
+inline bool decode_role_announce(const uint8_t* buf, size_t len, std::vector<RoleAnnounceEntry>* out) {
+    if (len < kTopicDirMagicLen + sizeof(uint16_t) || len > kRoleMaxPacket) return false;
+    size_t off = kTopicDirMagicLen;
+    uint16_t count;
+    std::memcpy(&count, buf + off, sizeof(count));
+    off += sizeof(count);
+    if (count > kRoleMaxEntries) return false;
+    std::vector<RoleAnnounceEntry> entries;
+    entries.reserve(count);
+    for (uint16_t i = 0; i < count; ++i) {
+        if (off + sizeof(uint32_t) + 1 > len) return false;
+        RoleAnnounceEntry e{};
+        std::memcpy(&e.topic_id, buf + off, sizeof(e.topic_id));
+        off += sizeof(e.topic_id);
+        e.role = buf[off++];
+        entries.push_back(e);
+    }
+    if (off != len) return false;
+    *out = std::move(entries);
+    return true;
+}
+
+inline std::vector<std::vector<RolePeerEntry>> chunk_role_peer_entries(
+    const std::vector<RolePeerEntry>& entries) {
+    constexpr size_t kEntryLen = sizeof(uint32_t) + 1 + sizeof(uint32_t) + sizeof(uint16_t);
+    constexpr size_t kHeaderLen = kTopicDirMagicLen + sizeof(uint16_t);
+    std::vector<std::vector<RolePeerEntry>> chunks;
+    std::vector<RolePeerEntry> current;
+    size_t current_len = kHeaderLen;
+    for (const auto& e : entries) {
+        if (!current.empty() &&
+            (current.size() >= kRoleMaxEntries || current_len + kEntryLen > kRoleMaxPacket)) {
+            chunks.push_back(std::move(current));
+            current = std::vector<RolePeerEntry>();
+            current_len = kHeaderLen;
+        }
+        current.push_back(e);
+        current_len += kEntryLen;
+    }
+    if (!current.empty()) chunks.push_back(std::move(current));
+    return chunks;
+}
+
+inline bool encode_role_reply(const std::vector<RolePeerEntry>& entries,
+                               uint8_t* out, size_t out_capacity, size_t* out_len) {
+    if (entries.size() > kRoleMaxEntries) return false;
+    size_t off = 0;
+    if (out_capacity < kTopicDirMagicLen + sizeof(uint16_t)) return false;
+    std::memcpy(out + off, kRoleReplyMagic, kTopicDirMagicLen);
+    off += kTopicDirMagicLen;
+    uint16_t count = static_cast<uint16_t>(entries.size());
+    std::memcpy(out + off, &count, sizeof(count));
+    off += sizeof(count);
+    for (const auto& e : entries) {
+        constexpr size_t kEntryLen = sizeof(uint32_t) + 1 + sizeof(uint32_t) + sizeof(uint16_t);
+        if (off + kEntryLen > out_capacity) return false;
+        std::memcpy(out + off, &e.topic_id, sizeof(e.topic_id));
+        off += sizeof(e.topic_id);
+        out[off++] = e.role;
+        std::memcpy(out + off, &e.ip, sizeof(e.ip));
+        off += sizeof(e.ip);
+        std::memcpy(out + off, &e.port, sizeof(e.port));
+        off += sizeof(e.port);
+    }
+    *out_len = off;
+    return true;
+}
+
+inline bool decode_role_reply(const uint8_t* buf, size_t len, std::vector<RolePeerEntry>* out) {
+    if (len < kTopicDirMagicLen + sizeof(uint16_t) || len > kRoleMaxPacket) return false;
+    size_t off = kTopicDirMagicLen;
+    uint16_t count;
+    std::memcpy(&count, buf + off, sizeof(count));
+    off += sizeof(count);
+    if (count > kRoleMaxEntries) return false;
+    std::vector<RolePeerEntry> entries;
+    entries.reserve(count);
+    constexpr size_t kEntryLen = sizeof(uint32_t) + 1 + sizeof(uint32_t) + sizeof(uint16_t);
+    for (uint16_t i = 0; i < count; ++i) {
+        if (off + kEntryLen > len) return false;
+        RolePeerEntry e{};
+        std::memcpy(&e.topic_id, buf + off, sizeof(e.topic_id));
+        off += sizeof(e.topic_id);
+        e.role = buf[off++];
+        std::memcpy(&e.ip, buf + off, sizeof(e.ip));
+        off += sizeof(e.ip);
+        std::memcpy(&e.port, buf + off, sizeof(e.port));
+        off += sizeof(e.port);
+        entries.push_back(e);
+    }
+    if (off != len) return false;
     *out = std::move(entries);
     return true;
 }

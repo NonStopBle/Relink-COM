@@ -38,6 +38,8 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <unistd.h>
+#include <sys/time.h>
+#include <chrono>
 
 using namespace relink;
 
@@ -48,6 +50,19 @@ struct PeerEntry {
         return std::tie(ip, port) < std::tie(o.ip, o.port);
     }
 };
+
+// A live node re-registers every 0.3s for as long as it's running (see
+// relink.hpp's rlcore reregister interval) -- a registration this stale
+// means the process exited (or died) without rlcore ever finding out,
+// since there's no unregister-on-close message on this wire protocol.
+// ~10x the reregister interval gives plenty of margin for a slow/missed
+// tick without treating a genuinely dead node as still alive for long.
+static constexpr double kRegistrationTtlSec = 3.0;
+
+static double now_sec() {
+    return std::chrono::duration<double>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
 
 int main(int argc, char** argv) {
     uint16_t port = kRlCoreDefaultPort;
@@ -78,6 +93,54 @@ int main(int argc, char** argv) {
     // topic_id -> set of peers registered for it
     std::map<uint32_t, std::set<PeerEntry>> table;
 
+    // (topic_id, peer) -> time of its most recent RegisterRequest --
+    // lets prune_stale() below evict a registration once its owning node
+    // stops re-registering (closed/crashed), so `rl_topic.py list`/
+    // `info` and peer discovery both stop treating a dead node's topics
+    // as live. See kRegistrationTtlSec.
+    std::map<std::pair<uint32_t, PeerEntry>, double> last_seen;
+
+    // (topic_id, peer) -> role bitmask (kRolePublisher | kRoleSubscriber),
+    // from periodic RLPA role announces -- lets `rl_topic.py info` show
+    // who's publishing vs subscribing a topic. Pruned by the same TTL as
+    // registrations, via its own last-seen map, since role announces are
+    // sent on the same periodic cadence as reregistration.
+    std::map<std::pair<uint32_t, PeerEntry>, uint8_t> role_table;
+    std::map<std::pair<uint32_t, PeerEntry>, double> role_last_seen;
+
+    auto prune_stale = [&]() {
+        double now = now_sec();
+        for (auto it = table.begin(); it != table.end(); ) {
+            auto& peers = it->second;
+            for (auto pit = peers.begin(); pit != peers.end(); ) {
+                auto ls = last_seen.find({it->first, *pit});
+                double age = (ls != last_seen.end()) ? (now - ls->second) : kRegistrationTtlSec + 1;
+                if (age > kRegistrationTtlSec) {
+                    if (ls != last_seen.end()) last_seen.erase(ls);
+                    pit = peers.erase(pit);
+                } else {
+                    ++pit;
+                }
+            }
+            if (peers.empty()) it = table.erase(it);
+            else ++it;
+        }
+        for (auto it = role_last_seen.begin(); it != role_last_seen.end(); ) {
+            if (now - it->second > kRegistrationTtlSec) {
+                role_table.erase(it->first);
+                it = role_last_seen.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    };
+
+    // Wake up periodically even with no incoming traffic, purely to run
+    // prune_stale() -- otherwise a fleet that goes quiet keeps every last
+    // registration "alive" forever, since nothing else ever calls it.
+    struct timeval recv_timeout{1, 0};
+    ::setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &recv_timeout, sizeof(recv_timeout));
+
     // topic_id -> name, accumulated from RLNM announces sent by any node
     // registered here (see topic_directory.hpp) -- lets rl_topic.py ask
     // rlcore for "every topic name any node in this fleet has ever
@@ -85,14 +148,24 @@ int main(int argc, char** argv) {
     // node individually.
     std::map<uint32_t, std::string> topic_names;
 
-    uint8_t recv_buf[2048];
-    uint8_t send_buf[8192];
+    // 65507 (largest possible UDP/IPv4 datagram), not a smaller fixed
+    // size: a RegisterRequest with many topics or an RLNM announce with
+    // real topic names can legitimately exceed a couple KB, and
+    // recvfrom()'s length argument silently truncates anything past it
+    // at the kernel level for UDP -- no error, just corrupted data that
+    // decode_register_request()/decode_topic_dir_entries() then
+    // correctly reject as malformed, even though the sender sent a
+    // perfectly valid packet. Measured: 500 real topic names produced a
+    // 13506-byte announce, well past the original 2048-byte recv_buf.
+    uint8_t recv_buf[65507];
+    uint8_t send_buf[65507];
 
     while (true) {
         struct sockaddr_in src{};
         socklen_t src_len = sizeof(src);
         ssize_t n = ::recvfrom(sock, recv_buf, sizeof(recv_buf), 0,
                                 reinterpret_cast<struct sockaddr*>(&src), &src_len);
+        prune_stale();
         if (n <= 0) continue;
 
         TopicDirKind dir_kind = topic_dir_packet_kind(recv_buf, static_cast<size_t>(n));
@@ -104,17 +177,83 @@ int main(int argc, char** argv) {
             continue;
         }
         if (dir_kind == TopicDirKind::Query) {
+            // Include every topic id `table` currently has a LIVE
+            // registration for (prune_stale() already dropped anything
+            // past kRegistrationTtlSec), not just ones that got a name
+            // via RLNM -- a topic advertised/subscribed with a raw
+            // numeric id (no string name) is real and actively routed,
+            // but would otherwise be completely invisible to
+            // `rl_topic.py list`. Such ids are sent with an empty name
+            // (wire format already supports name_len=0); topic_names
+            // still wins for anything named. Deliberately NOT unioned
+            // with topic_names' own keys: a name whose topic has no live
+            // registrant left (the node that announced it exited) must
+            // stop being listed too -- that's the whole point of this
+            // bug fix.
             std::vector<TopicDirEntry> entries;
-            entries.reserve(topic_names.size());
-            for (const auto& kv : topic_names) entries.push_back(TopicDirEntry{kv.first, kv.second});
-            size_t reply_len = 0;
-            if (encode_topic_dir_reply(entries, send_buf, sizeof(send_buf), &reply_len)) {
-                ::sendto(sock, send_buf, reply_len, 0,
-                         reinterpret_cast<struct sockaddr*>(&src), src_len);
+            entries.reserve(table.size());
+            for (const auto& kv : table) {
+                auto it = topic_names.find(kv.first);
+                entries.push_back(TopicDirEntry{kv.first, it != topic_names.end() ? it->second : std::string()});
+            }
+            // chunk_topic_dir_entries(), not one encode_topic_dir_reply()
+            // call: at real large-topic-count scale (e.g. ~1000 topics
+            // across a fleet) topic_names can need multiple RLNR reply
+            // packets -- see that function's doc comment. rl_topic's
+            // query_rlcore() collects every chunk sent here. An empty
+            // topic_names still sends one empty reply, matching the
+            // original single-packet behavior.
+            auto chunks = chunk_topic_dir_entries(entries);
+            if (chunks.empty()) chunks.emplace_back();
+            for (const auto& chunk : chunks) {
+                size_t reply_len = 0;
+                if (encode_topic_dir_reply(chunk, send_buf, sizeof(send_buf), &reply_len)) {
+                    ::sendto(sock, send_buf, reply_len, 0,
+                             reinterpret_cast<struct sockaddr*>(&src), src_len);
+                }
             }
             continue;
         }
         if (dir_kind == TopicDirKind::Reply) continue; // rlcore never queries anyone itself
+
+        RoleDirKind role_kind = role_packet_kind(recv_buf, static_cast<size_t>(n));
+        if (role_kind == RoleDirKind::Announce) {
+            // Always the OBSERVED UDP source, regardless of --nat --
+            // this is purely diagnostic ("who is really talking to me on
+            // this topic"), and the observed source is always the true
+            // endpoint for that purpose, unlike node_ip/node_port in a
+            // RegisterRequest payload which self-reports a possibly
+            // private/unroutable address.
+            std::vector<RoleAnnounceEntry> entries;
+            if (decode_role_announce(recv_buf, static_cast<size_t>(n), &entries)) {
+                PeerEntry observed{ntohl(src.sin_addr.s_addr), ntohs(src.sin_port)};
+                double reg_now = now_sec();
+                for (const auto& e : entries) {
+                    auto key = std::make_pair(e.topic_id, observed);
+                    role_table[key] = e.role;
+                    role_last_seen[key] = reg_now;
+                }
+            }
+            continue;
+        }
+        if (role_kind == RoleDirKind::Query) {
+            std::vector<RolePeerEntry> entries;
+            entries.reserve(role_table.size());
+            for (const auto& kv : role_table) {
+                entries.push_back(RolePeerEntry{kv.first.first, kv.second, kv.first.second.ip, kv.first.second.port});
+            }
+            auto chunks = chunk_role_peer_entries(entries);
+            if (chunks.empty()) chunks.emplace_back();
+            for (const auto& chunk : chunks) {
+                size_t reply_len = 0;
+                if (encode_role_reply(chunk, send_buf, sizeof(send_buf), &reply_len)) {
+                    ::sendto(sock, send_buf, reply_len, 0,
+                             reinterpret_cast<struct sockaddr*>(&src), src_len);
+                }
+            }
+            continue;
+        }
+        if (role_kind == RoleDirKind::Reply) continue; // rlcore never queries anyone itself
 
         DecodedRegisterRequest req{};
         if (decode_register_request(recv_buf, static_cast<size_t>(n), &req) != RegisterDecodeResult::Ok) {
@@ -136,9 +275,11 @@ int main(int argc, char** argv) {
         }
 
         // Update table with this node's info for each topic it declared.
+        double reg_now = now_sec();
         for (uint16_t i = 0; i < req.topic_count; ++i) {
             uint32_t topic = register_request_topic_at(req, i);
             table[topic].insert(self);
+            last_seen[{topic, self}] = reg_now;
         }
 
         // Build the peer list: every (ip,port,topic) for the requester's

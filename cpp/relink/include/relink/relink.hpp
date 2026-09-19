@@ -98,8 +98,15 @@ public:
     ~RelinkNode() {
         repunch_stop_ = true;
         if (repunch_thread_.joinable()) repunch_thread_.join();
+        rlcore_reregister_stop_ = true;
+        if (rlcore_reregister_thread_.joinable()) rlcore_reregister_thread_.join();
         relay_stop_ = true;
         if (relay_keepalive_thread_.joinable()) relay_keepalive_thread_.join();
+        if (initial_punch_thread_.joinable()) initial_punch_thread_.join();
+        {
+            std::lock_guard<std::mutex> lock(punch_threads_mutex_);
+            for (auto& t : punch_threads_) if (t.joinable()) t.join();
+        }
     }
 
     // Opt-in background re-punch: instead of firing the NAT hole-punch
@@ -247,6 +254,7 @@ public:
         }
         std::lock_guard<std::mutex> lock(state_mutex_);
         declared_topics_.insert(topic_id);
+        advertised_topics_.insert(topic_id);
     }
 
     // --- subscribe: receiver-side topic declaration + typed callback,
@@ -267,6 +275,7 @@ public:
         {
             std::lock_guard<std::mutex> lock(state_mutex_);
             declared_topics_.insert(topic_id);
+            subscribed_topics_.insert(topic_id);
         }
         t.set_topic_handler(topic_id, [callback](const uint8_t* payload, size_t len) {
             if (len != sizeof(T)) return; // type/size mismatch: drop, never misinterpret bytes
@@ -290,6 +299,7 @@ public:
         transport_for(topic_id);
         std::lock_guard<std::mutex> lock(state_mutex_);
         declared_topics_.insert(topic_id);
+        advertised_topics_.insert(topic_id);
     }
 
     void subscribe_raw(const std::string& name, RawCallback callback) {
@@ -300,6 +310,7 @@ public:
         {
             std::lock_guard<std::mutex> lock(state_mutex_);
             declared_topics_.insert(topic_id);
+            subscribed_topics_.insert(topic_id);
         }
         t.set_topic_handler(topic_id, std::move(callback));
     }
@@ -313,6 +324,7 @@ public:
         {
             std::lock_guard<std::mutex> lock(state_mutex_);
             declared_topics_.insert(topic_id);
+            advertised_topics_.insert(topic_id);
             auto it = peers_.find(topic_id);
             if (it != peers_.end()) peers = it->second;
         }
@@ -466,6 +478,7 @@ public:
             std::lock_guard<std::mutex> lock(state_mutex_);
             image_reassemblers_.push_back(reassembler); // keep alive for node lifetime
             declared_topics_.insert(topic_id);
+            subscribed_topics_.insert(topic_id);
         }
         // Zero-copy receive path: publish_image() sends the compact
         // wire format (10-byte header + only the valid data bytes, not
@@ -648,20 +661,46 @@ private:
             uint32_t self_ip = detect_local_ip_for_peer(set_rlcore.resolved_ip(),
                                                          set_rlcore.resolved_port());
             for (const auto& g : groups) {
+                // Only ONE quick attempt here (not the 3-retry/
+                // exponential-backoff default, which can block
+                // ensure_started() for ~3.5s if rlcore happens to be
+                // briefly unreachable) -- the periodic re-registration
+                // thread started below retries every few seconds for
+                // the rest of the node's lifetime, so a slow/late rlcore
+                // is recovered from in the background instead of
+                // stalling startup.
                 auto outcome = register_with_rlcore_on_socket(
                     g.transport->native_handle(),
                     set_rlcore.resolved_ip(), set_rlcore.resolved_port(),
                     self_ip, g.transport->local_port(),
-                    g.topics.data(), static_cast<uint16_t>(g.topics.size()));
+                    g.topics.data(), static_cast<uint16_t>(g.topics.size()),
+                    /*max_retries=*/1, /*timeout_ms=*/300, g.transport);
                 if (outcome.ok) {
                     std::lock_guard<std::mutex> lock2(state_mutex_);
                     for (const auto& p : outcome.peers) {
-                        PeerAddr addr{p.ip, p.port};
-                        peers_[p.topic_id].push_back(addr);
+                        // Copy fields out of RegisterAckPeer (#pragma
+                        // pack(1) in wire.hpp) into plain locals before
+                        // using them -- p.topic_id lives at a non-4-byte-
+                        // aligned offset in the packed struct, and
+                        // passing it by reference straight into
+                        // unordered_map::operator[](const key_type&)
+                        // binds a reference to that misaligned address.
+                        // That's UB, and at -O2 it isn't just theoretical:
+                        // it actually crashed with a general protection
+                        // fault under real traffic (many peers in one
+                        // vector, e.g. the ~1000-topic large-scale test).
+                        uint32_t ip = p.ip;
+                        uint16_t port = p.port;
+                        uint32_t topic_id = p.topic_id;
+                        PeerAddr addr{ip, port};
+                        peers_[topic_id].push_back(addr);
                         newly_learned_peers.push_back({g.transport, addr});
                     }
                 }
             }
+            rlcore_self_ip_ = self_ip;
+            rlcore_groups_.clear();
+            for (const auto& g : groups) rlcore_groups_.emplace_back(g.transport, g.topics);
             // Tell rlcore about any names we resolved for these topics
             // (best-effort, fire-and-forget -- rl_topic.py's RLNQ query
             // to rlcore is what actually depends on this, not any
@@ -676,15 +715,31 @@ private:
                     for (const auto& kv : topic_names_) entries.push_back(TopicDirEntry{kv.first, kv.second});
                 }
                 if (!entries.empty()) {
-                    uint8_t announce_buf[kTopicDirMaxPacket];
-                    size_t announce_len = 0;
-                    if (encode_topic_dir_announce(entries, announce_buf, sizeof(announce_buf), &announce_len)) {
-                        struct sockaddr_in dest{};
-                        dest.sin_family = AF_INET;
-                        dest.sin_addr.s_addr = htonl(set_rlcore.resolved_ip());
-                        dest.sin_port = htons(set_rlcore.resolved_port());
-                        ::sendto(transport_.native_handle(), announce_buf, announce_len, 0,
-                                 reinterpret_cast<struct sockaddr*>(&dest), sizeof(dest));
+                    // chunk_topic_dir_entries(), not one
+                    // encode_topic_dir_announce() call: a real large-
+                    // topic-count system (e.g. ~1000 topics) easily
+                    // exceeds kTopicDirMaxEntries (512) in one node, and
+                    // a single encode_topic_dir_announce() call would
+                    // just return false and get silently skipped by the
+                    // check this replaces, dropping every name for that
+                    // node with no announce ever reaching rlcore even
+                    // though registration/data traffic worked fine
+                    // (different wire protocols) -- rl_topic list/info
+                    // would then see nothing despite everything else
+                    // running. See chunk_topic_dir_entries()'s doc
+                    // comment for why entry-count chunking alone isn't
+                    // enough either.
+                    struct sockaddr_in dest{};
+                    dest.sin_family = AF_INET;
+                    dest.sin_addr.s_addr = htonl(set_rlcore.resolved_ip());
+                    dest.sin_port = htons(set_rlcore.resolved_port());
+                    for (const auto& chunk : chunk_topic_dir_entries(entries)) {
+                        uint8_t announce_buf[kTopicDirMaxPacket];
+                        size_t announce_len = 0;
+                        if (encode_topic_dir_announce(chunk, announce_buf, sizeof(announce_buf), &announce_len)) {
+                            ::sendto(transport_.native_handle(), announce_buf, announce_len, 0,
+                                     reinterpret_cast<struct sockaddr*>(&dest), sizeof(dest));
+                        }
                     }
                 }
             }
@@ -767,8 +822,34 @@ private:
         // reachable directly). Uses the reserved kNatPunchTopicId, which
         // every node silently drops on receive since nothing ever
         // subscribes to it.
-        for (const auto& kv : newly_learned_peers) {
-            nat_punch(kv.second, *kv.first);
+        //
+        // Backgrounded, not run inline here: this whole ensure_started()
+        // call runs SYNCHRONOUSLY on the caller's own thread (the first
+        // publish()/spin_once() call). nat_punch() sleeps 30ms between
+        // each of 3 packets per peer, so at a handful of peers that's
+        // invisible, but at real large-system peer counts (e.g.
+        // ~500-1000, one per topic) it's peer_count * 3 * 30ms of
+        // blocking sleep on the caller's own thread -- measured ~45s for
+        // 500 peers, which starved the caller's entire publish loop for
+        // the whole duration of a test before it ever got to send a
+        // second message. Punching a moment later in the background
+        // costs nothing real (the reregister loop already punches
+        // newly-discovered peers the same asynchronous way -- see
+        // start_rlcore_reregister_thread()), so there's no reason for
+        // this one-time burst to block startup at all.
+        if (!newly_learned_peers.empty()) {
+            // A joinable member thread (joined in ~RelinkNode()), not
+            // detach(): a detached thread capturing `this` could still
+            // be running nat_punch() -> a member function call -- after
+            // this RelinkNode is destroyed, which is a use-after-free.
+            // Joining on destruction is always safe, at worst blocking
+            // destruction for as long as the burst itself takes.
+            auto pairs = newly_learned_peers;
+            initial_punch_thread_ = std::thread([this, pairs] {
+                for (const auto& kv : pairs) {
+                    nat_punch(kv.second, *kv.first);
+                }
+            });
         }
 
         // NAT mode (rlcore, the only mode --nat applies to) gets a 1s
@@ -784,6 +865,8 @@ private:
             repunch_interval_ = std::chrono::duration<double>(1.0);
         }
         if (repunch_enabled_) start_repunch_thread();
+
+        if (mode == DiscoveryMode::RlCore) start_rlcore_reregister_thread();
 
         if (relay_enabled_) {
             std::vector<std::pair<UdpTransport*, std::vector<uint32_t>>> relay_groups;
@@ -822,6 +905,14 @@ private:
     std::mutex state_mutex_;
     DiscoveryMode mode_ = DiscoveryMode::None;
     std::unordered_set<uint32_t> declared_topics_;
+    // Split out of declared_topics_ so rlcore can be told WHICH role
+    // this node plays per topic (see the periodic RLPA role-announce in
+    // start_rlcore_reregister_thread()), for `rl_topic.py info`'s p2p
+    // connection details (who publishes, who subscribes, by ip:port). A
+    // topic can be both (e.g. a loopback/echo test) -- not mutually
+    // exclusive.
+    std::unordered_set<uint32_t> advertised_topics_;
+    std::unordered_set<uint32_t> subscribed_topics_;
     std::unordered_map<uint32_t, std::vector<PeerAddr>> peers_;
     std::unordered_map<uint32_t, uint32_t> next_image_frame_id_;
     std::unordered_map<uint32_t, std::string> topic_names_;
@@ -858,6 +949,34 @@ private:
     std::chrono::duration<double> repunch_interval_{5.0};
     std::atomic<bool> repunch_stop_{false};
     std::thread repunch_thread_;
+
+    // rlcore registration is otherwise one-shot (see ensure_started()):
+    // a node only ever learns the peers that existed at ITS OWN startup
+    // moment, so whichever side starts earlier can never learn about a
+    // peer that registers later -- publish-before-subscribe or
+    // subscribe-before-publish both silently fail depending on order.
+    // This periodic re-registration thread removes that ordering
+    // requirement: every rlcore_reregister_interval_, re-send the same
+    // RegisterRequest used at startup and merge any newly-returned
+    // peers into peers_, so a late-joining peer gets picked up without
+    // either side needing a restart.
+    std::vector<std::pair<UdpTransport*, std::vector<uint32_t>>> rlcore_groups_;
+    uint32_t rlcore_self_ip_ = 0;
+    std::chrono::duration<double> rlcore_reregister_interval_{0.3};
+    std::atomic<bool> rlcore_reregister_stop_{false};
+    std::thread rlcore_reregister_thread_;
+
+    // Runs the initial NAT-punch burst for peers learned at startup, off
+    // the caller's own thread -- see the call site in ensure_started().
+    std::thread initial_punch_thread_;
+
+    // One background thread per newly-discovered-peer batch found by the
+    // periodic reregister loop (see start_rlcore_reregister_thread()) --
+    // joined in the destructor. A plain vector, not reused/pooled: these
+    // bursts are rare (one per discovery event, not per tick) and each
+    // is cheap to join once finished, so simplicity wins over pooling.
+    std::mutex punch_threads_mutex_;
+    std::vector<std::thread> punch_threads_;
 
     bool relay_enabled_ = false;
     uint32_t relay_ip_ = 0;
@@ -898,6 +1017,187 @@ private:
                 std::this_thread::sleep_for(std::chrono::seconds(10));
                 if (relay_stop_.load()) break;
                 register_all_topics_with_relay(groups);
+            }
+        });
+    }
+
+    void start_rlcore_reregister_thread() {
+        rlcore_reregister_thread_ = std::thread([this] {
+            int tick = 0;
+            while (!rlcore_reregister_stop_.load()) {
+                std::this_thread::sleep_for(
+                    std::chrono::duration_cast<std::chrono::milliseconds>(rlcore_reregister_interval_));
+                if (rlcore_reregister_stop_.load()) break;
+                ++tick;
+                // Snapshot the group list under the lock (rlcore_groups_
+                // never changes after ensure_started(), but read it
+                // consistently anyway), then re-register outside it --
+                // register_with_rlcore_on_socket() blocks up to its own
+                // timeout, and holding state_mutex_ across that would
+                // stall any publish/subscribe call on another thread.
+                // This reuses each group's own data socket (same
+                // NAT-traversal requirement as the initial registration);
+                // passing `g.first` (the owning UdpTransport) makes it
+                // wait on that transport's register-reply handoff queue
+                // instead of calling recvfrom() itself, so it no longer
+                // races the data thread for the same fd (that race used
+                // to make a single attempt per tick miss for several
+                // seconds straight at high message rates -- see
+                // UdpTransport::get_register_reply()). The multi-attempt
+                // retry stays regardless, since rlcore itself can still
+                // be briefly slow/unreachable independent of that fixed
+                // race: backoff still doubles per attempt (100ms, 200ms,
+                // 400ms, 800ms, 1.6s -- ~3.1s worst case).
+                std::vector<std::pair<UdpTransport*, std::vector<uint32_t>>> groups_copy;
+                uint32_t self_ip;
+                {
+                    std::lock_guard<std::mutex> lock(state_mutex_);
+                    groups_copy = rlcore_groups_;
+                    self_ip = rlcore_self_ip_;
+                }
+                // At many topics (e.g. 20+), re-registering every group
+                // every tick multiplies load on rlcore (a single-
+                // threaded server) and this node's own busy sockets by
+                // the topic count, which measurably increases loss
+                // instead of reducing it. Once a topic already has at
+                // least one known peer, skip it on most ticks -- only
+                // do a full sweep (every 10th tick) so a late-arriving
+                // SECOND peer for an already-satisfied topic still
+                // eventually gets picked up. A topic with no peer yet is
+                // always retried every tick, same as before.
+                //
+                // On non-full-sweep ticks, re-register only the topics
+                // in this group that still lack a peer, not the whole
+                // group -- the old all-or-nothing check (skip the group
+                // ONLY if every single topic has a peer) meant that in
+                // the default multiplex mode, where every declared topic
+                // sits in ONE shared group, a single still-unsatisfied
+                // topic out of e.g. 1000 made every tick re-send the
+                // FULL 1000-topic RegisterRequest again. At real
+                // large-system scale that self-inflicted storm (a ~4KB
+                // request + a multi-KB ack, every 300ms, indefinitely)
+                // starved rlcore's single-threaded recv loop badly enough
+                // that the two ends' registrations kept losing the race
+                // asymmetrically -- one side converged to ~99% delivery,
+                // the other got stuck under 15% for the whole test, with
+                // the deficit never recovering because the flood never
+                // stopped. Registering only the pending subset keeps the
+                // request small once most topics are already satisfied.
+                bool full_sweep = (tick % 10 == 0);
+                for (const auto& g : groups_copy) {
+                    if (rlcore_reregister_stop_.load()) break;
+                    // Tell rlcore who's publishing/subscribing each of
+                    // this group's topics, every tick (not gated by
+                    // full_sweep -- this is diagnostic-only for
+                    // `rl_topic.py info`, not part of peer discovery,
+                    // and rlcore's TTL for this data is only 10x this
+                    // interval, so skipping most ticks would risk a
+                    // still-alive topic flickering as "gone"). See
+                    // topic_directory.hpp's role-directory section.
+                    {
+                        std::vector<RoleAnnounceEntry> role_entries;
+                        {
+                            std::lock_guard<std::mutex> lock(state_mutex_);
+                            for (uint32_t topic : g.second) {
+                                uint8_t role = 0;
+                                if (advertised_topics_.count(topic)) role |= kRolePublisher;
+                                if (subscribed_topics_.count(topic)) role |= kRoleSubscriber;
+                                if (role) role_entries.push_back(RoleAnnounceEntry{topic, role});
+                            }
+                        }
+                        for (const auto& chunk : chunk_role_announce_entries(role_entries)) {
+                            uint8_t buf[kRoleMaxPacket];
+                            size_t len = 0;
+                            if (encode_role_announce(chunk, buf, sizeof(buf), &len)) {
+                                sockaddr_in dst{};
+                                dst.sin_family = AF_INET;
+                                dst.sin_addr.s_addr = htonl(set_rlcore.resolved_ip());
+                                dst.sin_port = htons(set_rlcore.resolved_port());
+                                ::sendto(g.first->native_handle(), buf, len, 0,
+                                         reinterpret_cast<sockaddr*>(&dst), sizeof(dst));
+                            }
+                        }
+                    }
+                    std::vector<uint32_t> pending;
+                    if (!full_sweep) {
+                        std::lock_guard<std::mutex> lock(state_mutex_);
+                        for (uint32_t topic : g.second) {
+                            auto it = peers_.find(topic);
+                            if (it == peers_.end() || it->second.empty()) pending.push_back(topic);
+                        }
+                        if (pending.empty()) continue;
+                    }
+                    const std::vector<uint32_t>& to_register = full_sweep ? g.second : pending;
+                    auto t0 = std::chrono::steady_clock::now();
+                    auto outcome = register_with_rlcore_on_socket(
+                        g.first->native_handle(),
+                        set_rlcore.resolved_ip(), set_rlcore.resolved_port(),
+                        self_ip, g.first->local_port(),
+                        to_register.data(), static_cast<uint16_t>(to_register.size()),
+                        /*max_retries=*/5, /*timeout_ms=*/100, g.first);
+                    if (!outcome.ok) continue;
+                    // Populate peers_ for EVERY entry in this ack first,
+                    // fast and lock-only, before punching anything.
+                    // nat_punch() is 3 packets * 30ms sleep = ~90ms per
+                    // peer -- calling it inline, per-peer, in this same
+                    // loop (the old code) meant that when a registration
+                    // burst returns many newly-discovered peers at once
+                    // (e.g. all ~1000 topics' worth, the common case the
+                    // very first time this side learns about an already-
+                    // registered remote node), populating peer #2's entry
+                    // was gated behind peer #1's 90ms punch delay, peer #3
+                    // behind #1+#2, and so on -- throttling the whole
+                    // peers_ map to ~11 entries/second regardless of how
+                    // many were actually ready immediately. Since
+                    // publish() can only send once a topic's peers_ entry
+                    // exists, that throttling alone was enough to make
+                    // most of a real ~1000-topic node's topics never
+                    // acquire a usable peer within a typical test/run
+                    // window -- this, not registration failures or a
+                    // discovery "race", was the actual cause of one side
+                    // of a two-node exchange measuring ~10% delivery
+                    // while the other measured ~99%+ for what should be a
+                    // symmetric workload. Collecting the newly-discovered
+                    // peers here and punching them all in one background
+                    // burst afterward (same pattern as the initial-
+                    // registration punch burst in ensure_started()) keeps
+                    // population instant regardless of batch size.
+                    std::vector<std::pair<PeerAddr, UdpTransport*>> newly_discovered;
+                    for (const auto& p : outcome.peers) {
+                        // p.topic_id is a misaligned field in a
+                        // #pragma pack(1) struct (RegisterAckPeer in
+                        // wire.hpp) -- copy fields out before using them,
+                        // not take a reference to the packed field
+                        // itself (that's UB and has actually crashed
+                        // with a general protection fault at scale).
+                        uint32_t ip = p.ip;
+                        uint16_t port = p.port;
+                        uint32_t topic_id = p.topic_id;
+                        PeerAddr addr{ip, port};
+                        bool is_new;
+                        {
+                            std::lock_guard<std::mutex> lock(state_mutex_);
+                            auto& known = peers_[topic_id];
+                            is_new = true;
+                            for (const auto& existing : known) {
+                                if (existing.ip_host_order == addr.ip_host_order && existing.port == addr.port) {
+                                    is_new = false;
+                                    break;
+                                }
+                            }
+                            if (is_new) known.push_back(addr);
+                        }
+                        if (is_new) newly_discovered.push_back({addr, g.first});
+                    }
+                    if (!newly_discovered.empty()) {
+                        std::lock_guard<std::mutex> lock(punch_threads_mutex_);
+                        punch_threads_.push_back(std::thread([this, newly_discovered] {
+                            for (const auto& kv : newly_discovered) {
+                                nat_punch(kv.first, *kv.second);
+                            }
+                        }));
+                    }
+                }
             }
         });
     }

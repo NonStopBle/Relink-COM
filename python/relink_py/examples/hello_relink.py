@@ -35,6 +35,7 @@ def main():
     # rlcore_pubsub.py for the alternative (a small daemon, useful when
     # multicast isn't available on your network).
     node.use_multicast_discovery()
+    
 
     # Subscribe first so we don't miss any early messages, then
     # advertise -- both calls just declare intent, nothing is sent yet.
@@ -63,7 +64,7 @@ def main():
             node.publish(TOPIC_HELLO, Int32(data=counter))
             print(f"sent:     {counter} (to {len(peers)} peer(s))")
 
-        time.sleep(1)
+        time.sleep(0.001)
         counter += 1
 
 

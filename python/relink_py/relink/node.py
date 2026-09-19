@@ -88,6 +88,14 @@ class RelinkNode:
         self.set_rlcore = _RlCoreConfig(self)
         self._mode = DiscoveryMode.NONE
         self._declared_topics: Set[int] = set()
+        # Split out of _declared_topics so rlcore can be told WHICH role
+        # this node plays per topic (see the periodic RLPA role-announce
+        # in _rlcore_reregister_loop()), for `rl_topic.py info`'s p2p
+        # connection details (who publishes, who subscribes, by ip:port).
+        # A topic can be both (e.g. a loopback/echo test) -- the two sets
+        # aren't mutually exclusive.
+        self._advertised_topics: Set[int] = set()
+        self._subscribed_topics: Set[int] = set()
         self._peers_lock = threading.Lock()
         self._peers: Dict[int, List[PeerAddr]] = {}
         self._next_image_frame_id: Dict[int, int] = {}
@@ -107,6 +115,23 @@ class RelinkNode:
         self._repunch_interval = 5.0
         self._repunch_stop = threading.Event()
         self._repunch_thread: Optional[threading.Thread] = None
+
+        # rlcore registration is otherwise one-shot (see _ensure_started):
+        # a node only ever learns the peers that existed at ITS OWN
+        # startup moment, so whichever side starts earlier can never
+        # learn about a peer that registers later -- publish-before-
+        # subscribe or subscribe-before-publish both silently fail
+        # depending on order. This periodic re-registration thread
+        # removes that ordering requirement: every _rlcore_reregister_
+        # interval, re-send the same RegisterRequest used at startup and
+        # merge any newly-returned peers into self._peers, so a
+        # late-joining peer gets picked up without either side needing a
+        # restart.
+        self._rlcore_groups: List[Tuple[UdpTransport, List[int]]] = []
+        self._rlcore_self_ip = 0
+        self._rlcore_reregister_interval = 0.3
+        self._rlcore_reregister_stop = threading.Event()
+        self._rlcore_reregister_thread: Optional[threading.Thread] = None
 
         self._relay_enabled = False
         self._relay_ip = 0
@@ -162,6 +187,112 @@ class RelinkNode:
                 for _ in range(3):
                     via.publish_raw(NAT_PUNCH_TOPIC_ID, b"", p)
                     time.sleep(0.03)
+
+    def _rlcore_reregister_loop(self):
+        tick = 0
+        while not self._rlcore_reregister_stop.wait(self._rlcore_reregister_interval):
+            tick += 1
+            groups = self._rlcore_groups
+            self_ip = self._rlcore_self_ip
+            # At many topics (e.g. 20+), re-registering every group every
+            # tick multiplies load on rlcore (a single-threaded server)
+            # and on this node's own busy sockets by the topic count,
+            # which measurably increases loss instead of reducing it.
+            # Once a topic already has at least one known peer, skip it
+            # on most ticks -- only do a full sweep (every 10th tick) so
+            # a late-arriving SECOND peer for an already-satisfied topic
+            # still eventually gets picked up. A topic with no peer yet
+            # is always retried every tick, same as before.
+            full_sweep = (tick % 10 == 0)
+
+            def reregister_one_group(t, group_topics):
+                if self._rlcore_reregister_stop.is_set():
+                    return
+                # Tell rlcore who's publishing/subscribing each of this
+                # group's topics, every tick (not gated by full_sweep --
+                # this is diagnostic-only for `rl_topic.py info`, not
+                # part of peer discovery, and rlcore's TTL for this data
+                # is only 10x this interval, so skipping most ticks would
+                # risk a still-alive topic flickering as "gone"). Only
+                # topics with an actual role are sent (a topic in
+                # group_topics purely because it shares this group's
+                # socket, with no advertise()/subscribe() of its own,
+                # can't happen given how groups are built, but the filter
+                # is cheap insurance either way).
+                role_entries = []
+                for topic in group_topics:
+                    role = 0
+                    if topic in self._advertised_topics:
+                        role |= tdir.ROLE_PUBLISHER
+                    if topic in self._subscribed_topics:
+                        role |= tdir.ROLE_SUBSCRIBER
+                    if role:
+                        role_entries.append(tdir.RoleAnnounceEntry(topic, role))
+                rlcore_addr = (host_order_to_ipv4(self.set_rlcore.resolved_ip), self.set_rlcore.resolved_port)
+                for chunk in tdir.chunk_role_announce_entries(role_entries):
+                    try:
+                        t.sock.sendto(tdir.encode_role_announce(chunk), rlcore_addr)
+                    except OSError:
+                        pass
+                if not full_sweep:
+                    with self._peers_lock:
+                        if all(self._peers.get(topic) for topic in group_topics):
+                            return
+                # Reuses this group's own data socket (same NAT-traversal
+                # requirement as the initial registration), so it races
+                # the data thread's own recv on that socket: the data
+                # thread can "steal" the ACK reply before this call's
+                # recvfrom() sees it. Measured at 5000Hz that race is
+                # frequent enough that a single attempt per tick can miss
+                # for several seconds straight (the data thread simply
+                # gets far more chances to grab the packet first at high
+                # rates) -- so retry several times, back-to-back, within
+                # THIS tick rather than waiting a full interval between
+                # attempts. Backoff still doubles per attempt (0.1s,
+                # 0.2s, 0.4s, 0.8s, 1.6s -- ~3.1s worst case), but each
+                # attempt is a fresh independent chance to win the race,
+                # so in practice one of the first 1-2 attempts succeeds
+                # almost every tick instead of needing several whole
+                # 1s-interval ticks to get lucky once.
+                outcome = register_with_rlcore_on_socket(
+                    t.sock, self.set_rlcore.resolved_ip, self.set_rlcore.resolved_port,
+                    self_ip, t.local_port, group_topics,
+                    max_retries=5, timeout_s=0.1, transport=t)
+                if not outcome.ok:
+                    return
+                for p in outcome.peers:
+                    addr = PeerAddr(p.ip, p.port)
+                    with self._peers_lock:
+                        known = self._peers.setdefault(p.topic_id, [])
+                        is_new = addr not in known
+                        if is_new:
+                            known.append(addr)
+                    if is_new:
+                        for _ in range(3):  # newly-joined peer: open our NAT mapping to it right away
+                            t.publish_raw(NAT_PUNCH_TOPIC_ID, b"", addr)
+                            time.sleep(0.03)
+
+            # Each group has its OWN socket (set_multiplex(False)) or all
+            # share the one shared transport (default multiplex mode) --
+            # either way, running one group's blocking register call at a
+            # time in a plain for-loop means group N waits for groups
+            # 1..N-1 to each finish (including their up-to-5-retry worst
+            # case) before it even starts. At 10+ topics that serial
+            # chain was the actual measured bottleneck (confirmed by a
+            # monotonic per-topic decline matching registration order,
+            # not any rlcore-server-side effect -- see the 20-topic
+            # stress test that diagnosed this). Running every group's
+            # registration in its own thread lets them all proceed in
+            # parallel instead of queued behind each other; each thread
+            # only touches its own group's socket plus the already-
+            # locked shared self._peers dict, so this is safe under the
+            # same locking used everywhere else in this class.
+            threads = [threading.Thread(target=reregister_one_group, args=(t, group_topics), daemon=True)
+                       for t, group_topics in groups]
+            for th in threads:
+                th.start()
+            for th in threads:
+                th.join()
 
     def set_relay(self, ip: str, port: int = RELAY_DEFAULT_PORT):
         """Relay fallback for when direct peer-to-peer hole punching
@@ -285,6 +416,7 @@ class RelinkNode:
         else:
             self._transport_for(topic_id)
         self._declared_topics.add(topic_id)
+        self._advertised_topics.add(topic_id)
 
     # --- subscribe: receiver-side topic declaration + typed callback,
     # invoked inline on the data thread, per spec's v1 threading design ---
@@ -294,6 +426,7 @@ class RelinkNode:
         if not is_wire_type(msg_type):
             raise TypeError(f"{msg_type} must be a ctypes.Structure subclass with _pack_ = 1")
         self._declared_topics.add(topic_id)
+        self._subscribed_topics.add(topic_id)
         expected_size = ctypes.sizeof(msg_type)
         t = self._transport if msg_type is ImageChunk else self._transport_for(topic_id)
 
@@ -321,16 +454,19 @@ class RelinkNode:
         topic_id = self._topic_id_for(topic)
         self._transport_for(topic_id)
         self._declared_topics.add(topic_id)
+        self._advertised_topics.add(topic_id)
 
     def subscribe_raw(self, topic: Union[int, str], callback: Callable[[bytes], None]):
         topic_id = self._topic_id_for(topic)
         t = self._transport_for(topic_id)
         self._declared_topics.add(topic_id)
+        self._subscribed_topics.add(topic_id)
         t.set_topic_handler(topic_id, callback)
 
     def publish_raw(self, topic: Union[int, str], payload: bytes) -> bool:
         topic_id = self._topic_id_for(topic)
         self._declared_topics.add(topic_id)
+        self._advertised_topics.add(topic_id)
         self._ensure_started()
         with self._peers_lock:
             peers = list(self._peers.get(topic_id, []))
@@ -433,6 +569,7 @@ class RelinkNode:
         self._transport.enable_large_buffers()
         reassembler = ImageReassembler(callback)
         self._declared_topics.add(topic_id)
+        self._subscribed_topics.add(topic_id)
 
         # Zero-copy receive path: publish_image() sends the compact wire
         # format (10-byte header + only the valid data bytes, not padded
@@ -544,10 +681,19 @@ class RelinkNode:
                 self_ip = _detect_local_ip_for_peer(self.set_rlcore.resolved_ip,
                                                      self.set_rlcore.resolved_port)
                 for t, group_topics in groups:
+                    # Only ONE quick attempt here (not the 3-retry/
+                    # exponential-backoff default, which can block
+                    # spin()/publish() for ~3.5s if rlcore happens to be
+                    # briefly unreachable) -- the periodic re-registration
+                    # thread started below retries every few seconds for
+                    # the rest of the node's lifetime, so a slow/late
+                    # rlcore is recovered from in the background instead
+                    # of stalling startup.
                     outcome = register_with_rlcore_on_socket(
                         t.sock,
                         self.set_rlcore.resolved_ip, self.set_rlcore.resolved_port,
-                        self_ip, t.local_port, group_topics)
+                        self_ip, t.local_port, group_topics,
+                        max_retries=1, timeout_s=0.3, transport=t)
                     if outcome.ok:
                         with self._peers_lock:
                             for p in outcome.peers:
@@ -557,18 +703,35 @@ class RelinkNode:
                 # If registration failed after retries, register_with_rlcore
                 # already logged an error; proceed with an empty peer table
                 # rather than crashing the node.
+                self._rlcore_self_ip = self_ip
+                self._rlcore_groups = list(groups)
 
                 # Tell rlcore about any names we resolved for these topics
                 # (best-effort, fire-and-forget -- see the C++ side's
                 # identical comment in relink.hpp for the rationale).
+                # encode_announce() rejects more than tdir.MAX_ENTRIES
+                # (512) entries in one packet -- a real large-topic-count
+                # system (e.g. ~1000 topics) easily exceeds that in a
+                # single node, and the ONE announce call this used to be
+                # would raise ValueError and get silently swallowed by
+                # the bare except below, dropping every name for that
+                # node with no announce ever reaching rlcore even though
+                # registration/data traffic worked fine (different wire
+                # protocols) -- rl_topic.py list/info would then see
+                # nothing despite everything else running. Chunk instead.
                 if self._topic_names:
-                    entries = [TopicDirEntry(tid, name) for tid, name in self._topic_names.items()]
-                    try:
-                        announce = tdir.encode_announce(entries)
-                        self._transport.sock.sendto(
-                            announce, (host_order_to_ipv4(self.set_rlcore.resolved_ip), self.set_rlcore.resolved_port))
-                    except (ValueError, OSError):
-                        pass
+                    all_entries = [TopicDirEntry(tid, name) for tid, name in self._topic_names.items()]
+                    rlcore_addr = (host_order_to_ipv4(self.set_rlcore.resolved_ip), self.set_rlcore.resolved_port)
+                    # chunk_entries(), not a raw MAX_ENTRIES slice -- see
+                    # its docstring: MAX_ENTRIES alone doesn't guarantee
+                    # the encoded packet stays under MAX_PACKET once
+                    # names have real-world length.
+                    for chunk in tdir.chunk_entries(all_entries):
+                        try:
+                            announce = tdir.encode_announce(chunk)
+                            self._transport.sock.sendto(announce, rlcore_addr)
+                        except (ValueError, OSError):
+                            pass
 
                 self._transport.start()
             else:
@@ -619,10 +782,28 @@ class RelinkNode:
             # own NAT's outbound mapping so the peer's (simultaneous)
             # punch datagram back can get through. Harmless no-op cost
             # on a plain LAN.
-            for t, peer in newly_learned_peers:
-                for _ in range(3):
-                    t.publish_raw(NAT_PUNCH_TOPIC_ID, b"", peer)
-                    time.sleep(0.03)
+            #
+            # Backgrounded, not run inline here: this loop runs inside
+            # _ensure_started(), called SYNCHRONOUSLY from the caller's
+            # first publish()/spin_once(). At a handful of peers the
+            # 0.03s-per-packet pacing is invisible; at real large-system
+            # peer counts (e.g. ~500-1000, one per topic) it's
+            # peer_count * 3 * 0.03s of blocking sleep on the caller's
+            # own thread -- measured ~45s for 500 peers, which starved
+            # the caller's entire publish loop for the whole test
+            # duration before it ever got to send a second message.
+            # Punching a moment later in the background costs nothing
+            # real (the reregister loop already punches newly-discovered
+            # peers the same asynchronous way), so there's no reason for
+            # this one-time burst to block startup at all.
+            if newly_learned_peers:
+                def _initial_punch_burst(pairs):
+                    for t, peer in pairs:
+                        for _ in range(3):
+                            t.publish_raw(NAT_PUNCH_TOPIC_ID, b"", peer)
+                            time.sleep(0.03)
+                threading.Thread(target=_initial_punch_burst, args=(newly_learned_peers,),
+                                  daemon=True).start()
 
             # NAT mode (rlcore, the only mode --nat applies to) gets a 1s
             # re-punch thread by default -- this is the mode where a
@@ -639,6 +820,10 @@ class RelinkNode:
             if self._repunch_enabled:
                 self._repunch_thread = threading.Thread(target=self._repunch_loop, daemon=True)
                 self._repunch_thread.start()
+
+            if self._mode == DiscoveryMode.RLCORE:
+                self._rlcore_reregister_thread = threading.Thread(target=self._rlcore_reregister_loop, daemon=True)
+                self._rlcore_reregister_thread.start()
 
             if self._relay_enabled:
                 self._register_all_topics_with_relay(groups)  # immediate, don't wait for the first keepalive tick

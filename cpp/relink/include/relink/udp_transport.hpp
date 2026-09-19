@@ -23,6 +23,9 @@
 #include <functional>
 #include <unordered_map>
 #include <mutex>
+#include <condition_variable>
+#include <queue>
+#include <chrono>
 #include <cstring>
 #include <stdexcept>
 #include <string>
@@ -280,6 +283,25 @@ public:
         return recv_and_dispatch();
     }
 
+    bool is_running() const { return running_.load(std::memory_order_relaxed); }
+
+    // Blocks for up to `timeout_ms` for a non-frame packet (a
+    // RegisterAck) that arrived on this socket after start(), handed off
+    // by recv_and_dispatch() instead of raced for directly by a second
+    // caller of recvfrom() on the same fd. See register_with_rlcore_on_socket()
+    // in rlcore_client.hpp, the one caller of this. Returns true and
+    // fills `out` if a packet arrived in time, false on timeout.
+    bool get_register_reply(std::vector<uint8_t>* out, int timeout_ms) {
+        std::unique_lock<std::mutex> lock(register_reply_mutex_);
+        if (!register_reply_cv_.wait_for(lock, std::chrono::milliseconds(timeout_ms),
+                                          [this] { return !register_reply_queue_.empty(); })) {
+            return false;
+        }
+        *out = std::move(register_reply_queue_.front());
+        register_reply_queue_.pop();
+        return true;
+    }
+
 private:
     void apply_large_buffers() {
         int bufsize = 1024 * 1024;
@@ -320,6 +342,18 @@ private:
     bool recv_and_dispatch() {
         struct sockaddr_in src{};
         socklen_t src_len = sizeof(src);
+        // 65507 (largest possible UDP/IPv4 datagram), not kMaxFrameBytes
+        // (~1411, sized for the data-frame payload cap of 1400 bytes):
+        // this socket also carries RegisterAck replies (see
+        // register_reply_queue_ below), which have no relation to that
+        // cap -- a rlcore reply listing many peers can be several KB.
+        // recvfrom()'s length argument is a hard truncation point for
+        // UDP (the kernel discards anything past it, silently), so a
+        // too-small buffer here doesn't just clip a frame, it corrupts a
+        // legitimate large RegisterAck into something
+        // decode_register_ack() rejects -- which looks exactly like
+        // "rlcore never replied" from the caller's side even though
+        // rlcore's own log shows it did.
         ssize_t n = ::recvfrom(sock_, recv_buf_, sizeof(recv_buf_), 0,
                                 reinterpret_cast<struct sockaddr*>(&src), &src_len);
         if (n <= 0) {
@@ -329,6 +363,17 @@ private:
         DecodedFrame frame{};
         DecodeResult r = decode_frame(recv_buf_, static_cast<size_t>(n), &frame);
         if (r != DecodeResult::Ok) {
+            // Not a data frame -- most likely a RegisterAck reply for a
+            // register_with_rlcore_on_socket() call waiting on this same
+            // socket. Hand it off instead of dropping so that call
+            // doesn't lose the race for recvfrom() against this thread.
+            {
+                std::lock_guard<std::mutex> lock(register_reply_mutex_);
+                if (register_reply_queue_.size() < kMaxQueuedRegisterReplies) {
+                    register_reply_queue_.emplace(recv_buf_, recv_buf_ + n);
+                }
+            }
+            register_reply_cv_.notify_one();
             return false; // drop silently, per spec
         }
 
@@ -391,7 +436,19 @@ private:
     }
 
     uint8_t send_buf_[kMaxFrameBytes];
-    uint8_t recv_buf_[kMaxFrameBytes];
+    // 65507 (largest possible UDP/IPv4 datagram), not kMaxFrameBytes --
+    // see the note in recv_and_dispatch() above.
+    uint8_t recv_buf_[65507];
+
+    // Handoff queue for non-frame packets (RegisterAck replies) received
+    // by this thread but meant for a register_with_rlcore_on_socket()
+    // call blocked in get_register_reply(). Bounded so a rlcore that's
+    // gone haywire (or a misbehaving peer spamming garbage) can't grow
+    // this unboundedly on a node that never calls get_register_reply().
+    static constexpr size_t kMaxQueuedRegisterReplies = 16;
+    std::mutex register_reply_mutex_;
+    std::condition_variable register_reply_cv_;
+    std::queue<std::vector<uint8_t>> register_reply_queue_;
 };
 
 // Helper: resolve a dotted-quad IPv4 string to host-order uint32_t.

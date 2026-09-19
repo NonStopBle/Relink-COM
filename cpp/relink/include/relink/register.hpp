@@ -21,7 +21,20 @@
 namespace relink {
 
 inline constexpr uint16_t kRlCoreDefaultPort = 8445;
-inline constexpr size_t kMaxRegisterTopics = 128; // sanity cap, v1 fixed-size buffers
+// The real limit is topic_count's own uint16_t range combined with fitting
+// in one UDP/IPv4 datagram (65507 bytes max): (65507 - header) / 4 bytes
+// per topic_id =~ 16374. The old value here (128) was an arbitrary, much
+// lower sanity cap with no equivalent in the Python binding (register.py
+// has no topic-count cap at all beyond the wire format's own limits) --
+// at real large-system topic counts (e.g. ~1000 topics declared by one
+// node under the default shared-socket/multiplex mode, all in one
+// RegisterRequest) it silently made encode_register_request() return
+// TooManyTopics, which register_with_rlcore_on_socket() then returned as
+// a plain ok=false with NO error printed for that specific path -- so
+// registration failed completely (zero peers, zero data delivery) while
+// looking, from the caller's side, like rlcore was simply never
+// reachable. Matches the buffer sizes in rlcore_client.hpp/udp_transport.hpp.
+inline constexpr size_t kMaxRegisterTopics = 16374;
 
 enum class RegisterEncodeResult { Ok, TooManyTopics, BufferTooSmall };
 enum class RegisterDecodeResult { Ok, TooShort, LengthMismatch };

@@ -38,8 +38,13 @@ supports (cv2.VideoCapture.set() is a request, not a guarantee) -- raw
 chunk counts scale directly with resolution.
 
 Run:
-    python3 examples/camera_stream.py pub        # opens camera 0, streams both topics
-    python3 examples/camera_stream.py sub        # receives, writes latest frames to disk
+    python3 examples/camera_stream.py pub            # opens camera 0, streams both topics
+    python3 examples/camera_stream.py sub            # receives, writes latest frames to disk
+    python3 examples/camera_stream.py sub --display  # also live-shows image_raw in a cv2 window
+
+For a raw-camera-only ReLink-vs-ROS2 comparison (throughput/overhead/latency),
+see examples/ros2_compare/ (ros2_camera_pub.py / ros2_camera_sub.py) and
+COMPARISON.md in that directory.
 """
 import sys
 import os
@@ -107,11 +112,18 @@ def run_publisher(node: RelinkNode):
         time.sleep(0.2)  # ~5 FPS
 
 
-def run_subscriber(node: RelinkNode):
+def run_subscriber(node: RelinkNode, display: bool = False):
     def on_raw(frame_id, data):
         arr = np.frombuffer(data, dtype=np.uint8).reshape((240, 320, 3))
-        cv2.imwrite("latest_raw.jpg", arr)
-        print(f"image_raw: frame {frame_id} complete ({len(data)} bytes) -> latest_raw.jpg")
+        if display:
+            # Called synchronously from the same thread as node.spin() below
+            # -- safe to drive the cv2 GUI event loop (imshow + waitKey)
+            # right here, no separate GUI thread needed.
+            cv2.imshow("ReLink image_raw", arr)
+            cv2.waitKey(1)
+        else:
+            cv2.imwrite("latest_raw.jpg", arr)
+        print(f"image_raw: frame {frame_id} complete ({len(data)} bytes)")
 
     def on_compressed(frame_id, data):
         with open("latest_compressed.jpg", "wb") as f:
@@ -121,26 +133,33 @@ def run_subscriber(node: RelinkNode):
     node.subscribe_image(TOPIC_IMAGE_RAW, on_raw)
     node.subscribe_image(TOPIC_IMAGE_COMPRESSED, on_compressed)
 
-    print("camera_stream: subscribed, writing latest_raw.jpg / latest_compressed.jpg "
-          "to the current directory as frames complete")
+    if display:
+        print("camera_stream: subscribed, showing image_raw live in a cv2 window "
+              "(press q or ctrl-c to quit)")
+    else:
+        print("camera_stream: subscribed, writing latest_raw.jpg / latest_compressed.jpg "
+              "to the current directory as frames complete")
     node.spin()
 
 
 def main():
     if len(sys.argv) < 2:
-        print(f"usage: {sys.argv[0]} [pub|sub] [rlcore_ip]", file=sys.stderr)
+        print(f"usage: {sys.argv[0]} [pub|sub] [rlcore_ip] [--display]", file=sys.stderr)
         return 1
 
+    display = "--display" in sys.argv[2:]
+    rlcore_ip = next((a for a in sys.argv[2:] if not a.startswith("--")), None)
+
     node = RelinkNode()
-    if len(sys.argv) > 2:
-        node.set_rlcore.ip(sys.argv[2])
+    if rlcore_ip:
+        node.set_rlcore.ip(rlcore_ip)
     else:
         node.use_multicast_discovery()
 
     if sys.argv[1] == "pub":
         run_publisher(node)
     else:
-        run_subscriber(node)
+        run_subscriber(node, display=display)
     return 0
 
 

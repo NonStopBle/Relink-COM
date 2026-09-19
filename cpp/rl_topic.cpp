@@ -196,14 +196,31 @@ static std::map<uint32_t, std::string> query_rlcore(const std::string& ip, uint1
     encode_topic_dir_query(query_buf, sizeof(query_buf), &query_len);
     ::sendto(s, query_buf, query_len, 0, reinterpret_cast<struct sockaddr*>(&dest), sizeof(dest));
 
-    uint8_t buf[kTopicDirMaxPacket];
-    ssize_t n = ::recvfrom(s, buf, sizeof(buf), 0, nullptr, nullptr);
-    if (n > 0 && topic_dir_packet_kind(buf, static_cast<size_t>(n)) == TopicDirKind::Reply) {
+    // rlcore chunks its reply into multiple RLNR packets when it knows
+    // more than kTopicDirMaxEntries (512) names (a real large-topic-
+    // count fleet easily exceeds that), so collect every reply that
+    // arrives, not just the first packet -- a short quiet-window after
+    // the most recent chunk, not the full timeout, so a multi-chunk
+    // reply doesn't force waiting out the entire timeout_s after the
+    // last real chunk already arrived.
+    bool got_any = false;
+    while (true) {
+        uint8_t buf[kTopicDirMaxPacket];
+        ssize_t n = ::recvfrom(s, buf, sizeof(buf), 0, nullptr, nullptr);
+        if (n <= 0) break; // timed out -- done collecting chunks
+        if (topic_dir_packet_kind(buf, static_cast<size_t>(n)) != TopicDirKind::Reply) continue;
         std::vector<TopicDirEntry> entries;
         if (decode_topic_dir_entries(buf, static_cast<size_t>(n), &entries)) {
+            got_any = true;
             for (const auto& e : entries) out[e.topic_id] = e.name;
         }
-    } else if (n <= 0) {
+        struct timeval quiet{};
+        double quiet_s = timeout_s < 0.3 ? timeout_s : 0.3;
+        quiet.tv_sec = static_cast<time_t>(quiet_s);
+        quiet.tv_usec = static_cast<suseconds_t>((quiet_s - quiet.tv_sec) * 1e6);
+        ::setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &quiet, sizeof(quiet));
+    }
+    if (!got_any) {
         std::fprintf(stderr, "rl_topic: no reply from rlcore at %s:%u\n", ip.c_str(), port);
     }
     ::close(s);
@@ -247,6 +264,59 @@ static std::map<uint32_t, std::string> query_multicast(const std::string& group,
     return out;
 }
 
+struct RolePeer {
+    std::string ip;
+    uint16_t port;
+    uint8_t role;
+};
+
+// Unicast RLPQ to rlcore, return topic_id -> peers with roles -- who's
+// publishing/subscribing each topic (see topic_directory.hpp's role
+// directory). rlcore-only: multicast mode has no central table to ask,
+// each node only knows about itself.
+static std::map<uint32_t, std::vector<RolePeer>> query_rlcore_roles(
+    const std::string& ip, uint16_t port, double timeout_s) {
+    std::map<uint32_t, std::vector<RolePeer>> out;
+    int s = ::socket(AF_INET, SOCK_DGRAM, 0);
+    if (s < 0) return out;
+    struct timeval tv{};
+    tv.tv_sec = static_cast<time_t>(timeout_s);
+    tv.tv_usec = static_cast<suseconds_t>((timeout_s - tv.tv_sec) * 1e6);
+    ::setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+    struct sockaddr_in dest{};
+    dest.sin_family = AF_INET;
+    ::inet_pton(AF_INET, ip.c_str(), &dest.sin_addr);
+    dest.sin_port = htons(port);
+
+    uint8_t query_buf[8];
+    size_t query_len = 0;
+    encode_role_query(query_buf, sizeof(query_buf), &query_len);
+    ::sendto(s, query_buf, query_len, 0, reinterpret_cast<struct sockaddr*>(&dest), sizeof(dest));
+
+    while (true) {
+        uint8_t buf[kRoleMaxPacket];
+        ssize_t n = ::recvfrom(s, buf, sizeof(buf), 0, nullptr, nullptr);
+        if (n <= 0) break;
+        if (role_packet_kind(buf, static_cast<size_t>(n)) != RoleDirKind::Reply) continue;
+        std::vector<RolePeerEntry> entries;
+        if (decode_role_reply(buf, static_cast<size_t>(n), &entries)) {
+            for (const auto& e : entries) {
+                struct in_addr ia{};
+                ia.s_addr = htonl(e.ip);
+                out[e.topic_id].push_back(RolePeer{inet_ntoa(ia), e.port, e.role});
+            }
+        }
+        struct timeval quiet{};
+        double quiet_s = timeout_s < 0.3 ? timeout_s : 0.3;
+        quiet.tv_sec = static_cast<time_t>(quiet_s);
+        quiet.tv_usec = static_cast<suseconds_t>((quiet_s - quiet.tv_sec) * 1e6);
+        ::setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &quiet, sizeof(quiet));
+    }
+    ::close(s);
+    return out;
+}
+
 static std::map<uint32_t, std::string> collect_names(const Args& a) {
     std::map<uint32_t, std::string> fresh = a.rlcore_ip.empty()
         ? query_multicast(a.group, a.port, a.timeout)
@@ -278,18 +348,52 @@ static void cmd_info(const Args& a) {
     auto names = collect_names(a);
     bool is_numeric = !a.topic.empty() &&
         (std::isdigit(static_cast<unsigned char>(a.topic[0])) || a.topic[0] == '-');
-    bool found = false;
-    for (const auto& kv : names) {
-        bool matches = is_numeric ? (kv.first == static_cast<uint32_t>(std::stoul(a.topic))) : (kv.second == a.topic);
-        if (!matches) continue;
-        found = true;
+
+    std::vector<std::pair<uint32_t, std::string>> matches;
+    if (is_numeric) {
+        // A numeric topic id is always directly accessible (no name
+        // lookup needed to use it), even if no node ever announced a
+        // string name for it -- only string queries actually depend on
+        // the directory.
+        uint32_t tid = static_cast<uint32_t>(std::stoul(a.topic));
+        auto it = names.find(tid);
+        matches.push_back({tid, it != names.end() ? it->second : std::string()});
+    } else {
+        for (const auto& kv : names) if (kv.second == a.topic) matches.push_back(kv);
+    }
+
+    if (matches.empty()) {
+        std::fprintf(stderr, "rl_topic: no known topic matches \"%s\"\n", a.topic.c_str());
+        std::exit(1);
+    }
+
+    // p2p connection details (who's publishing/subscribing, by ip:port)
+    // only exist centrally at rlcore -- multicast mode has no central
+    // table to ask, each node only knows about itself.
+    std::map<uint32_t, std::vector<RolePeer>> roles;
+    if (!a.rlcore_ip.empty()) roles = query_rlcore_roles(a.rlcore_ip, a.rlcore_port, a.timeout);
+
+    for (const auto& kv : matches) {
         std::printf("Topic id : %u\n", kv.first);
         std::printf("Name     : %s\n", kv.second.empty() ? "(unnamed -- numeric topic id only)" : kv.second.c_str());
         std::printf("Source   : %s\n", a.rlcore_ip.empty() ? "multicast broadcast" : ("rlcore " + a.rlcore_ip).c_str());
-    }
-    if (!found) {
-        std::fprintf(stderr, "rl_topic: no known topic matches \"%s\"\n", a.topic.c_str());
-        std::exit(1);
+
+        if (a.rlcore_ip.empty()) continue;
+        std::vector<RolePeer> peers = roles.count(kv.first) ? roles[kv.first] : std::vector<RolePeer>{};
+        std::vector<RolePeer> publishers, subscribers;
+        for (const auto& p : peers) {
+            if (p.role & kRolePublisher) publishers.push_back(p);
+            if (p.role & kRoleSubscriber) subscribers.push_back(p);
+        }
+        std::printf("Publishers  (%zu):\n", publishers.size());
+        for (const auto& p : publishers) std::printf("  %s:%u\n", p.ip.c_str(), p.port);
+        std::printf("Subscribers (%zu):\n", subscribers.size());
+        for (const auto& p : subscribers) std::printf("  %s:%u\n", p.ip.c_str(), p.port);
+        if (peers.empty()) {
+            std::printf("(no live publisher/subscriber seen for this topic at rlcore -- "
+                        "either nothing is using it right now, or it's role-less raw "
+                        "registration-only traffic from before this role directory existed)\n");
+        }
     }
 }
 

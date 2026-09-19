@@ -30,6 +30,7 @@ speak the exact same bytes on the wire and are interchangeable.
 - [Step 7 — Message types](#step-7--message-types)
 - [Step 8 — Sending images](#step-8--sending-images)
 - [Step 9 — Running the rlcore daemon](#step-9--running-the-rlcore-daemon)
+  - [Using `rl_topic` — listing and inspecting topics](#using-rl_topic--listing-and-inspecting-topics)
 - [Step 10 — All examples](#step-10--all-examples)
 - [Step 11 — Testing](#step-11--testing)
 - [Step 12 — Benchmarks](#step-12--benchmarks)
@@ -575,6 +576,69 @@ and `logger.py` starts printing readings from `sensor.cpp` a moment
 later, even though they're two different languages on two different
 machines. That's the whole point: rlcore just handles the "how do I
 find you" problem so your actual code doesn't have to.
+
+### Using `rl_topic` — listing and inspecting topics
+
+`rl_topic` (`python/rl_topic.py` / `cpp/rl_topic.cpp`, built the same way
+as any other example in [Step 10](#step-10--all-examples)) is a
+`rostopic`-style CLI for asking "what topics exist right now, and who's
+using them" without writing any code. `list` and `info` are the two most
+common subcommands:
+
+```bash
+# Point it at your rlcore daemon (same ip:port your nodes use):
+python3 rl_topic.py list --rlcore-ip 10.0.0.5
+
+# every topic id currently registered with rlcore, plus its name if any
+# node has resolved one for it (see Step 4 — a purely numeric topic
+# still shows up, just as "(unnamed)"):
+#   377369340   /relink/temperature
+#   2779401242  (unnamed)
+```
+
+```bash
+python3 rl_topic.py info /relink/temperature --rlcore-ip 10.0.0.5
+# Topic id : 377369340
+# Name     : /relink/temperature
+# Source   : rlcore 10.0.0.5
+# Publishers  (1):
+#   10.0.0.5:53211
+# Subscribers (1):
+#   10.0.0.7:41830
+```
+
+`info` shows real **p2p connection details** — which `ip:port` is
+publishing and which is subscribing that topic, live, straight from
+rlcore's own bookkeeping (not from probing the nodes themselves). `info`
+also accepts a numeric topic id directly (`rl_topic.py info 377369340`),
+which works even for a topic that was never given a string name.
+
+A few things worth knowing:
+
+- **`--rlcore-ip`/`--rlcore-port`** select Mode A (rlcore) instead of
+  broadcasting to the Mode B multicast group — required for `info`'s
+  publisher/subscriber breakdown, since only rlcore keeps that central
+  table; multicast mode has no central registry to ask (each node only
+  knows about itself, per [Step 0](#step-0--what-relink-actually-is)).
+  Once given, both are remembered in `~/.cache/relink/conf.bin`, so a
+  later run without `--rlcore-ip` reuses the same rlcore automatically —
+  topic data itself is never cached, since a stale topic/peer list is
+  actively misleading (see the note printed to stderr when this kicks in).
+- **Freshness**: rlcore expires a registration (and its publisher/
+  subscriber role) if that node hasn't re-registered in the last few
+  seconds — closing a node makes it disappear from `list`/`info` shortly
+  after, it doesn't linger forever.
+- **`echo`** decodes payloads too, not just hex: `--type Float32` (or
+  any other built-in type from `standard_msgs.py`/`std_msgs`/
+  `geometry_msgs`/etc. — `Imu`, `Pose`, ...) or `--msg path/to/custom.msg`
+  (your own schema — see `relink_py/relink/msg_schema.py` for the
+  `.msg` file format) pretty-prints field values; `--hex` always forces
+  raw bytes regardless. With neither flag, it prints hex by default,
+  same as before this existed — ReLink has no wire-level type registry
+  to guess a shape from automatically.
+- **`hz`/`bw`/`pub`** round out the CLI (rate, bandwidth, and manual
+  publish by `--hex`/`--text`) — run `rl_topic.py <subcommand> --help`
+  for the full flag list on any of them.
 
 ---
 

@@ -23,68 +23,140 @@ and relink_py/relink/topic_directory.py for the wire protocol):
       segment -- there is no central registry to ask instead, by design
       (see the root README's "What ReLink actually is").
 
-Results are cached to ~/.cache/relink/topic_names.json across runs, so a
-topic name already learned once doesn't need to be re-asked for --
-running `list` again reuses the cache immediately and only asks the
-network/rlcore for anything new, unless --no-cache or --refresh is
-passed.
+Only the rlcore ip/port is cached across runs (~/.cache/relink/conf.bin,
+see CONF_PATH) -- topic names themselves are always re-queried live from
+rlcore/multicast on every invocation, never cached, since a stale topic
+list is actively misleading (renamed/removed topics, nodes that came and
+went) in a way a stale rlcore address isn't.
 """
 import argparse
 import binascii
-import json
+import ctypes
 import os
 import socket
+import struct
 import sys
 import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "relink_py"))
 from relink import topic_directory as tdir
 from relink import RelinkNode
+from relink import msg_schema
 
 DEFAULT_MULTICAST_GROUP = "239.255.0.1"
 DEFAULT_MULTICAST_PORT = 7400
 DEFAULT_RLCORE_PORT = 8445
 DEFAULT_TIMEOUT_S = 1.5
 
-CACHE_PATH = os.path.expanduser("~/.cache/relink/topic_names.json")
+# Remembers the last --rlcore-ip/--rlcore-port explicitly given, so a
+# large-fleet user who always talks to the same rlcore doesn't have to
+# retype it on every invocation -- mirrors the topic_names.json cache's
+# rationale, just for connection config instead of topic data. Binary
+# (not JSON) per request: a fixed 6-byte struct (4-byte IPv4 + 2-byte
+# port), the smallest correct representation for this exact pair.
+CONF_PATH = os.path.expanduser("~/.cache/relink/conf.bin")
+CONF_FMT = "!4sH"  # network-order packed IPv4 + port
 
 
-def load_cache():
+def load_conf():
+    """Returns (ip_str, port) last remembered via save_conf(), or None if
+    no conf.bin exists yet or it's unreadable/corrupt."""
     try:
-        with open(CACHE_PATH) as f:
-            raw = json.load(f)
-        return {int(k): v for k, v in raw.items()}
-    except (FileNotFoundError, ValueError, json.JSONDecodeError):
-        return {}
+        with open(CONF_PATH, "rb") as f:
+            raw = f.read(struct.calcsize(CONF_FMT))
+    except FileNotFoundError:
+        return None
+    if len(raw) != struct.calcsize(CONF_FMT):
+        return None
+    try:
+        packed_ip, port = struct.unpack(CONF_FMT, raw)
+        return socket.inet_ntoa(packed_ip), port
+    except (struct.error, OSError):
+        return None
 
 
-def save_cache(cache):
-    os.makedirs(os.path.dirname(CACHE_PATH), exist_ok=True)
-    with open(CACHE_PATH, "w") as f:
-        json.dump({str(k): v for k, v in cache.items()}, f, indent=2, sort_keys=True)
+def save_conf(ip: str, port: int):
+    os.makedirs(os.path.dirname(CONF_PATH), exist_ok=True)
+    with open(CONF_PATH, "wb") as f:
+        f.write(struct.pack(CONF_FMT, socket.inet_aton(ip), port))
 
 
 def query_rlcore(ip: str, port: int, timeout: float):
-    """Unicast RLNQ to rlcore, return {topic_id: name}."""
+    """Unicast RLNQ to rlcore, return {topic_id: name}. rlcore chunks its
+    reply into multiple RLNR packets when it knows more than
+    tdir.MAX_ENTRIES (512) names (a real large-topic-count fleet easily
+    exceeds that), so this collects every reply that arrives within
+    `timeout` of the LAST one seen, same idea as query_multicast() below,
+    not just the first packet."""
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     s.settimeout(timeout)
+    found = {}
+    got_any = False
     try:
         s.sendto(tdir.encode_query(), (ip, port))
-        data, _ = s.recvfrom(tdir.MAX_PACKET)
-    except (socket.timeout, OSError) as e:
-        print(f"rl_topic: no reply from rlcore at {ip}:{port} ({e})", file=sys.stderr)
-        return {}
+        while True:
+            try:
+                data, _ = s.recvfrom(tdir.MAX_PACKET)
+            except socket.timeout:
+                break
+            if tdir.packet_kind(data) != "reply":
+                continue
+            entries = tdir.decode_entries(data)
+            if entries is None:
+                print(f"rl_topic: malformed reply chunk from rlcore at {ip}:{port}", file=sys.stderr)
+                continue
+            got_any = True
+            for e in entries:
+                found[e.topic_id] = e.name
+            # A short quiet-window after the most recent chunk, not the
+            # full timeout, so a multi-chunk reply doesn't force waiting
+            # out the entire --timeout after the last real chunk already
+            # arrived.
+            s.settimeout(min(timeout, 0.3))
+    except OSError as e:
+        if not got_any:
+            print(f"rl_topic: no reply from rlcore at {ip}:{port} ({e})", file=sys.stderr)
+            return {}
     finally:
         s.close()
 
-    if tdir.packet_kind(data) != "reply":
-        print(f"rl_topic: unexpected reply from rlcore at {ip}:{port}", file=sys.stderr)
-        return {}
-    entries = tdir.decode_entries(data)
-    if entries is None:
-        print(f"rl_topic: malformed reply from rlcore at {ip}:{port}", file=sys.stderr)
-        return {}
-    return {e.topic_id: e.name for e in entries}
+    if not got_any:
+        print(f"rl_topic: no reply from rlcore at {ip}:{port} (timed out)", file=sys.stderr)
+    return found
+
+
+def query_rlcore_roles(ip: str, port: int, timeout: float):
+    """Unicast RLPQ to rlcore, return {topic_id: [(ip_str, port, role), ...]}
+    -- who's publishing/subscribing each topic, per the role directory
+    (see topic_directory.py). rlcore-only: there is no per-peer role
+    concept in multicast mode (each node only knows about itself)."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.settimeout(timeout)
+    found = {}
+    got_any = False
+    try:
+        s.sendto(tdir.encode_role_query(), (ip, port))
+        while True:
+            try:
+                data, _ = s.recvfrom(tdir.MAX_ROLE_PACKET)
+            except socket.timeout:
+                break
+            if tdir.role_packet_kind(data) != "role_reply":
+                continue
+            entries = tdir.decode_role_reply(data)
+            if entries is None:
+                print(f"rl_topic: malformed role reply chunk from rlcore at {ip}:{port}", file=sys.stderr)
+                continue
+            got_any = True
+            for e in entries:
+                ip_str = socket.inet_ntoa(struct.pack(">I", e.ip))
+                found.setdefault(e.topic_id, []).append((ip_str, e.port, e.role))
+            s.settimeout(min(timeout, 0.3))
+    except OSError:
+        pass
+    finally:
+        s.close()
+    return found
 
 
 def query_multicast(group: str, port: int, timeout: float):
@@ -122,17 +194,8 @@ def query_multicast(group: str, port: int, timeout: float):
 
 def collect_names(args) -> dict:
     if args.rlcore_ip:
-        fresh = query_rlcore(args.rlcore_ip, args.rlcore_port, args.timeout)
-    else:
-        fresh = query_multicast(args.group, args.port, args.timeout)
-
-    if args.no_cache:
-        return fresh
-
-    cache = {} if args.refresh else load_cache()
-    cache.update(fresh)  # fresh network data always wins over a stale cache entry
-    save_cache(cache)
-    return cache
+        return query_rlcore(args.rlcore_ip, args.rlcore_port, args.timeout)
+    return query_multicast(args.group, args.port, args.timeout)
 
 
 def resolve_topic_arg(raw: str):
@@ -247,21 +310,62 @@ def cmd_bw(args):
         pass
 
 
+def resolve_echo_msg_type(args):
+    """--hex always wins (explicit "just give me bytes"). Otherwise
+    --msg <path.msg> (a user-authored custom schema, see msg_schema.py)
+    beats --type <Name> (one of the built-in std_msgs/geometry_msgs/
+    sensor_msgs/... types, e.g. "Float32", "Imu", "Pose" -- see
+    msg_schema.find_builtin_type()). Neither given: falls back to raw
+    hex, same as before this feature existed -- ReLink has no wire-level
+    type registry to guess from, so an unannotated topic can't be
+    decoded automatically. Returns None for "print hex", else a
+    ctypes.Structure subclass to decode payloads against."""
+    if args.hex:
+        return None
+    if args.msg:
+        try:
+            return msg_schema.parse_msg_file(args.msg)
+        except msg_schema.MsgSchemaError as e:
+            print(f"rl_topic echo: {e}", file=sys.stderr)
+            sys.exit(2)
+    if args.type:
+        cls = msg_schema.find_builtin_type(args.type)
+        if cls is None:
+            print(f"rl_topic echo: unknown built-in message type \"{args.type}\" "
+                  "(see relink/standard_msgs.py for the full list, e.g. Float32, Imu, Pose)",
+                  file=sys.stderr)
+            sys.exit(2)
+        return cls
+    return None
+
+
 def cmd_echo(args):
     """Mirrors `rostopic echo <topic>`: prints each message as it
     arrives. ReLink has no message-type registry to decode the payload
-    against, so this prints raw hex bytes -- pipe through your own
-    struct.unpack if you know the shape (see the root README's custom
-    message type examples)."""
+    against on its own, so by default this prints raw hex bytes -- but
+    if you tell it the shape via --type <BuiltinName> (e.g. Float32,
+    Imu) or --msg <path/to/custom.msg> (see msg_schema.py), it decodes
+    and pretty-prints field values instead. --hex forces raw hex
+    regardless of --type/--msg."""
     node = make_node(args)
     topic = resolve_topic_arg(args.topic)
     topic_id = node._topic_id_for(topic)
     count = [0]
+    msg_type = resolve_echo_msg_type(args)
+    expected_size = ctypes.sizeof(msg_type) if msg_type is not None else None
 
     def on_msg(payload: bytes):
         count[0] += 1
         print(f"--- #{count[0]} ({len(payload)} bytes) ---")
-        print(binascii.hexlify(payload, " ").decode())
+        if msg_type is not None:
+            if len(payload) == expected_size:
+                print(msg_schema.format_message(msg_type.from_buffer_copy(payload)))
+            else:
+                print(f"(payload is {len(payload)} bytes, expected {expected_size} for this "
+                      "type/schema -- showing raw hex instead)")
+                print(binascii.hexlify(payload, " ").decode())
+        else:
+            print(binascii.hexlify(payload, " ").decode())
         if args.count and count[0] >= args.count:
             # Runs on RelinkNode's background data thread -- raising
             # SystemExit here would only kill that thread, not the
@@ -329,8 +433,11 @@ def cmd_info(args):
     matches = []
     if query.isdigit() or (query.startswith("-") and query[1:].isdigit()):
         tid = int(query)
-        if tid in names:
-            matches.append((tid, names[tid]))
+        # A numeric topic id is always directly accessible (no name
+        # lookup needed to use it -- rl_topic pub/echo/hz/bw already
+        # accept it as-is), even if no node ever announced a string name
+        # for it. Only string queries actually depend on the directory.
+        matches.append((tid, names.get(tid, "")))
     else:
         matches = [(tid, name) for tid, name in names.items() if name == query]
 
@@ -340,18 +447,42 @@ def cmd_info(args):
               "-- see the wire-id-vs-name explanation in topic_directory.hpp)", file=sys.stderr)
         sys.exit(1)
 
+    # p2p connection details (who's publishing/subscribing, by ip:port)
+    # only exist centrally at rlcore -- multicast mode has no central
+    # table to ask, each node only knows about itself.
+    roles = query_rlcore_roles(args.rlcore_ip, args.rlcore_port, args.timeout) if args.rlcore_ip else {}
+
     for tid, name in matches:
         print(f"Topic id : {tid}")
         print(f"Name     : {name if name else '(unnamed -- numeric topic id only)'}")
         print(f"Source   : {'rlcore ' + args.rlcore_ip if args.rlcore_ip else 'multicast broadcast'}")
 
+        if args.rlcore_ip:
+            peers = roles.get(tid, [])
+            publishers = [(ip, port) for ip, port, role in peers if role & tdir.ROLE_PUBLISHER]
+            subscribers = [(ip, port) for ip, port, role in peers if role & tdir.ROLE_SUBSCRIBER]
+            print(f"Publishers  ({len(publishers)}):")
+            for ip, port in sorted(publishers):
+                print(f"  {ip}:{port}")
+            print(f"Subscribers ({len(subscribers)}):")
+            for ip, port in sorted(subscribers):
+                print(f"  {ip}:{port}")
+            if not peers:
+                print("(no live publisher/subscriber seen for this topic at rlcore -- "
+                      "either nothing is using it right now, or it's role-less raw "
+                      "registration-only traffic from before this role directory existed)")
+
 
 def build_parser():
-    # Shared options, added to BOTH the top-level parser (so they work
-    # before the subcommand, e.g. "rl_topic.py --rlcore-ip x list") and
-    # each subparser (so they also work after it, e.g.
-    # "rl_topic.py list --rlcore-ip x") -- argparse subparsers don't
-    # inherit a parent's options by position, only via `parents=`.
+    # Shared options, added ONLY to each subparser (e.g.
+    # "rl_topic.py list --rlcore-ip x"), not to the top-level parser too.
+    # Attaching the same `parents=[common]` to both was the original
+    # design, meant to also allow the flag before the subcommand -- but
+    # argparse subparsers silently re-apply their own defaults over
+    # anything the top-level parser already set for a same-named
+    # argument, so "rl_topic.py --rlcore-ip x list" parsed but silently
+    # dropped rlcore_ip back to None. Only accepting it after the
+    # subcommand avoids that footgun instead of trying to work around it.
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--rlcore-ip", default=None,
                          help="Query rlcore directly instead of broadcasting over multicast.")
@@ -361,15 +492,9 @@ def build_parser():
     common.add_argument("--port", type=int, default=DEFAULT_MULTICAST_PORT)
     common.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT_S,
                          help="How long to wait for replies (seconds).")
-    common.add_argument("--no-cache", action="store_true",
-                         help="Don't read or write ~/.cache/relink/topic_names.json.")
-    common.add_argument("--refresh", action="store_true",
-                         help="Discard the existing cache before merging in fresh results.")
-
     p = argparse.ArgumentParser(
         prog="rl_topic.py",
-        description="rostopic-style topic name directory CLI for ReLink.",
-        parents=[common])
+        description="rostopic-style topic name directory CLI for ReLink.")
 
     sub = p.add_subparsers(dest="command", required=True)
 
@@ -396,11 +521,20 @@ def build_parser():
                        help="Seconds of recent history to report on each tick.")
     p_bw.set_defaults(func=cmd_bw)
 
-    p_echo = sub.add_parser("echo", help="Print messages on a topic as raw hex (type-agnostic).",
+    p_echo = sub.add_parser("echo", help="Print messages on a topic, decoded if possible.",
                              parents=[common])
     p_echo.add_argument("topic", help="Topic name or numeric wire id to subscribe to.")
     p_echo.add_argument("-n", "--count", type=int, default=0,
                          help="Stop after this many messages (default: run until Ctrl-C).")
+    p_echo.add_argument("--type", default=None,
+                         help="Decode payloads as this built-in message type (e.g. Float32, "
+                              "Imu, Pose -- see relink/standard_msgs.py for the full list) "
+                              "instead of printing raw hex.")
+    p_echo.add_argument("--msg", default=None,
+                         help="Decode payloads using a custom schema file (see msg_schema.py "
+                              "for the .msg format) instead of printing raw hex.")
+    p_echo.add_argument("--hex", action="store_true",
+                         help="Always print raw hex, even if --type/--msg is also given.")
     p_echo.set_defaults(func=cmd_echo)
 
     p_pub = sub.add_parser("pub", help="Publish a raw payload to a topic (type-agnostic).",
@@ -418,6 +552,14 @@ def build_parser():
 
 def main():
     args = build_parser().parse_args()
+    if args.rlcore_ip:
+        save_conf(args.rlcore_ip, args.rlcore_port)
+    else:
+        remembered = load_conf()
+        if remembered is not None:
+            args.rlcore_ip, args.rlcore_port = remembered
+            print(f"rl_topic: using remembered rlcore at {args.rlcore_ip}:{args.rlcore_port} "
+                  f"(from {CONF_PATH}; pass --rlcore-ip to change)", file=sys.stderr)
     args.func(args)
 
 
