@@ -966,6 +966,22 @@ dropped, not silently accepted). This only covers the signaling
 handshake with rlcore, not the pub/sub data path itself, which stays
 plain UDP multicast/unicast as documented elsewhere in this README.
 
+**Why the data path itself isn't encrypted**: this is deliberate, not
+an oversight. Payload encryption would put AES-GCM (key setup, nonce
+generation, tag computation) on the hot path of *every single message*
+`publish()` sends — the same hot path Step 4/Step 15 already measure in
+nanoseconds and optimize for zero allocation, since ReLink's whole
+value proposition against a general framework like ROS 2/DDS is low
+per-message overhead. Registration happens once at startup plus one
+re-registration packet every ~0.3s per node — cheap to encrypt
+regardless of algorithm cost. Payload encryption doesn't have that
+luxury: it runs at whatever rate you're publishing (this project's own
+benchmarks push 1000+ Hz). If your deployment needs the data path
+encrypted too (e.g. untrusted network segments), that's a real gap
+today — put ReLink traffic inside a WireGuard/IPsec tunnel at the OS
+level instead, which gets you confidentiality without taxing every
+`publish()` call.
+
 Generate a key once, then give the same key to rlcore and to every
 node that talks to it:
 
