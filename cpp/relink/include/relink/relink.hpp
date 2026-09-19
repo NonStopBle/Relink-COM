@@ -8,6 +8,7 @@
 #include "relink/wire.hpp"
 #include "relink/udp_transport.hpp"
 #include "relink/rlcore_client.hpp"
+#include "relink/crypto.hpp"
 #include "relink/multicast_discovery.hpp"
 #include "relink/image.hpp"
 #include "relink/topic_hash.hpp"
@@ -51,15 +52,38 @@ public:
             rlcore_port_ = p;
         }
 
+        // Sets the pre-shared AES-256 key (as 64 hex characters, e.g.
+        // the output of `relink-rlcore --generate-key`) used to encrypt
+        // this node's RegisterRequest/RegisterAck exchange with rlcore.
+        // Throws if `hex_key` isn't exactly 64 valid hex characters,
+        // rather than silently registering unencrypted -- a typo'd key
+        // here should never look like a working, plaintext setup.
+        // rlcore must be started with the SAME key via --encrypt-key
+        // for registration to succeed; a mismatched or missing key on
+        // either side makes every RegisterRequest/RegisterAck fail to
+        // decrypt and get dropped as malformed (see rlcore_client.hpp).
+        void setEncryptKey(const std::string& hex_key) {
+            if (!hex_to_key32(hex_key, encrypt_key_)) {
+                throw std::runtime_error(
+                    "set_rlcore.setEncryptKey: expected 64 hex characters (a 32-byte AES-256 "
+                    "key) -- generate one with `relink-rlcore --generate-key`");
+            }
+            has_encrypt_key_ = true;
+        }
+
         bool ip_is_set() const { return ip_set_; }
         uint32_t resolved_ip() const { return rlcore_ip_; }
         uint16_t resolved_port() const { return rlcore_port_; }
+        bool has_encrypt_key() const { return has_encrypt_key_; }
+        const uint8_t* encrypt_key() const { return has_encrypt_key_ ? encrypt_key_ : nullptr; }
 
     private:
         RelinkNode& owner_;
         bool ip_set_ = false;
         uint32_t rlcore_ip_ = 0;
         uint16_t rlcore_port_ = kRlCoreDefaultPort;
+        bool has_encrypt_key_ = false;
+        uint8_t encrypt_key_[kAesKeyBytes] = {};
     };
 
     RelinkNode() : set_rlcore(*this) {}
@@ -757,7 +781,8 @@ private:
                     set_rlcore.resolved_ip(), set_rlcore.resolved_port(),
                     self_ip, g.transport->local_port(),
                     g.topics.data(), static_cast<uint16_t>(g.topics.size()),
-                    /*max_retries=*/1, /*timeout_ms=*/300, g.transport);
+                    /*max_retries=*/1, /*timeout_ms=*/300, g.transport,
+                    set_rlcore.encrypt_key());
                 if (outcome.ok) {
                     std::lock_guard<std::mutex> lock2(state_mutex_);
                     for (const auto& p : outcome.peers) {
@@ -1239,7 +1264,8 @@ private:
                         set_rlcore.resolved_ip(), set_rlcore.resolved_port(),
                         self_ip, g.first->local_port(),
                         to_register.data(), static_cast<uint16_t>(to_register.size()),
-                        /*max_retries=*/5, /*timeout_ms=*/100, g.first);
+                        /*max_retries=*/5, /*timeout_ms=*/100, g.first,
+                        set_rlcore.encrypt_key());
                     if (!outcome.ok) continue;
                     // Populate peers_ for EVERY entry in this ack first,
                     // fast and lock-only, before punching anything.

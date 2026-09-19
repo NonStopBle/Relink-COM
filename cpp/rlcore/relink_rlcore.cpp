@@ -27,6 +27,7 @@
 #include "relink/register.hpp"
 #include "relink/topic_directory.hpp"
 #include "relink/platform.hpp"
+#include "relink/crypto.hpp"
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
@@ -62,11 +63,30 @@ static double now_sec() {
 int main(int argc, char** argv) {
     uint16_t port = kRlCoreDefaultPort;
     bool nat_mode = false;
+    bool has_encrypt_key = false;
+    uint8_t encrypt_key[kAesKeyBytes] = {};
     for (int i = 1; i < argc; ++i) {
-        if (std::strcmp(argv[i], "--port") == 0 && i + 1 < argc) {
+        if (std::strcmp(argv[i], "--generate-key") == 0) {
+            // Prints a fresh random AES-256 key and exits -- does not
+            // start the daemon. Run once, then pass the printed hex to
+            // both this daemon's --encrypt-key and every node's
+            // node.set_rlcore.setEncryptKey(...); the same key must be
+            // used on both sides for registration to succeed.
+            uint8_t key[kAesKeyBytes];
+            generate_random_key32(key);
+            std::printf("%s\n", key32_to_hex(key).c_str());
+            return 0;
+        } else if (std::strcmp(argv[i], "--port") == 0 && i + 1 < argc) {
             port = static_cast<uint16_t>(std::atoi(argv[++i]));
         } else if (std::strcmp(argv[i], "--nat") == 0) {
             nat_mode = true;
+        } else if (std::strcmp(argv[i], "--encrypt-key") == 0 && i + 1 < argc) {
+            if (!hex_to_key32(argv[++i], encrypt_key)) {
+                std::fprintf(stderr, "relink-rlcore: --encrypt-key expects 64 hex characters "
+                             "(a 32-byte AES-256 key) -- generate one with --generate-key\n");
+                return 1;
+            }
+            has_encrypt_key = true;
         }
     }
 
@@ -250,8 +270,29 @@ int main(int argc, char** argv) {
         }
         if (role_kind == RoleDirKind::Reply) continue; // rlcore never queries anyone itself
 
+        // When --encrypt-key is set, every RegisterRequest must be an
+        // AES-256-GCM-sealed blob under that key -- opened here before
+        // decoding. A plaintext or wrong-key request fails to open and
+        // is dropped the same way a malformed one always was; this
+        // also authenticates the sender (GCM's tag), not just hides the
+        // payload from onlookers.
+        const uint8_t* req_data = recv_buf;
+        size_t req_data_len = static_cast<size_t>(n);
+        uint8_t decrypted_req[65507];
+        if (has_encrypt_key) {
+            size_t decrypted_len = 0;
+            if (!aes256gcm_open(encrypt_key, recv_buf, static_cast<size_t>(n),
+                                 decrypted_req, sizeof(decrypted_req), &decrypted_len)) {
+                std::fprintf(stderr, "relink-rlcore: dropped RegisterRequest that failed to "
+                             "decrypt (missing/wrong key on the sending node?)\n");
+                continue;
+            }
+            req_data = decrypted_req;
+            req_data_len = decrypted_len;
+        }
+
         DecodedRegisterRequest req{};
-        if (decode_register_request(recv_buf, static_cast<size_t>(n), &req) != RegisterDecodeResult::Ok) {
+        if (decode_register_request(req_data, req_data_len, &req) != RegisterDecodeResult::Ok) {
             std::fprintf(stderr, "relink-rlcore: dropped malformed RegisterRequest\n");
             continue;
         }
@@ -296,7 +337,20 @@ int main(int argc, char** argv) {
             continue;
         }
 
-        ::sendto(sock, reinterpret_cast<const char*>(send_buf), static_cast<int>(out_len), 0,
+        const uint8_t* wire_ack = send_buf;
+        size_t wire_ack_len = out_len;
+        uint8_t sealed_ack[65507];
+        if (has_encrypt_key) {
+            size_t sealed_len = 0;
+            if (!aes256gcm_seal(encrypt_key, send_buf, out_len, sealed_ack, sizeof(sealed_ack), &sealed_len)) {
+                std::fprintf(stderr, "relink-rlcore: failed to encrypt RegisterAck, not replying\n");
+                continue;
+            }
+            wire_ack = sealed_ack;
+            wire_ack_len = sealed_len;
+        }
+
+        ::sendto(sock, reinterpret_cast<const char*>(wire_ack), static_cast<int>(wire_ack_len), 0,
                  reinterpret_cast<struct sockaddr*>(&src), src_len);
 
         struct in_addr ia{};

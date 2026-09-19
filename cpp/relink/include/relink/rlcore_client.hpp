@@ -17,6 +17,7 @@
 #include "relink/register.hpp"
 #include "relink/udp_transport.hpp"
 #include "relink/platform.hpp"
+#include "relink/crypto.hpp"
 #include <cstdio>
 #include <cstdint>
 #include <vector>
@@ -48,13 +49,20 @@ struct RegisterOutcome {
 // recvfrom() directly, closing that race. When `transport` is null or
 // not yet started, recvfrom() here is safe (nothing else reads this
 // socket yet).
+//
+// `encrypt_key`: when non-null (32 bytes, see crypto.hpp), the
+// RegisterRequest is sealed with AES-256-GCM before sending and the
+// RegisterAck is opened with the same key before decoding -- rlcore
+// must be running with the matching --encrypt-key or every request
+// from this node will be silently dropped as malformed on its side.
 inline RegisterOutcome register_with_rlcore_on_socket(
     socket_t sock,
     uint32_t server_ip_host_order, uint16_t server_port,
     uint32_t self_ip_host_order, uint16_t self_data_port,
     const uint32_t* topic_ids, uint16_t topic_count,
     int max_retries = 3, int timeout_ms = 500,
-    UdpTransport* transport = nullptr) {
+    UdpTransport* transport = nullptr,
+    const uint8_t* encrypt_key = nullptr) {
     RegisterOutcome outcome;
 
     struct sockaddr_in server{};
@@ -83,6 +91,25 @@ inline RegisterOutcome register_with_rlcore_on_socket(
         return outcome; // ok=false
     }
 
+    // Seal AFTER encoding but BEFORE the retry loop -- the same sealed
+    // bytes are safe to resend verbatim on a timeout/retry (a fresh
+    // random nonce per attempt would also be fine, but re-sealing the
+    // identical plaintext on every retry is unnecessary work for no
+    // benefit here).
+    uint8_t sealed_req[65507];
+    const uint8_t* wire_req = req_buf;
+    size_t wire_req_len = req_len;
+    if (encrypt_key != nullptr) {
+        size_t sealed_len = 0;
+        if (!aes256gcm_seal(encrypt_key, req_buf, req_len, sealed_req, sizeof(sealed_req), &sealed_len)) {
+            std::fprintf(stderr, "register_with_rlcore: failed to encrypt RegisterRequest -- "
+                         "registration not attempted\n");
+            return outcome; // ok=false
+        }
+        wire_req = sealed_req;
+        wire_req_len = sealed_len;
+    }
+
     bool use_transport_queue = transport != nullptr && transport->is_running();
     // A RegisterAck listing many peers (large topic counts) can be
     // several KB -- an undersized buffer here silently truncates it at
@@ -99,9 +126,9 @@ inline RegisterOutcome register_with_rlcore_on_socket(
         }
 
         ssize_t sent = static_cast<ssize_t>(::sendto(sock,
-                                 reinterpret_cast<const char*>(req_buf), static_cast<int>(req_len), 0,
+                                 reinterpret_cast<const char*>(wire_req), static_cast<int>(wire_req_len), 0,
                                  reinterpret_cast<struct sockaddr*>(&server), sizeof(server)));
-        if (sent != static_cast<ssize_t>(req_len)) {
+        if (sent != static_cast<ssize_t>(wire_req_len)) {
             std::fprintf(stderr, "register_with_rlcore: attempt %d/%d timed out, retrying...\n",
                          attempt + 1, max_retries);
             backoff_ms *= 2;
@@ -125,6 +152,19 @@ inline RegisterOutcome register_with_rlcore_on_socket(
             if (n > 0) {
                 resp_data = resp_buf;
                 resp_len = static_cast<size_t>(n);
+            }
+        }
+
+        uint8_t opened_resp[65507];
+        if (resp_data != nullptr && encrypt_key != nullptr) {
+            size_t opened_len = 0;
+            if (aes256gcm_open(encrypt_key, resp_data, resp_len, opened_resp, sizeof(opened_resp), &opened_len)) {
+                resp_data = opened_resp;
+                resp_len = opened_len;
+            } else {
+                std::fprintf(stderr, "register_with_rlcore: dropped RegisterAck that failed to decrypt "
+                             "(wrong --encrypt-key on rlcore, or a corrupted/spoofed reply)\n");
+                resp_data = nullptr;
             }
         }
 
@@ -159,12 +199,13 @@ inline RegisterOutcome register_with_rlcore(
     uint32_t server_ip_host_order, uint16_t server_port,
     uint32_t self_ip_host_order, uint16_t self_data_port,
     const uint32_t* topic_ids, uint16_t topic_count,
-    int max_retries = 3, int timeout_ms = 500) {
+    int max_retries = 3, int timeout_ms = 500,
+    const uint8_t* encrypt_key = nullptr) {
     socket_t sock = ::socket(AF_INET, SOCK_DGRAM, 0);
     if (sock == kInvalidSocket) throw std::runtime_error("register_with_rlcore: socket() failed");
     RegisterOutcome outcome = register_with_rlcore_on_socket(
         sock, server_ip_host_order, server_port, self_ip_host_order, self_data_port,
-        topic_ids, topic_count, max_retries, timeout_ms);
+        topic_ids, topic_count, max_retries, timeout_ms, nullptr, encrypt_key);
     relink::close_socket(sock);
     return outcome;
 }

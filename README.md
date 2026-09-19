@@ -954,6 +954,50 @@ in Step 12). Step 13 covers the full technical mechanism (background
 re-punch, multiplexed-vs-per-topic-port routing, exactly what a NAT
 type can and can't be punched through).
 
+### `--encrypt-key`: encrypting the registration handshake
+
+By default, the RegisterRequest/RegisterAck exchange with rlcore is
+plaintext UDP — anyone on the same network segment (or in the NAT-
+traversal case, the same relay) could read who's registering which
+topics with which address, or spoof a reply. `--encrypt-key` seals that
+exchange with AES-256-GCM under a pre-shared key, so it's both
+confidential and authenticated (a wrong or missing key gets the packet
+dropped, not silently accepted). This only covers the signaling
+handshake with rlcore, not the pub/sub data path itself, which stays
+plain UDP multicast/unicast as documented elsewhere in this README.
+
+Generate a key once, then give the same key to rlcore and to every
+node that talks to it:
+
+```bash
+./relink-rlcore --generate-key
+# ef78d9acb11a87844e705a07ae66ddd7f0124c28899da2fa56062a6367e42e3d
+#   (prints one key and exits -- doesn't start the daemon)
+
+./relink-rlcore --port 8445 --encrypt-key ef78d9acb11a87844e705a07ae66ddd7f0124c28899da2fa56062a6367e42e3d
+```
+
+```cpp
+node.set_rlcore.ip("203.0.113.10");
+node.set_rlcore.setEncryptKey("ef78d9acb11a87844e705a07ae66ddd7f0124c28899da2fa56062a6367e42e3d");
+```
+
+`setEncryptKey` throws immediately if the string isn't exactly 64 hex
+characters (a 32-byte key) — a typo'd key fails loudly at startup
+instead of quietly registering unencrypted. If rlcore has a key
+configured and a node doesn't (or the two keys don't match), every
+RegisterRequest from that node is dropped as undecryptable and the node
+never gets peers — check both sides' key when registration mysteriously
+times out after adding `--encrypt-key`. Leaving `--encrypt-key` off
+`relink-rlcore` and never calling `setEncryptKey` on any node keeps the
+old plaintext behavior, unchanged, for existing deployments.
+
+The AES-256-GCM implementation is self-contained (no OpenSSL/libcrypto
+dependency), so it doesn't affect the Windows/macOS build steps above —
+verified byte-for-byte interoperable with OpenSSL's own AES-256-GCM
+during development, and with a live encrypted registration exchange
+between a native Linux node and `relink-rlcore.exe` running under Wine.
+
 ### AF_XDP — optional, and fully detachable
 
 `relink-relay` has an optional "fast mode" (`-DRELINK_ENABLE_XDP`) that
