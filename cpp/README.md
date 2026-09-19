@@ -85,6 +85,64 @@ Use [`cmake_example/`](cmake_example/) as a copy-pasteable template —
 it's self-contained (its own `CMakeLists.txt`, `main.cpp`, and a MinGW
 cross-compile toolchain file) and documents adapting it step by step.
 
+## Copying ReLink into your own project
+
+ReLink's C++ core is header-only — there is no library to build or
+`.so`/`.a` to link, and no package manager integration needed. "Using
+it in your project" means copying one directory and pointing your
+compiler's include path at it.
+
+1. **Copy the library.** Only `include/relink/` is needed — nothing
+   else in this repo (`rlcore/`, `examples/`, `tests/`, etc.) is
+   required at all to use ReLink as a library:
+
+   ```bash
+   cp -r cpp/include/relink /path/to/your_project/third_party/relink
+   ```
+
+   This is a real copy, not a reference back into this repo — your
+   project owns it from here and can pin it at whatever commit you
+   copied it from. There's no build step to re-run when you update it,
+   just copy the newer `include/relink/` over the old one.
+
+2. **Point your build at it.** Whatever build system you use, add
+   `third_party/` (the directory *containing* `relink/`, not `relink/`
+   itself) to your include path, since every header includes its
+   siblings as `#include "relink/something.hpp"`:
+
+   - **Raw compiler command:**
+     ```bash
+     g++ -std=c++17 -I third_party -pthread my_node.cpp -o my_node
+     ```
+   - **CMake** (see [`cmake_example/CMakeLists.txt`](cmake_example/CMakeLists.txt)
+     for the full working file, including the Windows/`ws2_32` and
+     macOS/Linux `pthread` handling this snippet omits for brevity):
+     ```cmake
+     target_include_directories(my_target PRIVATE third_party)
+     ```
+   - **Any other build system** (Makefile, Bazel, Meson, ...): add
+     `third_party` as a header search path the same way you would for
+     any other vendored header-only library.
+
+3. **`#include "relink/relink.hpp"`** in your code and use
+   `RelinkNode` — see [`src/pub.cpp`](src/pub.cpp)/[`src/sub.cpp`](src/sub.cpp)
+   for the smallest possible working example, or the main README for
+   the full API.
+
+4. **Windows** needs `-lws2_32` (or `target_link_libraries(... ws2_32)`
+   in CMake) in addition to the include path — nothing else changes,
+   the same headers work unmodified on Linux, macOS, and Windows (see
+   the main README's Step 15 for what `platform.hpp` handles
+   internally so you don't have to).
+
+That's the whole integration. If you'd rather start from a working
+project than wire this up by hand, copy
+[`cmake_example/`](cmake_example/) instead of doing steps 2-3
+yourself — it's already set up exactly as described above, just with
+`../include` pointing back into this repo instead of a copied
+`third_party/relink/`; change that one path and it's identical to what
+step 2 produces.
+
 ## Where to start reading
 
 - **Just want to see a working node?** [`src/pub.cpp`](src/pub.cpp),
