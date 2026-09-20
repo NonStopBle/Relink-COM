@@ -43,8 +43,7 @@ Run:
     python3 examples/camera_stream.py sub --display  # also live-shows image_raw in a cv2 window
 
 For a raw-camera-only ReLink-vs-ROS2 comparison (throughput/overhead/latency),
-see examples/ros2_compare/ (ros2_camera_pub.py / ros2_camera_sub.py) and
-COMPARISON.md in that directory.
+see examples/ros2_compare/ (ros2_camera_pub.py / ros2_camera_sub.py).
 """
 import sys
 import os

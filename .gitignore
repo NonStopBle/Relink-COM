@@ -19,10 +19,5 @@ __pycache__/
 *.out
 *.log
 
-# Internal design spec -- not part of the public-facing repo
-relink-com-spec.md
-relink_com_implement.md
-relink-com-spec.md
-
 # pip editable-install metadata
 *.egg-info/
