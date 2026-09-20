@@ -138,6 +138,11 @@ run `examples/relink_image_benchmark.py pub/sub udp` vs `pub/sub shm`
 to reproduce them yourself (see the file's module docstring for a UDP
 launch-order caveat).
 
+Want to poke at a `*_local_ipc` topic without writing code? `rltopic`'s
+`hz`/`bw`/`echo`/`pub` subcommands take an `--ipc` flag that targets
+the shared-memory ring directly instead of the network -- see the root
+`python/README.md`'s "Using the commands" section for examples.
+
 ## Tests
 
 ```

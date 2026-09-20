@@ -41,7 +41,17 @@ rltopic list --rlcore-ip 203.0.113.10
 rltopic info /example/chatter --rlcore-ip 203.0.113.10
 rltopic echo /example/chatter --rlcore-ip 203.0.113.10
 rltopic list                           # no --rlcore-ip: multicast discovery instead
+
+rltopic echo /my/ipc/topic --ipc       # same-host shared-memory IPC instead of the
+rltopic pub /my/ipc/topic --ipc --text "hi"  # network -- no rlcore/multicast involved at all
 ```
+
+`--ipc` works on `hz`/`bw`/`echo`/`pub` (not `list`/`info`, which have
+nothing to query for a same-host-only topic) and resolves `<topic>` to
+a numeric id with the same name hash the network path uses, then talks
+directly to the shared-memory ring (`advertise_local_ipc`/
+`subscribe_local_ipc`/`publish_local_ipc`) -- see [Same-host
+IPC](relink_py/README.md#same-host-ipc) below.
 
 Unlike the C++ build, which keeps `relink-relay` as its own separate
 binary/process, the Python build folds relay-fallback forwarding
