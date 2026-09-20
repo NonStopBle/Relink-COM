@@ -132,11 +132,14 @@ compiler's include path at it.
    for the smallest possible working example, or the main README for
    the full API.
 
-4. **Windows** needs `-lws2_32` (or `target_link_libraries(... ws2_32)`
-   in CMake) in addition to the include path — nothing else changes,
-   the same headers work unmodified on Linux, macOS, and Windows (see
-   the main README's Step 15 for what `platform.hpp` handles
-   internally so you don't have to).
+4. **Windows** needs `-lws2_32 -D_WIN32_WINNT=0x0600` (or
+   `target_link_libraries(... ws2_32)` +
+   `target_compile_definitions(... _WIN32_WINNT=0x0600)` in CMake) in
+   addition to the include path — nothing else changes, the same
+   headers work unmodified on Linux, macOS, and Windows (see the main
+   README's Step 15 for what `platform.hpp` handles internally so you
+   don't have to, and why the version define specifically has to be a
+   compile flag rather than something baked into the header).
 
 That's the whole integration. If you'd rather start from a working
 project than wire this up by hand, copy

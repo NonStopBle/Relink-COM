@@ -43,6 +43,9 @@ if(WIN32)
     # Winsock -- required on Windows, no equivalent needed on
     # Linux/macOS since sockets are already part of libc there.
     target_link_libraries(relink_app PRIVATE ws2_32)
+    # See cpp/CMakeLists.txt's own WIN32 branch for why this has to be
+    # a compile definition rather than a #define inside platform.hpp.
+    target_compile_definitions(relink_app PRIVATE _WIN32_WINNT=0x0600)
     # Static-link the MinGW runtime (libgcc/libstdc++/libwinpthread) so
     # the resulting .exe runs standalone -- without this, it silently
     # depends on DLLs (libwinpthread-1.dll, etc.) that MinGW installs

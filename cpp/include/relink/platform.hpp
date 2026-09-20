@@ -41,6 +41,21 @@
 #ifndef NOGDI
 #define NOGDI
 #endif
+// inet_pton()/inet_ntop() (ws2tcpip.h) are only declared when the
+// targeted Windows version is Vista (0x0600) or newer -- some MinGW-w64
+// toolchain builds default lower than that, which compiles fine right
+// up until ipv4_to_host_order()/multicast_discovery.hpp call inet_pton
+// and it's silently missing. This #ifndef is a best-effort fallback for
+// whatever includes this header standalone/first -- it does NOT
+// reliably win in this project's real include chain (relink.hpp pulls
+// in wire.hpp's <cstdint> before platform.hpp, and MinGW's <cstdint>
+// already sets its own default _WIN32_WINNT by then), so the actual
+// fix is a command-line -D_WIN32_WINNT=0x0600 (see cpp/CMakeLists.txt
+// and cmake_example/CMakeLists.txt's WIN32 branches) -- always wins
+// regardless of include order.
+#ifndef _WIN32_WINNT
+#define _WIN32_WINNT 0x0600
+#endif
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>

@@ -25,21 +25,33 @@
 // ARM64, so this needs no OS-level lock -- std::atomic here is just to
 // stop the compiler from reordering/caching the load across the mmap
 // boundary, not for hardware atomicity.
+//
+// POSIX only (shm_open/mmap) -- not available on Windows (see the main
+// README's "Porting the C++ core to Windows" section). Rather than
+// making every other header in this project conditionally include
+// this one, ShmRing itself compiles unchanged on Windows via the stub
+// below: every method just returns false/no-ops, so RelinkNode's
+// *_local_ipc methods fail gracefully at runtime (same "loudly return
+// false, never silently misbehave" policy the rest of this codebase
+// already uses) instead of failing to build at all.
 #pragma once
 
 #include <atomic>
 #include <cstdint>
 #include <cstring>
 #include <string>
+#include <chrono>
+#include <thread>
+#include <functional>
+
+#ifndef _WIN32
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #include <errno.h>
 #include <signal.h>
-#include <chrono>
-#include <thread>
-#include <functional>
+#endif
 
 namespace relink {
 
@@ -59,6 +71,8 @@ struct ShmRingHeader {
     std::atomic<uint32_t> tail;      // producer-owned: index of next slot to write
     uint32_t creator_pid;            // liveness check for stale-segment detection
 };
+
+#ifndef _WIN32
 
 // One ring per (topic, publisher-process, subscriber-process) pair --
 // strictly single-producer/single-consumer, same fan-out model as
@@ -228,5 +242,29 @@ private:
     uint32_t max_payload_ = kShmMaxPayload;
     uint32_t slot_size_ = kShmMaxPayload + 8;
 };
+
+#else  // _WIN32: same-host shared memory isn't wired up on this platform
+       // yet -- every method fails cleanly rather than failing to build.
+
+class ShmRing {
+public:
+    bool open(const std::string&, uint32_t capacity = kShmDefaultCapacity,
+              uint32_t max_payload = kShmMaxPayload) {
+        max_payload_ = max_payload;
+        return false;
+    }
+    bool try_push(const uint8_t*, uint32_t, uint32_t) { return false; }
+    bool try_pop(uint8_t*, uint32_t&, uint32_t&) { return false; }
+    bool try_pop_zero_copy(const std::function<void(const uint8_t*, uint32_t, uint32_t)>&) { return false; }
+    bool is_creator() const { return false; }
+    uint32_t max_payload() const { return max_payload_; }
+    void unlink() {}
+    void close_mapping() {}
+
+private:
+    uint32_t max_payload_ = kShmMaxPayload;
+};
+
+#endif  // _WIN32
 
 }  // namespace relink

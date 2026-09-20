@@ -40,6 +40,24 @@ target_include_directories(relink INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_compile_features(relink INTERFACE cxx_std_17)
 if(WIN32)
     target_link_libraries(relink INTERFACE ws2_32)
+    # ws2tcpip.h only declares inet_pton()/inet_ntop() when targeting
+    # Vista (0x0600) or newer -- passed as a compile definition (not a
+    # #define inside platform.hpp) because by the time any of this
+    # project's own headers run, something earlier in the same
+    # translation unit (e.g. wire.hpp's <cstdint>) has usually already
+    # pulled in MinGW's own default _WIN32_WINNT, so an in-header
+    # #ifndef guard loses that race. A command-line -D always wins.
+    target_compile_definitions(relink INTERFACE _WIN32_WINNT=0x0600)
+    # Static-link the MinGW runtime (libgcc/libstdc++/libwinpthread) so
+    # every resulting .exe runs standalone -- without this, any binary
+    # using std::thread (i.e. almost everything here, via
+    # udp_transport.hpp's data thread) silently depends on
+    # libwinpthread-1.dll/libgcc_s_seh-1.dll/libstdc++-6.dll, which
+    # MinGW installs into its own bin/ but a plain Windows machine (or
+    # a fresh Wine prefix) won't have -- it fails to even start, with
+    # no indication why short of running it and reading the loader
+    # error. Same fix cmake_example/CMakeLists.txt already applies.
+    target_link_options(relink INTERFACE -static)
 else()
     find_package(Threads REQUIRED)
     target_link_libraries(relink INTERFACE Threads::Threads)
@@ -154,8 +172,14 @@ if(RELINK_BUILD_TESTS)
         test_image
         test_compressed_image
         test_adaptive_bitrate
-        test_relink_node
-        test_shm_transport)
+        test_relink_node)
+    if(NOT WIN32)
+        # test_shm_transport.cpp exercises crash recovery via a real
+        # fork()+SIGKILL+waitpid() -- POSIX-only, same as ShmRing itself
+        # (shm_transport.hpp's Windows branch stubs every method out
+        # rather than being tested here; see its header comment).
+        list(APPEND RELINK_UNIT_TESTS test_shm_transport)
+    endif()
     foreach(t ${RELINK_UNIT_TESTS})
         add_executable(${t} tests/${t}.cpp)
         target_link_libraries(${t} PRIVATE relink)

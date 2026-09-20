@@ -210,20 +210,25 @@ hardware — if you hit something, please open an issue.
 # Option A: MSYS2/MinGW-w64 (recommended -- closest to the Linux/macOS
 # build commands above, no Visual Studio needed)
 pacman -S mingw-w64-x86_64-gcc
-g++ -std=c++17 -I cpp/include cpp/examples/hello_relink.cpp -o hello_relink.exe -lws2_32
+g++ -std=c++17 -D_WIN32_WINNT=0x0600 -I cpp/include cpp/examples/hello_relink.cpp -o hello_relink.exe -lws2_32
 
 # Option B: cross-compile FROM Linux/WSL for Windows (what this
 # project's own CI/verification used -- see Step 11)
 sudo apt-get install -y g++-mingw-w64-x86-64-posix
-x86_64-w64-mingw32-g++ -std=c++17 -I cpp/include hello_relink.cpp -o hello_relink.exe -lws2_32
+x86_64-w64-mingw32-g++ -std=c++17 -D_WIN32_WINNT=0x0600 -I cpp/include hello_relink.cpp -o hello_relink.exe -lws2_32
 ```
 
 `-lws2_32` (Winsock) is required on Windows — there's no equivalent
 flag on Linux/macOS since sockets are already part of libc there.
-MSVC (`cl.exe`) is not tested but should work with the same `-lws2_32`
-equivalent (`ws2_32.lib`) and no other changes, since the Windows code
-path (`relink/platform.hpp`) is plain Win32/Winsock API, not
-MinGW-specific.
+`-D_WIN32_WINNT=0x0600` (Vista) is also required: `ws2tcpip.h` only
+declares `inet_pton()` at that version or newer, and some MinGW-w64
+toolchains default lower — CMake builds get this automatically
+(`cpp/CMakeLists.txt`'s `WIN32` branch), but a raw compiler invocation
+like the ones above needs it spelled out explicitly. MSVC (`cl.exe`) is
+not tested but should work with the same two flags' equivalents
+(`ws2_32.lib`, `_WIN32_WINNT=0x0600`) and no other changes, since the
+Windows code path (`relink/platform.hpp`) is plain Win32/Winsock API,
+not MinGW-specific.
 
 **Verified, not just theorized**: the Windows build was cross-compiled
 with MinGW-w64 and actually run under Wine — every unit/integration
@@ -335,9 +340,12 @@ this repo:
    [`cpp/src/pub.cpp`](cpp/src/pub.cpp)/[`cpp/src/sub.cpp`](cpp/src/sub.cpp)
    for the smallest working example.
 
-4. **Windows** additionally needs `-lws2_32` (or
-   `target_link_libraries(... ws2_32)` in CMake) — the same headers
-   work unmodified on Linux, macOS, and Windows otherwise.
+4. **Windows** additionally needs `-lws2_32 -D_WIN32_WINNT=0x0600` (or
+   `target_link_libraries(... ws2_32)` +
+   `target_compile_definitions(... _WIN32_WINNT=0x0600)` in CMake) —
+   see the note right after the Windows build commands above for why
+   the version define is needed — the same headers work unmodified on
+   Linux, macOS, and Windows otherwise.
 
 Verified: copying just `cpp/include/relink/` to a throwaway directory
 outside this repo and compiling/running a small node against it with

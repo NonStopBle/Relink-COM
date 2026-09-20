@@ -33,6 +33,17 @@ target_include_directories(relink-relay PRIVATE ${RELINK_INCLUDE_DIR})
 if(WIN32)
     target_link_libraries(relink-rlcore PRIVATE ws2_32)
     target_link_libraries(relink-relay PRIVATE ws2_32)
+    # See ../CMakeLists.txt's `relink` INTERFACE target for why this is
+    # needed (inet_pton() needs Vista+) -- this subdirectory builds its
+    # own targets standalone rather than through that INTERFACE target,
+    # so it needs the same definition applied here too.
+    target_compile_definitions(relink-rlcore PRIVATE _WIN32_WINNT=0x0600)
+    target_compile_definitions(relink-relay PRIVATE _WIN32_WINNT=0x0600)
+    # Same standalone-target reasoning as above, this time for static
+    # linking (see ../CMakeLists.txt's `relink` INTERFACE target) --
+    # win-bin/'s prebuilt .exes are already built this way.
+    target_link_options(relink-rlcore PRIVATE -static)
+    target_link_options(relink-relay PRIVATE -static)
 endif()
 
 if(RELINK_ENABLE_XDP)
