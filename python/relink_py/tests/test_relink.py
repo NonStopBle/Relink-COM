@@ -4,6 +4,7 @@ framework dependency, prints ok/FAIL per check, exits nonzero on failure."""
 
 import ctypes
 import os
+import subprocess
 import sys
 import threading
 import time
@@ -234,6 +235,37 @@ node4 = RelinkNode()
 node4.set_rlcore.port(9000)
 node4.advertise(100, Int32)
 check_throws(lambda: node4.publish(100, Int32(data=42)), "port without ip -> throws")
+
+# --- rl_topic CLI: --ipc guard on list/info ---
+# Mirrors cpp/tests/test_rl_topic_cli.cpp. list/info have no --ipc
+# argument at all (see build_parser()) -- there is no central directory
+# of same-host-only IPC topics for them to query, unlike UDP topics
+# which rlcore/multicast can always answer about. argparse itself must
+# reject --ipc there with a nonzero exit, not hang or silently ignore it.
+_RELINK_PY_DIR = os.path.join(os.path.dirname(__file__), "..")
+
+
+def _run_rl_topic(args):
+    return subprocess.run(
+        [sys.executable, "-m", "relink.cli.rl_topic"] + args,
+        cwd=_RELINK_PY_DIR, capture_output=True, text=True, timeout=10,
+    )
+
+
+_r = _run_rl_topic(["list", "--ipc"])
+check(_r.returncode == 2, "rltopic list --ipc: exits nonzero (argparse rejects unknown arg)")
+check("--ipc" in _r.stderr, "rltopic list --ipc: stderr names the rejected argument")
+
+_r = _run_rl_topic(["info", "/some/topic", "--ipc"])
+check(_r.returncode == 2, "rltopic info --ipc: exits nonzero (argparse rejects unknown arg)")
+check("--ipc" in _r.stderr, "rltopic info --ipc: stderr names the rejected argument")
+
+# Regression guard the other direction: pub --ipc (which DOES accept
+# --ipc, and returns immediately -- no peer-wait loop, unlike UDP) must
+# not be broken by anything guarding list/info.
+_r = _run_rl_topic(["pub", "/relink/test_cli_ipc_guard", "--ipc", "--text", "hello"])
+check(_r.returncode == 0, "rltopic pub --ipc: still exits 0")
+check("published" in _r.stdout, "rltopic pub --ipc: still publishes")
 
 print()
 if failures == 0:

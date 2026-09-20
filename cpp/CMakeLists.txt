@@ -186,6 +186,17 @@ if(RELINK_BUILD_TESTS)
         add_test(NAME ${t} COMMAND ${t})
     endforeach()
 
+    if(NOT WIN32)
+        # test_rl_topic_cli.cpp shells out to the built rl_topic binary
+        # (popen/WIFEXITED are POSIX-only) to cover its --ipc argument
+        # handling -- the list/info rejection path in particular, which
+        # nothing else exercises.
+        add_executable(test_rl_topic_cli tests/test_rl_topic_cli.cpp)
+        target_compile_definitions(test_rl_topic_cli PRIVATE
+            RL_TOPIC_EXE="$<TARGET_FILE:rl_topic>")
+        add_test(NAME test_rl_topic_cli COMMAND test_rl_topic_cli)
+    endif()
+
     # Multi-process/interactive CLIs (need to be run in pairs, or with
     # manual arguments/another process on the other end) -- built for
     # convenience, but deliberately not registered as ctest cases.
