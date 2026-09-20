@@ -224,6 +224,11 @@ def resolve_topic_arg(raw: str):
 
 def make_node(args) -> RelinkNode:
     node = RelinkNode()
+    if getattr(args, "ipc", False):
+        # Same-host IPC has no discovery step -- the shm ring is
+        # attached to directly by topic id, so skip rlcore/multicast
+        # setup entirely rather than doing needless network work.
+        return node
     if args.rlcore_ip:
         node.set_rlcore.ip(args.rlcore_ip)
         node.set_rlcore.port(args.rlcore_port)
@@ -260,16 +265,25 @@ def cmd_hz(args):
     def on_msg(payload: bytes):
         arrivals.append(time.monotonic())
 
-    node.subscribe_raw(topic, on_msg)
-    node.spin_once()
-    print(f"subscribed to topic id {topic_id} ({args.topic}), waiting for messages "
-          f"(Ctrl-C to stop)...", file=sys.stderr)
+    if args.ipc:
+        node.subscribe_local_ipc(topic, on_msg)
+    else:
+        node.subscribe_raw(topic, on_msg)
+    # spin_once() drives the UDP data path (registration, beacons,
+    # discovery) -- irrelevant to local IPC, whose subscribe_local_ipc()
+    # call above already started its own polling thread, and calling it
+    # here would require discovery to be configured for no reason.
+    if not args.ipc:
+        node.spin_once()
+    print(f"subscribed to {'local-IPC ' if args.ipc else ''}topic id {topic_id} ({args.topic}), "
+          f"waiting for messages (Ctrl-C to stop)...", file=sys.stderr)
 
     window = args.window
     try:
         while True:
             time.sleep(0.5)
-            node.spin_once()
+            if not args.ipc:
+                node.spin_once()
             cutoff = time.monotonic() - args.report_every
             recent = [t for t in arrivals if t >= cutoff]
             if len(recent) < 2:
@@ -299,15 +313,21 @@ def cmd_bw(args):
     def on_msg(payload: bytes):
         samples.append((time.monotonic(), len(payload)))
 
-    node.subscribe_raw(topic, on_msg)
-    node.spin_once()
-    print(f"subscribed to topic id {topic_id} ({args.topic}), waiting for messages "
-          f"(Ctrl-C to stop)...", file=sys.stderr)
+    if args.ipc:
+        node.subscribe_local_ipc(topic, on_msg)
+    else:
+        node.subscribe_raw(topic, on_msg)
+    # See cmd_hz()'s comment on skipping spin_once() for --ipc.
+    if not args.ipc:
+        node.spin_once()
+    print(f"subscribed to {'local-IPC ' if args.ipc else ''}topic id {topic_id} ({args.topic}), "
+          f"waiting for messages (Ctrl-C to stop)...", file=sys.stderr)
 
     try:
         while True:
             time.sleep(1.0)
-            node.spin_once()
+            if not args.ipc:
+                node.spin_once()
             cutoff = time.monotonic() - args.report_every
             recent = [s for s in samples if s[0] >= cutoff]
             if len(recent) < 2:
@@ -390,13 +410,20 @@ def cmd_echo(args):
             sys.stdout.flush()
             os._exit(0)
 
-    node.subscribe_raw(topic, on_msg)
-    node.spin_once()
-    print(f"subscribed to topic id {topic_id} ({args.topic}) (Ctrl-C to stop)...", file=sys.stderr)
+    if args.ipc:
+        node.subscribe_local_ipc(topic, on_msg)
+    else:
+        node.subscribe_raw(topic, on_msg)
+    # See cmd_hz()'s comment on skipping spin_once() for --ipc.
+    if not args.ipc:
+        node.spin_once()
+    print(f"subscribed to {'local-IPC ' if args.ipc else ''}topic id {topic_id} ({args.topic}) "
+          f"(Ctrl-C to stop)...", file=sys.stderr)
     try:
         while True:
             time.sleep(0.05)
-            node.spin_once()
+            if not args.ipc:
+                node.spin_once()
     except KeyboardInterrupt:
         pass
 
@@ -413,6 +440,25 @@ def cmd_pub(args):
     node = make_node(args)
     topic = resolve_topic_arg(args.topic)
     topic_id = node._topic_id_for(topic)
+
+    if args.ipc:
+        # No discovery step for same-host IPC -- the ring is created/
+        # attached to directly, and messages sit in it until a
+        # subscriber attaches and drains them (up to capacity), so
+        # there's no "wait for a peer" concept here (unlike UDP's
+        # wait_for_peers() below).
+        if not node.advertise_local_ipc(topic):
+            print(f"rl_topic pub: advertise_local_ipc() failed for topic id {topic_id}", file=sys.stderr)
+            sys.exit(1)
+        reps = args.repeat if args.repeat else 1
+        for i in range(reps):
+            ok = node.publish_local_ipc(topic, payload)
+            print(f"published {len(payload)} bytes to local-IPC topic id {topic_id} "
+                  f"({args.topic}): {'ok' if ok else 'ring full / failed'}")
+            if i + 1 < reps:
+                time.sleep(args.rate_period)
+        return
+
     node.advertise_raw(topic)  # must declare BEFORE the first spin_once()
     n_peers = wait_for_peers(node, topic_id, args.timeout)
     if n_peers == 0:
@@ -525,12 +571,18 @@ def build_parser():
     p_info.add_argument("topic", help="Topic name (e.g. /relink/imu) or numeric wire id.")
     p_info.set_defaults(func=cmd_info)
 
+    ipc_help = ("Target a same-host shared-memory IPC topic instead of the network "
+                "(relink/shm_transport.py) -- <topic> is still resolved to a numeric id "
+                "via the same string hash UDP topics use, but no rlcore/multicast query is "
+                "performed; the shm ring is attached to directly.")
+
     p_hz = sub.add_parser("hz", help="Measure the publish rate of a topic (raw, type-agnostic).",
                            parents=[common])
     p_hz.add_argument("topic", help="Topic name or numeric wire id to subscribe to.")
     p_hz.add_argument("--window", type=int, default=100, help="Rolling sample window size.")
     p_hz.add_argument("--report-every", type=float, default=5.0,
                        help="Seconds of recent history to report on each tick.")
+    p_hz.add_argument("--ipc", action="store_true", help=ipc_help)
     p_hz.set_defaults(func=cmd_hz)
 
     p_bw = sub.add_parser("bw", help="Measure the bandwidth of a topic (raw, type-agnostic).",
@@ -538,6 +590,7 @@ def build_parser():
     p_bw.add_argument("topic", help="Topic name or numeric wire id to subscribe to.")
     p_bw.add_argument("--report-every", type=float, default=5.0,
                        help="Seconds of recent history to report on each tick.")
+    p_bw.add_argument("--ipc", action="store_true", help=ipc_help)
     p_bw.set_defaults(func=cmd_bw)
 
     p_echo = sub.add_parser("echo", help="Print messages on a topic, decoded if possible.",
@@ -554,6 +607,7 @@ def build_parser():
                               "for the .msg format) instead of printing raw hex.")
     p_echo.add_argument("--hex", action="store_true",
                          help="Always print raw hex, even if --type/--msg is also given.")
+    p_echo.add_argument("--ipc", action="store_true", help=ipc_help)
     p_echo.set_defaults(func=cmd_echo)
 
     p_pub = sub.add_parser("pub", help="Publish a raw payload to a topic (type-agnostic).",
@@ -564,6 +618,7 @@ def build_parser():
     p_pub.add_argument("-r", "--repeat", type=int, default=1, help="Number of times to publish.")
     p_pub.add_argument("--rate-period", type=float, default=1.0,
                         help="Seconds between repeats when --repeat > 1.")
+    p_pub.add_argument("--ipc", action="store_true", help=ipc_help)
     p_pub.set_defaults(func=cmd_pub)
 
     return p

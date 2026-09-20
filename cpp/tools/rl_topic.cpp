@@ -11,7 +11,19 @@
 // Usage: rl_topic list | info <topic> | hz <topic> | bw <topic> |
 //        echo <topic> | pub <topic> --hex <bytes> | --text <string>
 //   [--rlcore-ip <ip>] [--rlcore-port <port>] [--group <ip>] [--port <n>]
-//   [--timeout <s>] [--no-cache] [--refresh]
+//   [--timeout <s>] [--no-cache] [--refresh] [--ipc]
+//
+// --ipc (hz/bw/echo/pub only, not list/info -- see below) targets a
+// same-host shared-memory topic (relink/shm_transport.hpp) instead of
+// the network: <topic> is resolved to a numeric id via the exact same
+// topic_id_for() string hash UDP topics use, then subscribed/published
+// through advertise_local_ipc/subscribe_local_ipc/publish_local_ipc
+// instead of *_raw()/UDP sockets. No rlcore/multicast round trip is
+// needed or performed -- same-host IPC has no discovery step, the ring
+// is attached to directly (see relink_image_benchmark.cpp's header
+// comment for why). `list`/`info` still refuse --ipc: there is no
+// central directory of shm-only topics to enumerate, unlike UDP's
+// rlcore/multicast-backed topic directory.
 
 #include "relink/relink.hpp"
 #include "relink/topic_directory.hpp"
@@ -53,6 +65,7 @@ struct Args {
     double timeout = 1.5;
     bool no_cache = false;
     bool refresh = false;
+    bool ipc = false;
     int window = 100;
     double report_every = 5.0;
     int count = 0;
@@ -87,6 +100,7 @@ static Args parse_args(int argc, char** argv) {
         else if (arg == "--timeout") { next_arg(argc, argv, i, &val); a.timeout = std::atof(val.c_str()); }
         else if (arg == "--no-cache") { a.no_cache = true; }
         else if (arg == "--refresh") { a.refresh = true; }
+        else if (arg == "--ipc") { a.ipc = true; }
         else if (arg == "--window") { next_arg(argc, argv, i, &val); a.window = std::atoi(val.c_str()); }
         else if (arg == "--report-every") { next_arg(argc, argv, i, &val); a.report_every = std::atof(val.c_str()); }
         else if (arg == "-n" || arg == "--count") { next_arg(argc, argv, i, &val); a.count = std::atoi(val.c_str()); }
@@ -422,23 +436,30 @@ static std::atomic<bool> g_stop{false};
 static void on_sigint(int) { g_stop.store(true); }
 
 static void cmd_hz(const Args& a) {
-    RelinkNode node; configure_node(node, a);
+    RelinkNode node;
+    if (!a.ipc) configure_node(node, a);
     uint32_t topic_id = resolve_topic(node, a.topic);
     std::mutex m;
     std::vector<double> arrivals;
-    node.subscribe_raw(topic_id, [&](const uint8_t*, size_t) {
+    auto on_msg = [&](const uint8_t*, size_t) {
         std::lock_guard<std::mutex> lk(m);
         arrivals.push_back(std::chrono::duration<double>(
             std::chrono::steady_clock::now().time_since_epoch()).count());
-    });
-    node.spin_once();
-    std::fprintf(stderr, "subscribed to topic id %u (%s), waiting for messages (Ctrl-C to stop)...\n",
-                 topic_id, a.topic.c_str());
+    };
+    if (a.ipc) node.subscribe_local_ipc(topic_id, on_msg);
+    else node.subscribe_raw(topic_id, on_msg);
+    // spin_once() drives the UDP data path (registration, beacons,
+    // discovery) -- irrelevant to local IPC, whose subscribe_local_ipc()
+    // call above already started its own polling thread, and calling it
+    // here would require discovery to be configured for no reason.
+    if (!a.ipc) node.spin_once();
+    std::fprintf(stderr, "subscribed to %stopic id %u (%s), waiting for messages (Ctrl-C to stop)...\n",
+                 a.ipc ? "local-IPC " : "", topic_id, a.topic.c_str());
     std::signal(SIGINT, on_sigint);
 
     while (!g_stop.load()) {
         std::this_thread::sleep_for(std::chrono::milliseconds(500));
-        node.spin_once();
+        if (!a.ipc) node.spin_once();
         std::vector<double> recent;
         {
             std::lock_guard<std::mutex> lk(m);
@@ -466,23 +487,27 @@ static void cmd_hz(const Args& a) {
 }
 
 static void cmd_bw(const Args& a) {
-    RelinkNode node; configure_node(node, a);
+    RelinkNode node;
+    if (!a.ipc) configure_node(node, a);
     uint32_t topic_id = resolve_topic(node, a.topic);
     std::mutex m;
     std::vector<std::pair<double, size_t>> samples;
-    node.subscribe_raw(topic_id, [&](const uint8_t*, size_t len) {
+    auto on_msg = [&](const uint8_t*, size_t len) {
         std::lock_guard<std::mutex> lk(m);
         samples.push_back({std::chrono::duration<double>(
             std::chrono::steady_clock::now().time_since_epoch()).count(), len});
-    });
-    node.spin_once();
-    std::fprintf(stderr, "subscribed to topic id %u (%s), waiting for messages (Ctrl-C to stop)...\n",
-                 topic_id, a.topic.c_str());
+    };
+    if (a.ipc) node.subscribe_local_ipc(topic_id, on_msg);
+    else node.subscribe_raw(topic_id, on_msg);
+    // See cmd_hz()'s comment on skipping spin_once() for --ipc.
+    if (!a.ipc) node.spin_once();
+    std::fprintf(stderr, "subscribed to %stopic id %u (%s), waiting for messages (Ctrl-C to stop)...\n",
+                 a.ipc ? "local-IPC " : "", topic_id, a.topic.c_str());
     std::signal(SIGINT, on_sigint);
 
     while (!g_stop.load()) {
         std::this_thread::sleep_for(std::chrono::milliseconds(1000));
-        node.spin_once();
+        if (!a.ipc) node.spin_once();
         std::vector<std::pair<double, size_t>> recent;
         {
             std::lock_guard<std::mutex> lk(m);
@@ -505,19 +530,24 @@ static void cmd_bw(const Args& a) {
 }
 
 static void cmd_echo(const Args& a) {
-    RelinkNode node; configure_node(node, a);
+    RelinkNode node;
+    if (!a.ipc) configure_node(node, a);
     uint32_t topic_id = resolve_topic(node, a.topic);
     std::atomic<int> count{0};
-    node.subscribe_raw(topic_id, [&](const uint8_t* payload, size_t len) {
+    auto on_msg = [&](const uint8_t* payload, size_t len) {
         int n = ++count;
         std::printf("--- #%d (%zu bytes) ---\n", n, len);
         for (size_t i = 0; i < len; ++i) std::printf("%02x ", payload[i]);
         std::printf("\n");
         std::fflush(stdout);
         if (a.count && n >= a.count) std::_Exit(0); // same rationale as rl_topic.py: runs off the data thread
-    });
-    node.spin_once();
-    std::fprintf(stderr, "subscribed to topic id %u (%s) (Ctrl-C to stop)...\n", topic_id, a.topic.c_str());
+    };
+    if (a.ipc) node.subscribe_local_ipc(topic_id, on_msg);
+    else node.subscribe_raw(topic_id, on_msg);
+    // See cmd_hz()'s comment on skipping spin_once() for --ipc.
+    if (!a.ipc) node.spin_once();
+    std::fprintf(stderr, "subscribed to %stopic id %u (%s) (Ctrl-C to stop)...\n",
+                 a.ipc ? "local-IPC " : "", topic_id, a.topic.c_str());
     std::signal(SIGINT, on_sigint);
     while (!g_stop.load()) std::this_thread::sleep_for(std::chrono::milliseconds(50));
 }
@@ -536,8 +566,30 @@ static void cmd_pub(const Args& a) {
         payload.assign(a.text_payload.begin(), a.text_payload.end());
     }
 
-    RelinkNode node; configure_node(node, a);
+    RelinkNode node;
+    if (!a.ipc) configure_node(node, a);
     uint32_t topic_id = resolve_topic(node, a.topic);
+
+    if (a.ipc) {
+        // No discovery step for same-host IPC -- the ring is created/
+        // attached to directly, and messages sit in it until a
+        // subscriber attaches and drains them (up to capacity), so
+        // there's no "wait for a peer" concept to apply here (unlike
+        // UDP's peers_for_topic() below).
+        if (!node.advertise_local_ipc(topic_id)) {
+            std::fprintf(stderr, "rl_topic pub: advertise_local_ipc() failed for topic id %u\n", topic_id);
+            std::exit(1);
+        }
+        int reps = a.repeat > 0 ? a.repeat : 1;
+        for (int i = 0; i < reps; ++i) {
+            bool ok = node.publish_local_ipc(topic_id, payload.data(), payload.size());
+            std::printf("published %zu bytes to local-IPC topic id %u (%s): %s\n",
+                        payload.size(), topic_id, a.topic.c_str(), ok ? "ok" : "ring full / failed");
+            if (i + 1 < reps) std::this_thread::sleep_for(std::chrono::duration<double>(a.rate_period));
+        }
+        return;
+    }
+
     node.advertise_raw(topic_id); // must declare BEFORE the first spin_once()
 
     auto deadline = std::chrono::steady_clock::now() + std::chrono::duration<double>(a.timeout);
@@ -564,6 +616,13 @@ static void cmd_pub(const Args& a) {
 
 int main(int argc, char** argv) {
     Args a = parse_args(argc, argv);
+    if (a.ipc && (a.command == "list" || a.command == "info")) {
+        std::fprintf(stderr, "rl_topic: --ipc is not supported for \"%s\" -- there is no "
+                     "central directory of same-host IPC topics to enumerate (unlike UDP's "
+                     "rlcore/multicast topic directory); use hz/bw/echo/pub --ipc instead.\n",
+                     a.command.c_str());
+        return 2;
+    }
     if (a.command == "list") cmd_list(a);
     else if (a.command == "info") cmd_info(a);
     else if (a.command == "hz") cmd_hz(a);
