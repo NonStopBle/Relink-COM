@@ -24,6 +24,21 @@ private LAN address useless to a peer on a different network. Opening
 the actual NAT hole additionally requires each RelinkNode client to send
 a punch-packet burst to every peer it learns about -- see
 relink/node.py's _ensure_started().
+
+--relay: folds the standalone relink-relay daemon's data-frame
+forwarding directly into this process, on this same socket/port --
+one daemon, one port, instead of running rlcore and relink-relay
+separately. Some NAT types (notably "symmetric" NAT) structurally
+cannot be punched through no matter how the client retries, and a
+relay reachable at a single fixed address is the only fallback for
+those -- since --nat mode is exactly the case where some clients may
+have that kind of NAT, it implies --relay automatically (pass --relay
+alone, without --nat, to still get forwarding for other reasons, e.g.
+a firewall that blocks unsolicited inbound UDP entirely). On the
+client, point node.set_relay() at this SAME ip and --port (not
+relay's old default of 8446) to actually use it -- see set_relay()'s
+docstring in node.py for why direct punching keeps running too rather
+than being replaced by this.
 """
 import os
 import socket
@@ -35,8 +50,14 @@ from .. import topic_directory as tdir
 from ..crypto import (
     generate_random_key32, key32_to_hex, hex_to_key32, aes256gcm_seal, aes256gcm_open,
 )
+from ..relay_wire import decode_relay_register, peek_frame_topic_id
 
 DEFAULT_PORT = 8445
+
+# Must outlive the client's relay re-register interval (node.py's
+# _relay_keepalive_loop fires every 10s) -- same value and rationale as
+# the now-retired standalone relay.py's MEMBER_TTL_SECONDS.
+RELAY_MEMBER_TTL_S = 30
 
 # A live node re-registers every 0.3s for as long as it's running (see
 # node.py's _rlcore_reregister_interval) -- a registration this stale
@@ -73,12 +94,16 @@ def encode_register_ack(status: int, peers) -> bytes:
 
 
 def print_usage():
-    print(f"usage: rlcore [--port <port>] [--ip <address>] [--nat]\n"
+    print(f"usage: rlcore [--port <port>] [--ip <address>] [--nat] [--relay]\n"
           f"              [--encrypt-key <64-hex>] [--generate-key] [-h|--help]\n"
           f"\n"
           f"  --port <port>       UDP port to listen on (default {DEFAULT_PORT})\n"
           f"  --ip <address>      local address to bind to (default 0.0.0.0, all interfaces)\n"
-          f"  --nat                enable NAT traversal / UDP hole punching\n"
+          f"  --nat                enable NAT traversal / UDP hole punching (implies --relay)\n"
+          f"  --relay              also forward data frames between peers that can't reach\n"
+          f"                       each other directly, on this same port -- no separate\n"
+          f"                       relink-relay process needed (point the client's\n"
+          f"                       set_relay() at this ip:port to use it)\n"
           f"  --encrypt-key <hex>  require AES-256-GCM encrypted registration (64 hex chars)\n"
           f"  --generate-key       print a fresh AES-256 key and exit\n"
           f"  -h, --help           show this help and exit")
@@ -105,6 +130,7 @@ def main():
     if "--ip" in sys.argv:
         bind_ip = sys.argv[sys.argv.index("--ip") + 1]
     nat_mode = "--nat" in sys.argv
+    relay_mode = nat_mode or "--relay" in sys.argv
 
     encrypt_key = None
     if "--encrypt-key" in sys.argv:
@@ -123,7 +149,12 @@ def main():
               f"relink-rlcore: another process may already be listening there "
               f"(try --port <other-port>, or check `ss -ulnp`)", file=sys.stderr)
         sys.exit(1)
-    suffix = " (NAT traversal enabled)" if nat_mode else ""
+    suffix_bits = []
+    if nat_mode:
+        suffix_bits.append("NAT traversal enabled")
+    if relay_mode:
+        suffix_bits.append("relay forwarding enabled" + (" (auto via --nat)" if nat_mode else ""))
+    suffix = f" ({', '.join(suffix_bits)})" if suffix_bits else ""
     print(f"relink-rlcore (Python) listening on {bind_ip}:{port}{suffix}", flush=True)
 
     table = {}  # topic_id -> set of (ip, port)
@@ -152,6 +183,14 @@ def main():
     role_table = {}
     role_last_seen = {}
 
+    # topic_id -> {(ip, port): time.time() of last REGISTER/keepalive} --
+    # only populated/consulted when relay_mode, per-topic forwarding
+    # group membership for the merged relay path (was relay.py's
+    # `groups`, now living here). Distinct from `table` above: rlcore
+    # registrations there track for peer-discovery/RegisterAck purposes,
+    # not who wants relayed copies of a topic's data frames.
+    relay_groups = {}
+
     def prune_stale():
         now = time.time()
         for topic in list(table.keys()):
@@ -166,6 +205,14 @@ def main():
         for key in [k for k, ts in role_last_seen.items() if now - ts > REGISTRATION_TTL_S]:
             role_last_seen.pop(key, None)
             role_table.pop(key, None)
+        if relay_mode:
+            for topic_id in list(relay_groups.keys()):
+                members = relay_groups[topic_id]
+                stale = [a for a, seen in members.items() if now - seen > RELAY_MEMBER_TTL_S]
+                for a in stale:
+                    del members[a]
+                if not members:
+                    del relay_groups[topic_id]
 
     # Wake up periodically even with no incoming traffic, purely to run
     # prune_stale() -- otherwise a fleet that goes quiet keeps every last
@@ -257,6 +304,31 @@ def main():
             continue
         if role_kind == "role_reply":
             continue  # rlcore never queries anyone itself
+
+        if relay_mode:
+            # A relay REGISTER control packet (join a topic's forwarding
+            # group) or an ordinary data frame to forward -- checked
+            # before the RegisterRequest path below since neither shape
+            # can ever be a valid (plaintext or encrypted) RegisterRequest
+            # (see decode_relay_register/peek_frame_topic_id's exact
+            # size/start-byte checks), so this never steals traffic that
+            # path would otherwise have handled.
+            relay_topic_id = decode_relay_register(data)
+            if relay_topic_id is not None:
+                relay_groups.setdefault(relay_topic_id, {})[addr] = time.time()
+                continue
+            frame_topic_id = peek_frame_topic_id(data)
+            if frame_topic_id is not None:
+                members = relay_groups.get(frame_topic_id)
+                if members:
+                    for member_addr in members:
+                        if member_addr == addr:
+                            continue  # never echo back to the sender
+                        try:
+                            sock.sendto(data, member_addr)
+                        except OSError:
+                            pass
+                continue
 
         # When --encrypt-key is set, every RegisterRequest must be an
         # AES-256-GCM-sealed blob under that key -- opened here before

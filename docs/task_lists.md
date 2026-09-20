@@ -165,6 +165,44 @@ Everything implemented together so far, in order.
       the full `test_relink.py`/`test_image.py` suites (ALL PASS).
       README's relay/rl_topic sections updated to document the new flags.
 
+## Verified done (2026-09-20, continued further)
+
+- [x] Merged the standalone Python `relink-relay` daemon (`relay.py`)
+      directly into `rlcore.py` -- one process, one port, instead of two
+      daemons. New `--relay` flag turns on data-frame forwarding on
+      rlcore's own socket (reusing `relay_wire.decode_relay_register`/
+      `peek_frame_topic_id`, same forwarding logic relay.py had); `--nat`
+      auto-enables `--relay` too, since a symmetric-NAT client (the case
+      `--nat` mode exists for) is exactly the case that needs the relay
+      fallback. Startup message reports which of NAT/relay are active
+      and whether relay came from `--nat` or was requested directly.
+      Decision (asked and confirmed by the user): remove the standalone
+      `relay.py`/`relink-relay` console_script entirely rather than keep
+      it alongside the merged form -- the C++ build still ships
+      `relink-relay` as its own binary (unchanged; this was a Python-only
+      merge), so parity between the two languages is now "same
+      capability, different process topology" rather than "identical
+      topology". Client wiring (`node.set_relay(ip, port)`) stays a
+      manual call, same as before, just pointed at rlcore's own
+      `--port` (8445 by default) instead of the old relay-only default
+      of 8446 -- no RelinkNode API change.
+      Verified: `rlcore --help` shows `--relay`; `--relay` alone and
+      `--nat` (which implies it) both start correctly with the right
+      startup message; a raw relay REGISTER + data-frame test forwarded
+      correctly between two sockets; a full RelinkNode pub/sub pair
+      using `set_relay()` pointed at the merged rlcore delivered a
+      message end-to-end through the relay path; full
+      `test_relink.py`/`test_image.py` suites still ALL PASS.
+      README (root + python/README.md) updated throughout to describe
+      the merged Python daemon vs. the still-separate C++ binary, and
+      the stale python/ directory-layout diagram (still showing the
+      pre-pip-packaging `python/rlcore/relink_rlcore.py` layout) was
+      corrected to the current `relink_py/relink/cli/` structure.
+
 ## Ideas / not started
 
-(none open right now)
+- [ ] Consider whether the C++ `relink-relay`/`relink-rlcore` should get
+      the same merge (a `--relay` flag on relink-rlcore.cpp), for full
+      topology parity with the now-merged Python build -- not done here,
+      out of scope for "merge relay.py into rlcore" which only named the
+      Python file.

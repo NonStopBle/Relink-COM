@@ -1105,20 +1105,26 @@ the direct one also got through. You don't have to detect or configure
 which case you're in.
 
 ```bash
-# Build + run the relay (plain sockets, no AF_XDP -- see below)
+# C++: standalone relay binary (plain sockets, no AF_XDP -- see below)
 g++ -std=c++17 -O2 -I cpp/include -pthread cpp/rlcore/relink_relay.cpp -o relink-relay
 ./relink-relay --port 8446 --ip 10.0.0.5   # or just ./relink-relay [port]
 ./relink-relay --help
 
-# Python
-relink-relay --port 8446 --ip 10.0.0.5   # after: pip install -e python/relink_py
-relink-relay --help
+# Python: folded directly into rlcore, not a separate process -- pass
+# --relay (or --nat, which implies it) to relink-rlcore/rlcore instead:
+rlcore --port 8445 --relay --ip 10.0.0.5   # after: pip install -e python/relink_py
 ```
 
 `--ip` binds the relay to one local interface instead of all of them
-(default `0.0.0.0`); the legacy `relink-relay [port]` positional form
-still works and is equivalent to `--port`. Same bind-failure behavior
-as `relink-rlcore` — see the troubleshooting note above.
+(default `0.0.0.0`). The C++ build still ships `relink-relay` as its
+own binary (with its own `[port]` positional form and `--help`); the
+Python build merged relay forwarding into `rlcore` itself, on the same
+socket, so a `pip install -e python/relink_py` deployment only ever
+needs one process. Either way, point `node.set_relay(ip, port)` at
+whichever one you're running — for Python's merged form, `port` is
+`rlcore`'s own `--port` (8445 by default), not the old relay-only
+default of 8446. Same bind-failure behavior as `relink-rlcore` in
+both cases — see the troubleshooting note above.
 
 **Stress-tested**: 30 concurrent nodes registering, punching, and
 publishing through the same `relink-rlcore --nat` instance at once —
@@ -1739,11 +1745,16 @@ a path that was never open; that case needs a relay/TURN-style fallback
 — see below.
 
 **Relay fallback, for NATs punching can't cross at all.** Run
-`relink-relay` (C++, `cpp/rlcore/relink_relay.cpp`) or `relink_relay.py`
-(pure Python, no compiler needed) on a host both nodes can reach — the
-same box running `relink-rlcore --nat` works fine. Then call
-`node.set_relay(ip, port = 8446)` on every node that needs it, before
-`spin()`/`publish()` traffic. A relay reaches nodes direct punching
+`relink-relay` (C++, `cpp/rlcore/relink_relay.cpp`, its own process) or,
+on the Python build, just add `--relay` to the `rlcore` you're already
+running (`--nat` implies it, since that's exactly the mode where some
+client might have this kind of NAT) — no separate process needed there,
+it's the same daemon on the same port. Either way it just needs to be a
+host both nodes can reach; the same box already running
+`relink-rlcore`/`rlcore --nat` works fine. Then call `node.set_relay(ip,
+port)` on every node that needs it, before `spin()`/`publish()` traffic
+— `port` is 8446 for the standalone C++ relay, or the Python `rlcore`'s
+own `--port` (8445 by default) for the merged form. A relay reaches nodes direct punching
 structurally cannot, because both clients only ever open a NAT mapping
 toward the relay's one fixed `(ip, port)`, never toward each other — the
 relay's replies always come from that exact remote endpoint, which is
@@ -1973,14 +1984,18 @@ cpp/
   ros2_compare/                  ROS2 Humble comparison benchmark package
 
 python/
-  relink_py/relink/             Python library (stdlib-only: ctypes + socket + struct)
-    (mirrors the C++ layer-for-layer, see python/relink_py/README.md)
-  relink_py/examples/            Python usage examples (Step 10)
-  relink_py/tests/               unit tests + two-process correctness tests (Step 11)
-  rlcore/                        Python daemons, byte-identical wire protocol to cpp/rlcore/
-    relink_rlcore.py               registration daemon
-    relink_relay.py                relay fallback daemon (Step 13)
-  rl_topic.py
+  README.md                      pip install / console-scripts overview
+  relink_py/                      the installable distribution (pyproject.toml lives here)
+    relink/                        Python library (stdlib-only: ctypes + socket + struct)
+      (mirrors the C++ layer-for-layer, see python/relink_py/README.md)
+      cli/                            the console_scripts entry points
+        rlcore.py                       registration daemon, byte-identical wire protocol to
+                                         cpp/rlcore/relink_rlcore.cpp -- --relay/--nat also
+                                         fold in the relay-fallback daemon (Step 13), unlike
+                                         the C++ build which keeps that as its own binary
+        rl_topic.py                     `rltopic` -- rostopic-style topic inspection CLI
+    examples/                       Python usage examples (Step 10)
+    tests/                          unit tests + two-process correctness tests (Step 11)
 ```
 
 ### Status / scope

@@ -360,9 +360,14 @@ class RelinkNode:
         exactly as before. A subscriber that gets the same message from
         both paths silently drops the second copy (matched by seq_num,
         see UdpTransport.enable_relay_dedup()). Call before
-        spin()/publish() traffic; must be paired with a relink-relay
-        daemon running at `ip:port`. See relink.hpp's set_relay() for
-        the full rationale."""
+        spin()/publish() traffic; `ip:port` must be reachable as a
+        relay -- either the standalone C++ `relink-relay` binary (still
+        defaults to this function's own default port, 8446), or a
+        Python `rlcore --relay` (or `--nat`, which implies it) daemon,
+        in which case `port` must match THAT daemon's `--port` (8445 by
+        default), not this function's default, since it's the same
+        socket as registration. See relink.hpp's set_relay() for the
+        full rationale."""
         self._relay_enabled = True
         self._relay_ip = ipv4_to_host_order(ip)
         self._relay_port = port
