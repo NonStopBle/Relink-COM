@@ -93,6 +93,8 @@ inline uint16_t derive_multicast_port(uint16_t network_id) {
 struct PeerInfo {
     uint32_t ip;   // host byte order
     uint16_t port;
+    uint32_t pid = 0;
+    bool shm_capable = false;  // same-host AND peer build supports shm_transport.hpp
 };
 
 // Callback invoked whenever a topic's peer is discovered or updated.
@@ -103,6 +105,15 @@ struct MulticastDiscoveryConfig {
     uint16_t group_port = kDefaultMulticastPort;
 
     uint32_t self_ip = 0;      // host byte order -- this node's own IP
+    uint32_t self_pid = 0;
+    // Whether THIS node's build supports the shared-memory local-IPC
+    // ring (see shm_transport.hpp) -- a build/feature-level bit, not a
+    // per-topic one: a receiving peer combines this with "same host"
+    // (its own self_ip matching ours) to know local IPC MIGHT be usable
+    // for an overlapping topic, IF that peer's application also
+    // separately calls advertise_local_ipc/subscribe_local_ipc for it.
+    // This does not, by itself, reroute publish()/subscribe() traffic.
+    bool shm_capable = false;
 
     // One beacon is sent per group, each with its own port. Multiplexed
     // nodes (the default) have exactly one group covering every declared
@@ -255,7 +266,8 @@ private:
             auto er = encode_beacon_packet(cfg_.self_ip, g.port,
                                             g.topics.data(),
                                             static_cast<uint16_t>(g.topics.size()),
-                                            buf, sizeof(buf), &len);
+                                            buf, sizeof(buf), &len,
+                                            cfg_.self_pid, cfg_.shm_capable);
             if (er != BeaconEncodeResult::Ok) continue;
             ::sendto(send_sock_, reinterpret_cast<const char*>(buf), static_cast<int>(len), 0,
                      reinterpret_cast<struct sockaddr*>(&dest), sizeof(dest));
@@ -353,7 +365,8 @@ private:
 
                 if (!local_topics_.count(topic)) continue; // no overlap: discard, keep no peer-routing state
 
-                PeerInfo peer{b.node_ip, b.node_port};
+                bool is_same_host = b.node_ip == cfg_.self_ip;
+                PeerInfo peer{b.node_ip, b.node_port, b.node_pid, b.shm_capable && is_same_host};
                 bool is_new;
                 {
                     std::lock_guard<std::mutex> lock(table_mutex_);

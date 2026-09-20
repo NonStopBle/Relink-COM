@@ -118,9 +118,25 @@ shows; the Python versions live here:
   compress, and adapt quality for a large message; requires OpenCV,
   which you install yourself (`pip install opencv-python`) -- it is not
   a ReLink dependency
+- `examples/relink_image_benchmark.py` -- raw full-HD image throughput
+  and delivery rate, UDP socket vs same-host shared-memory IPC, side by
+  side; also requires OpenCV -- see **Same-host IPC** below
 
 Run the pub/sub examples as two processes: `python3 rlcore_pubsub.py
 pub <rlcore_ip>` and `python3 rlcore_pubsub.py sub <rlcore_ip>`.
+
+## Same-host IPC
+
+If publisher and subscriber are two processes on the same machine,
+`advertise_local_ipc`/`subscribe_local_ipc`/`publish_local_ipc` (and
+the `_image` variants for whole `Image`/`CompressedImage` frames) go
+through a shared-memory ring instead of UDP -- no socket, no chunk-loss
+mode for raw frames. See the root `README.md`'s [same-host
+shared-memory IPC](../../README.md#same-host-shared-memory-ipc-_local_ipc)
+deep-dive section for the API, constraints, and measured numbers, and
+run `examples/relink_image_benchmark.py pub/sub udp` vs `pub/sub shm`
+to reproduce them yourself (see the file's module docstring for a UDP
+launch-order caveat).
 
 ## Tests
 

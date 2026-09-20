@@ -1056,6 +1056,7 @@ testing without one), with a live log of motion/quality/bytes per frame.
 - A larger socket buffer trades drops for latency on short bursts; it doesn't fix a slow subscriber callback.
 - Prefer `image_compressed`/`image_adaptive` over raw frames for anything real-time.
 - `CompressedImage` adds a capture timestamp + quality to every chunk; `AdaptiveBitrateController` picks that quality from motion and a bitrate ceiling.
+- If publisher and subscriber are two processes on the **same machine**, raw (uncompressed) frames don't have to go over UDP at all — see [same-host shared-memory IPC](#same-host-shared-memory-ipc-_local_ipc) in the deep dive for `advertise_local_ipc_image`/`publish_local_ipc`/`subscribe_local_ipc_image`, which sidesteps the chunk-loss problem above entirely.
 
 Now, let's look at running the rlcore daemon for Mode A discovery.
 
@@ -1521,7 +1522,14 @@ exists in both C++ (`cpp/examples/`) and Python (`python/relink_py/examples/`).
 
 There's also a performance test harness (`cpp/tools/relink_benchmark.cpp`)
 used to produce the numbers in Step 12 — worth reading once you're
-comfortable with the basics, not a starting point.
+comfortable with the basics, not a starting point. Alongside it,
+`relink_image_benchmark` (`cpp/tools/relink_image_benchmark.cpp` /
+`python/relink_py/examples/relink_image_benchmark.py`, **requires
+OpenCV**) runs the raw-image UDP-vs-shared-memory-IPC comparison from
+Step 12's Image/video streaming section and Step 15's same-host IPC
+deep dive yourself: `./relink_image_benchmark pub udp` / `... sub udp`
+vs `./relink_image_benchmark pub shm` / `... sub shm` (see the file's
+header comment for the UDP launch-order caveat).
 
 ---
 
@@ -1754,6 +1762,31 @@ for raw is likely slightly better than shown. The direction of the
 finding — and the compressed-only result, run on a fresh topic — both
 hold regardless.)
 
+### Raw image: UDP socket vs shared-memory IPC
+
+Same-machine head-to-head, `relink_image_benchmark` (see Step 10),
+real video decoded to raw uncompressed 1920×1080 BGR8 frames (~6.2MB
+each), pushed as fast as the pipeline allows, no rate cap:
+
+| | Publisher rate | Delivered | **Delivery rate** | Throughput (sent) |
+|---|---|---|---|---|
+| Python — UDP socket (`publish_image`) | 10.9 fps | 14/88 frames | **15.9%** | 68 MB/s |
+| Python — shm IPC (`publish_local_ipc_image`) | 73.1 fps | 439/439 frames | **100%** | 455 MB/s |
+| C++ — UDP socket (`publish_image`) | 35.7 fps | 17/286 frames | **5.9%** | 222 MB/s |
+| C++ — shm IPC (`publish_local_ipc_image`) | 105.0 fps | 631/631 frames | **100%** | 653 MB/s |
+
+Same root cause as the webcam table above, just more extreme at full
+HD: a raw frame is ~4,450 UDP chunks, and losing any one of them drops
+the whole frame — the more chunks, the more chances to lose one. The
+shared-memory ring has no MTU at all, so a whole frame is one ring
+slot with nothing to partially lose; see [Step 15's same-host
+shared-memory IPC](#same-host-shared-memory-ipc-_local_ipc) deep dive
+for the full design rationale. Run it yourself with
+`relink_image_benchmark pub/sub udp` vs `pub/sub shm` — numbers will
+vary with hardware and instantaneous system load, but the qualitative
+gap (single-digit-to-low-double-digit percent vs. 100%) reproduces
+reliably.
+
 ---
 
 ## Step 13 — NAT traversal (cross-network nodes)
@@ -1895,6 +1928,111 @@ hot path. See [Step 0](#step-0--what-relink-actually-is) for the
 plain-language summary and [Step 12](#step-12--benchmarks) for the
 measured numbers this buys.
 
+### Same-host shared-memory IPC (`*_local_ipc`)
+
+Everything else in this doc goes over UDP, even when publisher and
+subscriber happen to be two processes on the same machine — real
+network stack, real socket buffers, real kernel copies, loopback or
+not. UDP's fire-and-forget design (no retransmission, no backpressure —
+see "Why ReLink gives up ROS's generality" above) means a slow
+subscriber's socket buffer can silently overflow under load, and for
+`Image`'s raw (uncompressed) path specifically, a single dropped chunk
+invalidates the whole frame. Measured effect at full 1920x1080: raw
+image delivery over UDP collapsed to **1.8-28%** depending on run —
+compression (`image_compressed`/`image_adaptive`) works around this by
+shrinking the chunk count per frame, but the raw path itself stays
+fundamentally exposed to it.
+
+`advertise_local_ipc`/`subscribe_local_ipc`/`publish_local_ipc` (and
+the `_image` variants below) sidestep the problem entirely for the
+same-host case: a lock-free single-producer/single-consumer ring
+buffer in POSIX shared memory (`shm_transport.hpp`/`shm_transport.py`),
+one ring per (topic, publisher, subscriber) triple. No socket, no
+kernel network stack, no chunk-loss mode to have in the first place —
+a full ring reports backpressure (the push fails, explicitly) rather
+than silently dropping mid-frame. Measured at full 1920x1080 **raw**
+(no compression) frames, uncapped rate: **100% delivery**, both
+languages and cross-language, at 70-93 FPS / 430-580 MB/s throughput —
+the exact workload that collapsed over UDP above. `relink_image_benchmark`
+(`cpp/tools/` / `python/relink_py/examples/`, Step 10/12) runs this
+exact comparison end to end — `pub`/`sub udp` vs `pub`/`sub shm` — and
+prints delivery rate + throughput for whichever transport you pick, so
+you can reproduce these numbers (or measure your own hardware) directly.
+
+```python
+# Python -- small fixed-size messages
+node.advertise_local_ipc(500)                    # capacity/max_payload default to small-message sizes
+node.subscribe_local_ipc(500, lambda payload: ...)
+node.publish_local_ipc(500, b"...")
+
+# Whole Image/CompressedImage frames -- no chunking needed at all here,
+# shared memory has no MTU to chunk around, so a full frame is ONE slot
+node.advertise_local_ipc_image(501)              # defaults: 1920x1080 BGR8 max size, capacity=8
+node.subscribe_local_ipc_image(501, lambda payload: ...)
+node.publish_local_ipc(501, raw_frame_bytes)
+```
+
+```cpp
+// C++ -- same shape
+node.advertise_local_ipc(500);
+node.subscribe_local_ipc(500, [](const uint8_t* payload, size_t len) { ... });
+node.publish_local_ipc(500, data, len);
+
+node.advertise_local_ipc_image(501);
+node.subscribe_local_ipc_image(501, [](const uint8_t* payload, size_t len) { ... });  // zero-copy: `payload`
+                                                                                        // points directly into
+                                                                                        // shared memory, valid
+                                                                                        // only during this call
+node.publish_local_ipc(501, frame.data, len);
+```
+
+**What this is not**: automatic. Both sides must explicitly call the
+matching `*_local_ipc` method with the same topic, capacity, and
+`max_payload` — a mismatch on any of those fails to attach rather than
+silently misbehaving. `local_ipc_peers(topic)` (populated from an
+extension to the Mode B beacon, see below) tells you *whether* a
+same-host, shm-capable peer exists for a topic; it does not itself
+reroute `publish()`/`subscribe()` traffic — that decision is still
+yours to make. There's no chunking/reassembly step because there's no
+MTU, so `Image`/`CompressedImage`'s wire types aren't involved at all
+on this path — a raw frame's bytes go into one ring slot, whole.
+
+A few concrete constraints worth knowing before reaching for this:
+- **Same host only** — POSIX shared memory, no equivalent across
+  machines. `local_ipc_peers()` only ever reports peers whose beacon's
+  self-declared address matches this node's own (the same test already
+  used to recognize "this is my own beacon" during ordinary discovery).
+- **Fixed capacity, reserved up front** — unlike UDP (which reserves
+  nothing per topic), a ring reserves `capacity * max_payload` bytes at
+  open time. The `_image` defaults use a small `capacity=8` specifically
+  because a full 1080p frame is ~6.2MB; the plain (non-image) default
+  (`capacity=1024`, `max_payload=1400`) mirrors UDP's own MTU-driven
+  cap and stays a small, fixed reservation.
+- **Crash recovery, not crash prevention.** A process that dies without
+  calling `request_stop()` leaves its segment behind in `/dev/shm` —
+  the next `open()` for that name detects the dead `creator_pid` (a
+  liveness check, `kill(pid, 0)` in C++ / `os.kill(pid, 0)` in Python)
+  and reinitializes rather than attaching to garbage `head`/`tail`
+  state, verified via both an in-process C++ test
+  (`tests/test_shm_transport.cpp`, using `fork()`+`SIGKILL`) and a
+  synthesized-stale-header Python test — real `os.fork()` after
+  touching `multiprocessing.shared_memory` turned out to be fragile in
+  CPython itself (its background resource-tracker connection doesn't
+  survive fork cleanly), so the Python test constructs the stale-header
+  condition directly instead of relying on real process-crash timing.
+- **POSIX only.** No Windows shared-memory equivalent is wired up (see
+  "Porting the C++ core to Windows" below for what *is* covered there)
+  — this path simply isn't available on that platform yet.
+- **Zero-copy in C++, always-copies in Python** — `subscribe_local_ipc`'s
+  callback gets a pointer directly into the shared-memory slot in C++
+  (valid only for the call's duration, same contract `UdpTransport`'s
+  own raw callback already uses for its reused receive buffer), but
+  Python's `try_pop()` always returns an owned `bytes` — a
+  memoryview-into-shared-memory variant would be a new sharp-edged
+  lifetime contract with no existing precedent in the Python binding,
+  which this project already documents as prioritizing convenience
+  over matching the C++ core's raw performance.
+
 ### `network_id` — why both the address and the port have to change
 
 Mode B's multicast domain isolation ([Step 3](#step-3--pick-a-discovery-mode))
@@ -2011,6 +2149,9 @@ port was verified under Wine.
 | `Image` type (chunk + reassemble) | ✅ | ✅ |
 | Zero-copy image chunk send/recv | ✅ (`sendmsg`) | ✅ (`socket.sendmsg`) |
 | CPU pinning / `SCHED_FIFO` data thread | ✅ | — (not applicable to CPython's threading model) |
+| Same-host shared-memory IPC (`*_local_ipc`) | ✅ | ✅ |
+| — zero-copy subscriber callback | ✅ | — (always copies, by design — see deep dive) |
+| Same-host shm-peer discovery (`local_ipc_peers`) | ✅ | ✅ |
 | TCP reliable transport | ❌ (out of scope) | ❌ (out of scope) |
 | Encryption (`secure=true`) | ❌ (API shape decided, unimplemented) | ❌ (API shape decided, unimplemented) |
 
@@ -2044,7 +2185,8 @@ cpp/
     CMakeLists.txt                 also buildable standalone; -DRELINK_ENABLE_XDP=ON for AF_XDP (Step 12)
     xdp/                           AF_XDP socket + eBPF kernel program
 
-  tools/                        rl_topic.cpp, relink_example.cpp, relink_benchmark.cpp
+  tools/                        rl_topic.cpp, relink_example.cpp, relink_benchmark.cpp,
+                                  relink_image_benchmark.cpp (needs OpenCV -- Step 12)
   examples/                     C++ usage examples (Step 10)
   tests/                        unit tests + two-process correctness tests (Step 11)
   cmake_example/                minimal standalone CMake template for consuming ReLink from your own project

@@ -16,6 +16,7 @@
 #include "relink/topic_directory.hpp"
 #include "relink/standard_msgs.hpp"
 #include "relink/relay_wire.hpp"
+#include "relink/shm_transport.hpp"
 #include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
@@ -144,6 +145,8 @@ public:
             std::lock_guard<std::mutex> lock(punch_threads_mutex_);
             for (auto& t : punch_threads_) if (t.joinable()) t.join();
         }
+        stop_requested_ = true;
+        if (shm_poll_thread_.joinable()) shm_poll_thread_.join();
     }
 
     // Opt-in background re-punch: instead of firing the NAT hole-punch
@@ -697,7 +700,103 @@ public:
         }
     }
 
-    void request_stop() { stop_requested_ = true; }
+    void request_stop() {
+        stop_requested_ = true;
+        std::lock_guard<std::mutex> lock(shm_mutex_);
+        for (auto& kv : shm_rings_) {
+            if (kv.second->is_creator()) kv.second->unlink();
+        }
+    }
+
+    // --- Same-host IPC opt-in: explicit shared-memory fast path for two
+    // processes known to be on the same machine. NOT auto-selected via
+    // discovery yet (see the phased local-IPC plan) -- both sides must
+    // call the matching *_local_ipc(same topic) themselves, with the
+    // SAME capacity/max_payload (mismatched values fail to attach --
+    // see ShmRing::open()'s compatibility check).
+    //
+    // max_payload defaults to relink::kShmMaxPayload (1400, matching
+    // UDP's MTU-driven MAX_PAYLOAD_BYTES) for small messages. Pass a
+    // larger value for whole Image/CompressedImage frames -- shared
+    // memory has no MTU, so unlike the UDP path, a frame goes over in
+    // ONE slot, no chunking/reassembly needed (see shm_transport.hpp's
+    // header comment). A raw 1920x1080x3 frame is ~6.2MB; size
+    // max_payload (and capacity) to your actual resolution/backlog
+    // needs -- the segment reserves capacity*max_payload bytes up
+    // front, unlike UDP which reserves nothing.
+
+    bool advertise_local_ipc(uint32_t topic_id, uint32_t capacity = relink::kShmDefaultCapacity,
+                              uint32_t max_payload = relink::kShmMaxPayload) {
+        std::lock_guard<std::mutex> lock(shm_mutex_);
+        if (shm_rings_.count(topic_id)) return true;
+        auto ring = std::make_unique<relink::ShmRing>();
+        if (!ring->open("/relink_topic_" + std::to_string(topic_id), capacity, max_payload)) return false;
+        shm_rings_.emplace(topic_id, std::move(ring));
+        declared_topics_.insert(topic_id);
+        return true;
+    }
+    bool advertise_local_ipc(const std::string& name, uint32_t capacity = relink::kShmDefaultCapacity,
+                              uint32_t max_payload = relink::kShmMaxPayload) {
+        return advertise_local_ipc(topic_id_for(name), capacity, max_payload);
+    }
+
+    // `payload` points directly into shared memory (zero-copy -- see
+    // shm_transport.hpp's try_pop_zero_copy()) and is valid ONLY for the
+    // duration of this call; copy out anything you need to keep past
+    // it. Same discipline as UdpTransport's own raw callback, which
+    // already hands a pointer into a reused receive buffer under the
+    // identical constraint -- not a new contract for this codebase.
+    using ShmCallback = std::function<void(const uint8_t* payload, size_t len)>;
+
+    bool subscribe_local_ipc(uint32_t topic_id, ShmCallback callback,
+                              uint32_t capacity = relink::kShmDefaultCapacity,
+                              uint32_t max_payload = relink::kShmMaxPayload) {
+        if (!advertise_local_ipc(topic_id, capacity, max_payload)) return false;
+        {
+            std::lock_guard<std::mutex> lock(shm_mutex_);
+            shm_handlers_[topic_id] = std::move(callback);
+        }
+        ensure_shm_poll_thread();
+        return true;
+    }
+    bool subscribe_local_ipc(const std::string& name, ShmCallback callback,
+                              uint32_t capacity = relink::kShmDefaultCapacity,
+                              uint32_t max_payload = relink::kShmMaxPayload) {
+        return subscribe_local_ipc(topic_id_for(name), std::move(callback), capacity, max_payload);
+    }
+
+    // Convenience wrappers for whole Image/CompressedImage frames over
+    // local IPC -- same mechanism as advertise_local_ipc above, just
+    // defaulting max_payload to a full 1920x1080 BGR8 frame's size so
+    // callers don't have to compute it themselves. Use a smaller
+    // max_payload directly via advertise_local_ipc() for a known
+    // smaller resolution or compressed (JPEG) frames.
+    static constexpr uint32_t kShmImageDefaultMaxPayload = 1920u * 1080u * 3u;  // ~6.2MB, raw BGR8 1080p
+
+    bool advertise_local_ipc_image(uint32_t topic_id, uint32_t max_payload = kShmImageDefaultMaxPayload,
+                                    uint32_t capacity = 8) {
+        return advertise_local_ipc(topic_id, capacity, max_payload);
+    }
+    bool subscribe_local_ipc_image(uint32_t topic_id, ShmCallback callback,
+                                    uint32_t max_payload = kShmImageDefaultMaxPayload,
+                                    uint32_t capacity = 8) {
+        return subscribe_local_ipc(topic_id, std::move(callback), capacity, max_payload);
+    }
+
+    bool publish_local_ipc(uint32_t topic_id, const void* payload, size_t len) {
+        relink::ShmRing* ring = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(shm_mutex_);
+            auto it = shm_rings_.find(topic_id);
+            if (it == shm_rings_.end()) return false;
+            ring = it->second.get();
+        }
+        uint32_t seq = shm_seq_[topic_id]++;
+        return ring->try_push(static_cast<const uint8_t*>(payload), static_cast<uint32_t>(len), seq);
+    }
+    bool publish_local_ipc(const std::string& name, const void* payload, size_t len) {
+        return publish_local_ipc(topic_id_for(name), payload, len);
+    }
 
     // Override the data thread's CPU pin (see Lean optimization section
     // of the spec). Pass -1 to disable pinning entirely; must be called
@@ -726,8 +825,80 @@ public:
         return it != peers_.end() ? it->second : std::vector<PeerAddr>{};
     }
 
+    // PIDs of same-host, shm-capable peers discovered for `topic_id` so
+    // far (see multicast_discovery.hpp's beacon extension). A signal
+    // only: does not itself start using local IPC for this topic --
+    // call advertise_local_ipc/subscribe_local_ipc/publish_local_ipc
+    // yourself once you've decided to. Empty if discovery hasn't found
+    // one yet, or isn't in use (rlcore mode doesn't populate this).
+    std::vector<uint32_t> local_ipc_peers(uint32_t topic_id) {
+        std::lock_guard<std::mutex> lock(shm_mutex_);
+        auto it = local_ipc_candidates_.find(topic_id);
+        if (it == local_ipc_candidates_.end()) return {};
+        return std::vector<uint32_t>(it->second.begin(), it->second.end());
+    }
+    std::vector<uint32_t> local_ipc_peers(const std::string& name) {
+        return local_ipc_peers(topic_id_for(name));
+    }
+
 private:
     friend class RlCoreConfig;
+
+    // One thread services every local-IPC topic on this node, same
+    // "one dedicated data path per node" shape as UdpTransport's own
+    // receive thread -- polling instead of blocking since the ring has
+    // no OS-level wakeup primitive (see shm_transport.hpp's design
+    // notes on why: avoiding named-semaphore bindings for v1).
+    void ensure_shm_poll_thread() {
+        bool expected = false;
+        if (!shm_poll_started_.compare_exchange_strong(expected, true)) return;
+        shm_poll_thread_ = std::thread([this]() {
+            // Zero-copy: try_pop_zero_copy() hands the callback a
+            // pointer directly into the shared-memory slot (valid only
+            // for the duration of the call -- head only advances after
+            // it returns), so there's no intermediate buffer to size or
+            // copy into here at all. Matters most for Image/
+            // CompressedImage-sized rings, where an extra memcpy would
+            // otherwise undo a real fraction of the point of using
+            // shared memory.
+            while (!stop_requested_.load()) {
+                bool delivered_any = false;
+                std::vector<std::pair<uint32_t, relink::ShmRing*>> rings;
+                {
+                    std::lock_guard<std::mutex> lock(shm_mutex_);
+                    for (auto& kv : shm_handlers_) {
+                        auto it = shm_rings_.find(kv.first);
+                        if (it != shm_rings_.end()) rings.emplace_back(kv.first, it->second.get());
+                    }
+                }
+                for (auto& tr : rings) {
+                    ShmCallback cb;
+                    {
+                        std::lock_guard<std::mutex> lock(shm_mutex_);
+                        auto it = shm_handlers_.find(tr.first);
+                        if (it != shm_handlers_.end()) cb = it->second;
+                    }
+                    if (!cb) continue;
+                    bool popped = tr.second->try_pop_zero_copy(
+                        [&](const uint8_t* payload, uint32_t len, uint32_t /*seq*/) {
+                            cb(payload, len);
+                        });
+                    if (popped) delivered_any = true;
+                }
+                if (!delivered_any) std::this_thread::sleep_for(std::chrono::microseconds(200));
+            }
+        });
+        shm_thread_owned_ = true;
+    }
+
+    std::mutex shm_mutex_;
+    std::unordered_map<uint32_t, std::unique_ptr<relink::ShmRing>> shm_rings_;
+    std::unordered_map<uint32_t, ShmCallback> shm_handlers_;
+    std::unordered_map<uint32_t, uint32_t> shm_seq_;
+    std::unordered_map<uint32_t, std::unordered_set<uint32_t>> local_ipc_candidates_;
+    std::atomic<bool> shm_poll_started_{false};
+    bool shm_thread_owned_ = false;
+    std::thread shm_poll_thread_;
 
     // Returns the transport that topic_id should send/receive on: the
     // one shared transport_ in multiplexed mode (the default), or a
@@ -994,6 +1165,8 @@ private:
             cfg.group_port = derive_multicast_port(network_id_);
             cfg.self_ip = detect_local_ip_for_peer(
                 ipv4_to_host_order(cfg.group_ip), cfg.group_port);
+            cfg.self_pid = static_cast<uint32_t>(getpid());
+            cfg.shm_capable = true;  // this build has shm_transport.hpp
             for (const auto& g : groups) {
                 cfg.port_groups.push_back(
                     MulticastDiscoveryConfig::PortGroup{g.transport->local_port(), g.topics});
@@ -1007,6 +1180,10 @@ private:
                     peers_[topic].push_back(addr);
                     auto it = topic_route_.find(topic);
                     via = (it != topic_route_.end()) ? it->second : &transport_;
+                }
+                if (p.shm_capable) {
+                    std::lock_guard<std::mutex> lock3(shm_mutex_);
+                    local_ipc_candidates_[topic].insert(p.pid);
                 }
                 // Multicast discovery keeps running for the node's whole
                 // lifetime (unlike rlcore's one-shot registration burst

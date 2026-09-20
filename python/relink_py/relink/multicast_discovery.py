@@ -84,6 +84,8 @@ def derive_multicast_port(network_id: int) -> int:
 class PeerInfo:
     ip: int    # host byte order
     port: int
+    pid: int = 0
+    shm_capable: bool = False
 
 
 PeerDiscoveredCallback = Callable[[int, PeerInfo], None]
@@ -100,6 +102,15 @@ class MulticastDiscoveryConfig:
     group_ip: str = DEFAULT_MULTICAST_GROUP
     group_port: int = DEFAULT_MULTICAST_PORT
     self_ip: int = 0
+    self_pid: int = 0
+    # Whether THIS node's build supports the shared-memory local-IPC
+    # ring (see shm_transport.py) -- a build/feature-level bit, not a
+    # per-topic one: a receiving peer combines this with "same host"
+    # (its own self_ip matching ours) to know local IPC MIGHT be usable
+    # for an overlapping topic, IF that peer's application also
+    # separately calls advertise_local_ipc/subscribe_local_ipc for it.
+    # This does not, by itself, reroute publish()/subscribe() traffic.
+    shm_capable: bool = False
     # One beacon is sent per group, each with its own port -- see the
     # identical PortGroup comment in multicast_discovery.hpp. Multiplexed
     # nodes (the default) have exactly one group covering every declared
@@ -202,7 +213,9 @@ class MulticastDiscovery:
 
     def _send_beacon_once(self):
         for g in self._cfg.port_groups:
-            payload = encode_beacon_packet(self._cfg.self_ip, g.port, g.topics)
+            payload = encode_beacon_packet(self._cfg.self_ip, g.port, g.topics,
+                                            node_pid=self._cfg.self_pid,
+                                            shm_capable=self._cfg.shm_capable)
             try:
                 self._send_sock.sendto(payload, (self._cfg.group_ip, self._cfg.group_port))
             except OSError:
@@ -278,4 +291,7 @@ class MulticastDiscovery:
                     is_new = key not in peer_set
                     peer_set.add(key)
                 if is_new and self._on_peer_discovered:
-                    self._on_peer_discovered(topic, PeerInfo(*key))
+                    is_same_host = beacon.node_ip == self._cfg.self_ip
+                    self._on_peer_discovered(topic, PeerInfo(
+                        *key, pid=beacon.node_pid,
+                        shm_capable=beacon.shm_capable and is_same_host))

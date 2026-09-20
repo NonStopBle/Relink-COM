@@ -6,6 +6,7 @@ argument rather than a template parameter)."""
 
 import ctypes
 import enum
+import os
 import socket
 import struct
 import threading
@@ -35,6 +36,7 @@ from .compressed_image import (
     CompressedImageTooLargeError, MAX_COMPRESSED_IMAGE_BYTES,
     COMPRESSED_IMAGE_CHUNK_DATA_BYTES, COMPRESSED_IMAGE_CHUNK_HEADER_BYTES,
 )
+from .shm_transport import ShmRing, SHM_DEFAULT_CAPACITY, SHM_MAX_PAYLOAD, SHM_IMAGE_DEFAULT_MAX_PAYLOAD
 
 
 class DiscoveryMode(enum.Enum):
@@ -149,6 +151,21 @@ class RelinkNode:
         self._start_lock = threading.Lock()
         self._started = False
         self._stop_requested = threading.Event()
+
+        # Same-host IPC opt-in (see shm_transport.py) -- explicit, not
+        # discovered: both processes must call advertise/subscribe_
+        # local_ipc() on the same topic themselves. Keyed by topic_id,
+        # separate from the UDP peer/transport machinery above.
+        self._shm_rings: Dict[int, ShmRing] = {}
+        self._shm_handlers: Dict[int, Callable[[bytes], None]] = {}
+        self._shm_seq: Dict[int, int] = {}
+        self._shm_poll_thread: Optional[threading.Thread] = None
+        # Phase 5: topic_id -> pids of same-host, shm-capable peers seen
+        # via multicast beacons (see multicast_discovery.py). A SIGNAL
+        # only -- populating this does NOT itself reroute publish()/
+        # subscribe() traffic; see local_ipc_peers().
+        self._local_ipc_candidates_lock = threading.Lock()
+        self._local_ipc_candidates: Dict[int, Set[int]] = {}
 
         self._repunch_enabled = False
         self._repunch_interval = 5.0
@@ -797,6 +814,112 @@ class RelinkNode:
 
     def request_stop(self):
         self._stop_requested.set()
+        for topic_id, ring in self._shm_rings.items():
+            if ring.is_creator:
+                ring.unlink()
+            else:
+                ring.close()
+
+    # --- Same-host IPC opt-in: explicit shared-memory fast path for two
+    # processes known to be on the same machine. NOT auto-selected via
+    # discovery yet (see the phased local-IPC plan) -- both sides must
+    # call the matching *_local_ipc(same topic) themselves, with the
+    # SAME capacity/max_payload (mismatched values fail to attach --
+    # see ShmRing.open()'s compatibility check).
+    #
+    # max_payload defaults to SHM_MAX_PAYLOAD (1400, matching UDP's
+    # MTU-driven MAX_PAYLOAD_BYTES) for small messages. Pass a larger
+    # value for whole Image/CompressedImage frames -- shared memory has
+    # no MTU, so unlike the UDP path, a frame goes over in ONE slot, no
+    # chunking/reassembly needed (see shm_transport.py's header
+    # comment). A raw 1920x1080x3 frame is ~6.2MB; size max_payload
+    # (and capacity) to your actual resolution/backlog needs -- the
+    # segment reserves capacity*max_payload bytes up front, unlike UDP
+    # which reserves nothing. ---
+
+    def advertise_local_ipc(self, topic: Union[int, str], capacity: int = SHM_DEFAULT_CAPACITY,
+                             max_payload: int = SHM_MAX_PAYLOAD) -> bool:
+        """Opens (creating if this process gets there first) the shared-
+        memory ring for `topic`. Idempotent -- safe to call again for a
+        topic already opened. Returns False if the ring could not be
+        opened (e.g. a live, incompatible-version peer already owns it
+        with a different capacity/max_payload)."""
+        topic_id = self._topic_id_for(topic)
+        if topic_id in self._shm_rings:
+            return True
+        ring = ShmRing()
+        if not ring.open(f"/relink_topic_{topic_id}", capacity, max_payload=max_payload):
+            return False
+        self._shm_rings[topic_id] = ring
+        self._declared_topics.add(topic_id)
+        return True
+
+    def subscribe_local_ipc(self, topic: Union[int, str], callback: Callable[[bytes], None],
+                             capacity: int = SHM_DEFAULT_CAPACITY,
+                             max_payload: int = SHM_MAX_PAYLOAD) -> bool:
+        topic_id = self._topic_id_for(topic)
+        if not self.advertise_local_ipc(topic, capacity, max_payload):
+            return False
+        self._shm_handlers[topic_id] = callback
+        self._subscribed_topics.add(topic_id)
+        self._ensure_shm_poll_thread()
+        return True
+
+    def publish_local_ipc(self, topic: Union[int, str], payload: bytes) -> bool:
+        topic_id = self._topic_id_for(topic)
+        ring = self._shm_rings.get(topic_id)
+        if ring is None:
+            return False
+        seq = self._shm_seq.get(topic_id, 0)
+        self._shm_seq[topic_id] = (seq + 1) & 0xFFFFFFFF
+        return ring.try_push(payload, seq)
+
+    # Convenience wrappers for whole Image/CompressedImage frames over
+    # local IPC -- same mechanism as advertise_local_ipc above, just
+    # defaulting max_payload to a full 1920x1080 BGR8 frame's size and
+    # capacity to a small backlog (a multi-megabyte ring at
+    # SHM_DEFAULT_CAPACITY=1024 slots would reserve several GB up
+    # front) so callers don't have to compute either themselves. Use a
+    # smaller max_payload directly via advertise_local_ipc() for a
+    # known smaller resolution or compressed (JPEG) frames.
+    SHM_IMAGE_DEFAULT_CAPACITY = 8
+
+    def advertise_local_ipc_image(self, topic: Union[int, str],
+                                   max_payload: int = SHM_IMAGE_DEFAULT_MAX_PAYLOAD,
+                                   capacity: int = SHM_IMAGE_DEFAULT_CAPACITY) -> bool:
+        return self.advertise_local_ipc(topic, capacity, max_payload)
+
+    def subscribe_local_ipc_image(self, topic: Union[int, str], callback: Callable[[bytes], None],
+                                   max_payload: int = SHM_IMAGE_DEFAULT_MAX_PAYLOAD,
+                                   capacity: int = SHM_IMAGE_DEFAULT_CAPACITY) -> bool:
+        return self.subscribe_local_ipc(topic, callback, capacity, max_payload)
+
+    def _ensure_shm_poll_thread(self):
+        # One thread services every local-IPC topic on this node, same
+        # "one dedicated data path per node" shape as UdpTransport's own
+        # receive thread -- polling instead of blocking since the ring
+        # has no OS-level wakeup primitive (see shm_transport.py's
+        # design notes on why: avoiding named-semaphore bindings).
+        if self._shm_poll_thread is not None:
+            return
+
+        def _loop():
+            while not self._stop_requested.is_set():
+                delivered_any = False
+                for topic_id, handler in list(self._shm_handlers.items()):
+                    ring = self._shm_rings.get(topic_id)
+                    if ring is None:
+                        continue
+                    item = ring.try_pop()
+                    if item is not None:
+                        delivered_any = True
+                        _seq, payload = item
+                        handler(payload)
+                if not delivered_any:
+                    time.sleep(0.0002)
+
+        self._shm_poll_thread = threading.Thread(target=_loop, daemon=True)
+        self._shm_poll_thread.start()
 
     def local_data_port(self) -> int:
         self._ensure_started()
@@ -805,6 +928,18 @@ class RelinkNode:
     def peers_for_topic(self, topic_id: int) -> List[PeerAddr]:
         with self._peers_lock:
             return list(self._peers.get(topic_id, []))
+
+    def local_ipc_peers(self, topic: Union[int, str]) -> List[int]:
+        """PIDs of same-host, shm-capable peers discovered for `topic` so
+        far (see multicast_discovery.py's beacon extension). A signal
+        only: does not itself start using local IPC for this topic --
+        call advertise_local_ipc/subscribe_local_ipc/publish_local_ipc
+        yourself once you've decided to. Empty if discovery hasn't
+        found one yet, or isn't in use (rlcore mode doesn't populate
+        this)."""
+        topic_id = self._topic_id_for(topic)
+        with self._local_ipc_candidates_lock:
+            return sorted(self._local_ipc_candidates.get(topic_id, set()))
 
     def _ensure_started(self):
         with self._start_lock:
@@ -965,6 +1100,8 @@ class RelinkNode:
                     group_port=group_port,
                     self_ip=_detect_local_ip_for_peer(
                         ipv4_to_host_order(group_ip), group_port),
+                    self_pid=os.getpid(),
+                    shm_capable=True,  # this build has shm_transport.py
                     port_groups=[PortGroup(t.local_port, group_topics) for t, group_topics in groups],
                 )
                 self._mcast = MulticastDiscovery(cfg)
@@ -974,6 +1111,9 @@ class RelinkNode:
                     with self._peers_lock:
                         self._peers.setdefault(topic, []).append(addr)
                         via = self._topic_route.get(topic, self._transport)
+                    if peer.shm_capable:
+                        with self._local_ipc_candidates_lock:
+                            self._local_ipc_candidates.setdefault(topic, set()).add(peer.pid)
                     # Multicast discovery keeps running for the node's
                     # whole lifetime (unlike rlcore's one-shot registration
                     # burst below), so a peer for a set_multiplex(False)

@@ -25,6 +25,7 @@ cpp/
     beacon.hpp / multicast_discovery.hpp Mode B (multicast) discovery
     crypto.hpp               AES-256-GCM for the rlcore signaling handshake
     platform.hpp             Linux/macOS/Windows socket + threading shim
+    shm_transport.hpp        same-host shared-memory IPC ring (advertise/subscribe/publish_local_ipc)
     ... (topic_hash.hpp, ring_buffer.hpp, frame.hpp, image.hpp, compressed_image.hpp,
          adaptive_bitrate.hpp, standard_msgs.hpp, relay_wire.hpp, topic_directory.hpp)
 
@@ -36,7 +37,8 @@ cpp/
   src/                   minimal pub/sub quickstart -- see src/README.md
     pub.cpp, sub.cpp, pubsub.cpp, main.cpp
 
-  tools/                 rl_topic.cpp (rostopic-style CLI), relink_example.cpp, relink_benchmark.cpp
+  tools/                 rl_topic.cpp (rostopic-style CLI), relink_example.cpp, relink_benchmark.cpp,
+                          relink_image_benchmark.cpp (raw image UDP-vs-shm-IPC benchmark, needs OpenCV)
   examples/              larger, message-type-coverage examples (Step 10 of the main README)
   tests/                 unit tests + two-process correctness tests
   cmake_example/         standalone CMake project template for consuming ReLink from your OWN project -- see cmake_example/README.md
@@ -159,6 +161,16 @@ step 2 produces.
   README's Step 9.
 - **Want to see every built-in/composite message type in action?**
   [`examples/`](examples/) — one file per ROS-familiar message package.
+- **Publisher and subscriber on the same machine?**
+  `advertise_local_ipc`/`subscribe_local_ipc`/`publish_local_ipc` (and
+  the `_image` variants) route through `shm_transport.hpp`'s
+  shared-memory ring instead of UDP — see the main README's [same-host
+  shared-memory IPC](../README.md#same-host-shared-memory-ipc-_local_ipc)
+  section for the full API and constraints. Want to measure the
+  difference yourself? `tools/relink_image_benchmark.cpp` (needs
+  OpenCV) runs raw full-HD frames both ways and reports delivery rate
+  and throughput for each — see the main README's Step 12 for the
+  measured numbers.
 - **Modifying the library itself?** Start at
   [`include/relink/relink.hpp`](include/relink/relink.hpp) (the public
   API) and follow its includes down into `udp_transport.hpp`,

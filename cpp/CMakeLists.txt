@@ -43,6 +43,14 @@ if(WIN32)
 else()
     find_package(Threads REQUIRED)
     target_link_libraries(relink INTERFACE Threads::Threads)
+    # shm_transport.hpp's shm_open()/shm_unlink() live in librt on
+    # glibc < 2.34 (folded into libc itself from 2.34 on) -- link it
+    # unconditionally on non-Windows rather than version-detecting, it's
+    # a no-op on systems that don't need it.
+    find_library(RELINK_RT_LIB rt)
+    if(RELINK_RT_LIB)
+        target_link_libraries(relink INTERFACE ${RELINK_RT_LIB})
+    endif()
 endif()
 
 # relink-rlcore / relink-relay (own CMakeLists.txt, also usable
@@ -57,6 +65,18 @@ target_link_libraries(relink_example PRIVATE relink)
 
 add_executable(relink_benchmark tools/relink_benchmark.cpp)
 target_link_libraries(relink_benchmark PRIVATE relink)
+
+# relink_image_benchmark needs OpenCV (same as camera_stream below) --
+# only built when it's actually found, independent of
+# RELINK_BUILD_EXAMPLES since this is a tool, not an example.
+find_package(OpenCV QUIET)
+if(OpenCV_FOUND)
+    add_executable(relink_image_benchmark tools/relink_image_benchmark.cpp)
+    target_link_libraries(relink_image_benchmark PRIVATE relink ${OpenCV_LIBS})
+    target_include_directories(relink_image_benchmark PRIVATE ${OpenCV_INCLUDE_DIRS})
+else()
+    message(STATUS "relink: OpenCV not found -- skipping relink_image_benchmark tool (see README Step 12)")
+endif()
 
 # cpp/src/ -- a minimal pub/sub quickstart (see src/README.md), separate
 # from cpp/examples/'s larger message-type-coverage set. The pubsub.cpp
@@ -134,7 +154,8 @@ if(RELINK_BUILD_TESTS)
         test_image
         test_compressed_image
         test_adaptive_bitrate
-        test_relink_node)
+        test_relink_node
+        test_shm_transport)
     foreach(t ${RELINK_UNIT_TESTS})
         add_executable(${t} tests/${t}.cpp)
         target_link_libraries(${t} PRIVATE relink)
