@@ -193,7 +193,7 @@ public:
     // small fixed struct, e.g. Image's 10-byte chunk header) and `data`
     // (the caller's actual buffer, e.g. a camera frame slice) are handed
     // to the kernel directly -- no userspace copy of either, only the
-    // 9 fixed framing bytes ('#' + 7-byte header + '\n') are ever
+    // 11 fixed framing bytes ('#' + 9-byte header + '\n') are ever
     // assembled locally.
     bool publish_scattered(uint32_t topic_id, const void* extra_header, size_t extra_header_len,
                             const void* data, size_t data_len, const PeerAddr& peer) {

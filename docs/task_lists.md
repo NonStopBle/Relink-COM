@@ -120,20 +120,28 @@ Everything implemented together so far, in order.
 
 ## In progress / pending
 
-- [ ] Widen `topic_id` from `uint16_t` to `uint32_t` (2nd pass -- header
-      grows 7->9 bytes on the wire). C++ header/register/beacon/frame/
-      transport/discovery/relink.hpp already updated in a prior session;
-      still need:
-      - verify image.hpp for missed uint16_t topic_id fields
-      - rebuild all of cpp/ (tests, examples, benchmark, ros2_compare) and
-        fix any remaining type-mismatch errors
-      - update tests/test_image.cpp byte-size expectations (7->9 byte header)
-      - mirror the change in relink_py (struct format char H -> I, header
-        size 7->9, register/beacon array element size 2->4 bytes)
-      - update relink_py/tests/test_image.py byte-size expectations
-      - re-run both C++ and Python test suites
-      - cross-language byte-for-byte sanity check with a topic_id > 0xFFFF
-      - full plan saved at ~/.claude/plans/mellow-tickling-teapot.md
+(none right now -- see "Verified done" below for the item that was here)
+
+## Verified done (2026-09-20 check)
+
+- [x] Widen `topic_id` from `uint16_t` to `uint32_t` -- confirmed this was
+      already fully merged (wire.hpp/register.hpp/beacon.hpp/frame.hpp/
+      udp_transport.hpp/multicast_discovery.hpp/relink.hpp all use
+      `uint32_t topic_id`; RelinkHeader is 9 bytes; relink_py's wire.py
+      uses `ctypes.c_uint32` and is also 9 bytes). image.hpp has no
+      topic_id-typed fields, so nothing to fix there.
+      Re-verified end to end:
+      - full cpp/ rebuild via CMake -- clean
+      - `ctest` -- 10/10 pass
+      - `python3 tests/test_relink.py` and `tests/test_image.py` -- ALL PASS
+      - manual cross-language byte check: encoded topic_id=0x12345678
+        (>0xFFFF, only fits in 4 bytes) in Python's `encode_frame`, header
+        bytes matched the same LE layout C++'s test_wire.cpp expects
+        (topic_id, seq_num, payload_len, flags in that order)
+      - fixed two stale comments left over from the old 7-byte header:
+        cpp/include/relink/frame.hpp ("header(7)" -> "header(9)") and
+        cpp/include/relink/udp_transport.hpp ("9 fixed framing bytes ...
+        7-byte header" -> "11 fixed framing bytes ... 9-byte header")
 
 ## Ideas / not started
 

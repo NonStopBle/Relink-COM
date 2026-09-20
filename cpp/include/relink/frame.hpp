@@ -23,7 +23,7 @@ namespace relink {
 inline constexpr size_t kMaxPayloadBytes = 1400;
 
 // Max full frame size a single encode can ever produce at this budget:
-// '#' + header(7) + payload(<=1400) + '\n', no secure/checksum in v1.
+// '#' + header(9) + payload(<=1400) + '\n', no secure/checksum in v1.
 inline constexpr size_t kMaxFrameBytes = 1 + sizeof(RelinkHeader) + kMaxPayloadBytes + 1;
 
 enum class EncodeResult {
