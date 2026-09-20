@@ -161,7 +161,13 @@ step 2 produces.
   `rlcore/relink_rlcore.cpp` and `tools/rl_topic.cpp` — build steps and
   every CLI flag (including `--nat` and the AES-256-GCM
   `--encrypt-key`/`--generate-key` encryption flags) are in the main
-  README's Step 9.
+  README's Step 9. That includes `--ipc`, which retargets `rl_topic`'s
+  `hz`/`bw`/`echo`/`pub` at a same-host shared-memory topic instead of
+  the network:
+  ```bash
+  ./rl_topic echo /my/ipc/topic --ipc
+  ./rl_topic pub /my/ipc/topic --ipc --text "hello over shm"
+  ```
 - **Want to see every built-in/composite message type in action?**
   [`examples/`](examples/) — one file per ROS-familiar message package.
 - **Publisher and subscriber on the same machine?**
