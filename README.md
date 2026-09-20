@@ -1107,11 +1107,18 @@ which case you're in.
 ```bash
 # Build + run the relay (plain sockets, no AF_XDP -- see below)
 g++ -std=c++17 -O2 -I cpp/include -pthread cpp/rlcore/relink_relay.cpp -o relink-relay
-./relink-relay [port]   # default 8446
+./relink-relay --port 8446 --ip 10.0.0.5   # or just ./relink-relay [port]
+./relink-relay --help
 
 # Python
-relink-relay [port]   # after: pip install -e python/relink_py
+relink-relay --port 8446 --ip 10.0.0.5   # after: pip install -e python/relink_py
+relink-relay --help
 ```
+
+`--ip` binds the relay to one local interface instead of all of them
+(default `0.0.0.0`); the legacy `relink-relay [port]` positional form
+still works and is equivalent to `--port`. Same bind-failure behavior
+as `relink-rlcore` — see the troubleshooting note above.
 
 **Stress-tested**: 30 concurrent nodes registering, punching, and
 publishing through the same `relink-rlcore --nat` instance at once —
@@ -1387,6 +1394,12 @@ A few things worth knowing:
   subscriber role) if that node hasn't re-registered in the last few
   seconds — closing a node makes it disappear from `list`/`info` shortly
   after, it doesn't linger forever.
+- **`--ip <address>`** sends `list`/`info` queries from a specific local
+  interface instead of whatever the OS picks by default — for the
+  multicast path it also sets the outgoing multicast interface, useful
+  on a multi-homed host where the default route isn't on the ReLink
+  LAN segment. `-h`/`--help` works on the top-level command and on
+  every subcommand (`rl_topic list --help`, etc.).
 - **`echo`** decodes payloads too, not just hex: `--type Float32` (or
   any other built-in type from `standard_msgs.py`/`std_msgs`/
   `geometry_msgs`/etc. — `Imu`, `Pose`, ...) or `--msg path/to/custom.msg`

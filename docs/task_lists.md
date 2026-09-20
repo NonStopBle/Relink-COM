@@ -143,9 +143,28 @@ Everything implemented together so far, in order.
         cpp/include/relink/udp_transport.hpp ("9 fixed framing bytes ...
         7-byte header" -> "11 fixed framing bytes ... 9-byte header")
 
+## Verified done (2026-09-20, continued)
+
+- [x] `relay.py` (`relink-relay`): added `--port`, `--ip`, `-h`/`--help`,
+      unrecognized-flag rejection, and a clearer bind-failure message,
+      matching `rlcore.py`. Kept the legacy `relink-relay [port]`
+      positional form working (errors if both `--port` and a positional
+      are given, or if more than one positional is given).
+- [x] `rl_topic.py` (`rltopic`): `-h`/`--help` was already free via
+      argparse on the top-level command and every subcommand. Added
+      `--ip` to `list`/`info` (and everything sharing the `common`
+      argparse group) to bind the query socket to a specific local
+      interface, and to set `IP_MULTICAST_IF` for multicast queries on a
+      multi-homed host. Not wired into `hz`/`bw`/`echo`/`pub`, which go
+      through `RelinkNode` instead of a raw socket here -- `RelinkNode`
+      itself has no bind-ip option yet, so plumbing it through those four
+      would be a separate, bigger change.
+      Verified: `--help` on both tools and every rl_topic subcommand,
+      `--ip 127.0.0.1` functional test, bad-flag rejection, bind-conflict
+      message, both-port-forms-given error, both-positionals error, and
+      the full `test_relink.py`/`test_image.py` suites (ALL PASS).
+      README's relay/rl_topic sections updated to document the new flags.
+
 ## Ideas / not started
 
-- [ ] Consider whether `--ip`/unrecognized-flag handling should also be
-      added to `relink-relay` and `rl_topic` (only `relink-rlcore` got it
-      so far, prompted by the readyidc bind-error report)
-- [ ] Give relay.py's CLI `-h`/`--help` and `--ip` for parity with rlcore
+(none open right now)

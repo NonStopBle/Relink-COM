@@ -80,14 +80,20 @@ def save_conf(ip: str, port: int):
         f.write(struct.pack(CONF_FMT, socket.inet_aton(ip), port))
 
 
-def query_rlcore(ip: str, port: int, timeout: float):
+def query_rlcore(ip: str, port: int, timeout: float, bind_ip: str = None):
     """Unicast RLNQ to rlcore, return {topic_id: name}. rlcore chunks its
     reply into multiple RLNR packets when it knows more than
     tdir.MAX_ENTRIES (512) names (a real large-topic-count fleet easily
     exceeds that), so this collects every reply that arrives within
     `timeout` of the LAST one seen, same idea as query_multicast() below,
-    not just the first packet."""
+    not just the first packet.
+
+    bind_ip, when given, sends the query out a specific local interface
+    -- needed on a multi-homed host where the default route doesn't
+    reach rlcore (mirrors rlcore's own --ip)."""
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    if bind_ip:
+        s.bind((bind_ip, 0))
     s.settimeout(timeout)
     found = {}
     got_any = False
@@ -124,12 +130,14 @@ def query_rlcore(ip: str, port: int, timeout: float):
     return found
 
 
-def query_rlcore_roles(ip: str, port: int, timeout: float):
+def query_rlcore_roles(ip: str, port: int, timeout: float, bind_ip: str = None):
     """Unicast RLPQ to rlcore, return {topic_id: [(ip_str, port, role), ...]}
     -- who's publishing/subscribing each topic, per the role directory
     (see topic_directory.py). rlcore-only: there is no per-peer role
     concept in multicast mode (each node only knows about itself)."""
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    if bind_ip:
+        s.bind((bind_ip, 0))
     s.settimeout(timeout)
     found = {}
     got_any = False
@@ -158,11 +166,19 @@ def query_rlcore_roles(ip: str, port: int, timeout: float):
     return found
 
 
-def query_multicast(group: str, port: int, timeout: float):
+def query_multicast(group: str, port: int, timeout: float, bind_ip: str = None):
     """Broadcast RLNQ to the multicast group, collect every RLNR reply
-    that arrives within `timeout` seconds. Returns {topic_id: name}."""
+    that arrives within `timeout` seconds. Returns {topic_id: name}.
+
+    bind_ip, when given, also sets IP_MULTICAST_IF so the query goes out
+    a specific NIC -- on a multi-homed host the default multicast route
+    doesn't necessarily point at the interface actually on the ReLink
+    LAN segment."""
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    if bind_ip:
+        s.bind((bind_ip, 0))
+        s.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF, socket.inet_aton(bind_ip))
     s.settimeout(timeout)
     found = {}
     try:
@@ -193,8 +209,8 @@ def query_multicast(group: str, port: int, timeout: float):
 
 def collect_names(args) -> dict:
     if args.rlcore_ip:
-        return query_rlcore(args.rlcore_ip, args.rlcore_port, args.timeout)
-    return query_multicast(args.group, args.port, args.timeout)
+        return query_rlcore(args.rlcore_ip, args.rlcore_port, args.timeout, args.ip)
+    return query_multicast(args.group, args.port, args.timeout, args.ip)
 
 
 def resolve_topic_arg(raw: str):
@@ -449,7 +465,8 @@ def cmd_info(args):
     # p2p connection details (who's publishing/subscribing, by ip:port)
     # only exist centrally at rlcore -- multicast mode has no central
     # table to ask, each node only knows about itself.
-    roles = query_rlcore_roles(args.rlcore_ip, args.rlcore_port, args.timeout) if args.rlcore_ip else {}
+    roles = (query_rlcore_roles(args.rlcore_ip, args.rlcore_port, args.timeout, args.ip)
+             if args.rlcore_ip else {})
 
     for tid, name in matches:
         print(f"Topic id : {tid}")
@@ -491,6 +508,9 @@ def build_parser():
     common.add_argument("--port", type=int, default=DEFAULT_MULTICAST_PORT)
     common.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT_S,
                          help="How long to wait for replies (seconds).")
+    common.add_argument("--ip", default=None,
+                         help="local address/interface to send queries from (default: OS-chosen). "
+                              "Also sets the outgoing interface for multicast queries.")
     p = argparse.ArgumentParser(
         prog="rl_topic.py",
         description="rostopic-style topic name directory CLI for ReLink.")
