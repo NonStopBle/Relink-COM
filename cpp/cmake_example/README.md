@@ -153,5 +153,14 @@ cmake --build build
 ./build/rl_topic info /example/chatter --rlcore-ip 203.0.113.10
 ```
 
+`hz`/`bw`/`echo`/`pub` also take an `--ipc` flag that targets a
+same-host shared-memory topic directly instead of the network — no
+`relink-rlcore`/multicast involved at all:
+
+```bash
+./build/rl_topic echo /my/ipc/topic --ipc
+./build/rl_topic pub /my/ipc/topic --ipc --text "hello over shm"
+```
+
 Both binaries are also available prebuilt for Windows under
 [`cpp/win-bin/`](../win-bin/) if you don't want to build them yourself.
