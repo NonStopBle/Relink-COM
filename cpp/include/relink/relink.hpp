@@ -11,6 +11,7 @@
 #include "relink/crypto.hpp"
 #include "relink/multicast_discovery.hpp"
 #include "relink/image.hpp"
+#include "relink/compressed_image.hpp"
 #include "relink/topic_hash.hpp"
 #include "relink/topic_directory.hpp"
 #include "relink/standard_msgs.hpp"
@@ -293,8 +294,8 @@ public:
                    bool pair = false, uint32_t pair_id = 0) {
         static_assert(std::is_trivially_copyable<T>::value,
                       "advertise<T>: T must be trivially copyable");
-        if constexpr (std::is_same<T, ImageChunk>::value) {
-            transport_.enable_large_buffers(); // Image always stays on the shared transport
+        if constexpr (std::is_same<T, ImageChunk>::value || std::is_same<T, CompressedImageChunk>::value) {
+            transport_.enable_large_buffers(); // Image/CompressedImage always stay on the shared transport
         } else {
             register_pair(topic_id, pair, pair_id);
             transport_for(topic_id);
@@ -318,9 +319,10 @@ public:
                    bool pair = false, uint32_t pair_id = 0) {
         static_assert(std::is_trivially_copyable<T>::value,
                       "subscribe<T>: T must be trivially copyable");
-        if constexpr (!std::is_same<T, ImageChunk>::value) register_pair(topic_id, pair, pair_id);
-        UdpTransport& t = std::is_same<T, ImageChunk>::value ? transport_ : transport_for(topic_id);
-        if constexpr (std::is_same<T, ImageChunk>::value) {
+        constexpr bool kIsLargeBlob = std::is_same<T, ImageChunk>::value || std::is_same<T, CompressedImageChunk>::value;
+        if constexpr (!kIsLargeBlob) register_pair(topic_id, pair, pair_id);
+        UdpTransport& t = kIsLargeBlob ? transport_ : transport_for(topic_id);
+        if constexpr (kIsLargeBlob) {
             transport_.enable_large_buffers();
         }
         {
@@ -411,13 +413,14 @@ public:
             auto it = peers_.find(topic_id);
             if (it != peers_.end()) peers = it->second;
         }
-        UdpTransport& t = std::is_same<T, ImageChunk>::value ? transport_ : transport_for(topic_id);
+        constexpr bool kIsLargeBlob = std::is_same<T, ImageChunk>::value || std::is_same<T, CompressedImageChunk>::value;
+        UdpTransport& t = kIsLargeBlob ? transport_ : transport_for(topic_id);
         uint16_t seq = t.next_seq(); // shared across every direct peer AND the relay copy
         bool all_ok = true;
         for (const auto& peer : peers) {
             all_ok = t.publish_raw(topic_id, &value, sizeof(T), peer, seq) && all_ok;
         }
-        if (relay_enabled_ && !std::is_same<T, ImageChunk>::value) {
+        if (relay_enabled_ && !kIsLargeBlob) {
             t.publish_raw(topic_id, &value, sizeof(T), relay_peer(), seq);
         }
         return all_ok;
@@ -553,6 +556,127 @@ public:
             size_t data_len = len - kImageChunkHeaderBytes;
             if (chunk_bytes != data_len) return; // mismatch: drop, never misinterpret bytes
             reassembler->on_chunk_raw(frame_id, chunk_index, chunk_count, data, chunk_bytes);
+        });
+    }
+
+    // --- CompressedImage: same MTU-chunking as Image, plus a capture
+    // timestamp and the encoder quality used, carried on every chunk so
+    // a receiver can measure end-to-end latency and report the quality
+    // actually used, with no side channel back to the publisher. Pair
+    // this with AdaptiveBitrateController (see adaptive_bitrate.hpp) to
+    // pick `quality` per frame -- this method itself does no encoding
+    // and no quality selection, same "bring your own codec" stance as
+    // Image. See compressed_image.hpp and examples/cpp/camera_stream.cpp. ---
+
+    void advertise_compressed_image(const std::string& name) { advertise_compressed_image(topic_id_for(name)); }
+    void advertise_compressed_image(uint32_t topic_id) { advertise<CompressedImageChunk>(topic_id); }
+
+    // data/len is already-compressed bytes (e.g. a JPEG buffer).
+    // capture_timestamp_ns defaults to now() -- override it if you
+    // captured the frame earlier than this call (e.g. batching).
+    // quality is purely informational: the encoder quality (0-100) you
+    // used for this frame, so a subscriber can display/log it without
+    // a return channel. Returns false if `len` exceeds
+    // kMaxCompressedImageBytes, same "never silently truncate" rule as
+    // publish_image().
+    bool publish_compressed_image(const std::string& name, const uint8_t* data, size_t len,
+                                   uint8_t quality = 0, uint32_t frame_id = kAutoFrameId,
+                                   uint64_t capture_timestamp_ns = 0) {
+        return publish_compressed_image(topic_id_for(name), data, len, quality, frame_id, capture_timestamp_ns);
+    }
+
+    bool publish_compressed_image(uint32_t topic_id, const uint8_t* data, size_t len,
+                                   uint8_t quality = 0, uint32_t frame_id = kAutoFrameId,
+                                   uint64_t capture_timestamp_ns = 0) {
+        if (len > kMaxCompressedImageBytes) return false;
+        if (frame_id == kAutoFrameId) {
+            std::lock_guard<std::mutex> lock(state_mutex_);
+            frame_id = next_compressed_image_frame_id_[topic_id]++;
+        }
+        if (capture_timestamp_ns == 0) {
+            capture_timestamp_ns = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::system_clock::now().time_since_epoch()).count());
+        }
+        ensure_started();
+
+        std::vector<PeerAddr> peers;
+        {
+            std::lock_guard<std::mutex> lock(state_mutex_);
+            auto it = peers_.find(topic_id);
+            if (it != peers_.end()) peers = it->second;
+        }
+
+        uint16_t chunk_count = static_cast<uint16_t>(
+            (len + kCompressedImageChunkDataBytes - 1) / kCompressedImageChunkDataBytes);
+        if (chunk_count == 0) chunk_count = 1; // empty image is still one chunk
+
+        bool all_ok = true;
+        for (uint16_t i = 0; i < chunk_count; ++i) {
+#pragma pack(push, 1)
+            struct ChunkHeader {
+                uint32_t frame_id;
+                uint16_t chunk_index;
+                uint16_t chunk_count;
+                uint16_t chunk_bytes;
+                uint64_t capture_timestamp_ns;
+                uint8_t  quality;
+            };
+#pragma pack(pop)
+            static_assert(sizeof(ChunkHeader) == kCompressedImageChunkHeaderBytes,
+                          "ChunkHeader must exactly match the wire chunk header layout");
+            ChunkHeader chdr{frame_id, i, chunk_count, 0, capture_timestamp_ns, quality};
+            size_t offset = size_t(i) * kCompressedImageChunkDataBytes;
+            size_t n = std::min(kCompressedImageChunkDataBytes, len - offset);
+            chdr.chunk_bytes = static_cast<uint16_t>(n);
+
+            for (const auto& peer : peers) {
+                all_ok = transport_.publish_scattered(topic_id, &chdr, sizeof(chdr),
+                                                        data + offset, n, peer) && all_ok;
+            }
+        }
+        return all_ok;
+    }
+
+    // Subscribes to a topic of CompressedImage chunks; `callback`
+    // (frame_id, data, capture_timestamp_ns, quality) fires once per
+    // COMPLETE image. Same drop-on-incomplete-frame tradeoff, same
+    // "slow callback blocks the data thread" warning, as
+    // subscribe_image() -- see there for the full explanation.
+    template <typename Callback>
+    void subscribe_compressed_image(const std::string& name, Callback callback) {
+        subscribe_compressed_image(topic_id_for(name), std::move(callback));
+    }
+
+    template <typename Callback>
+    void subscribe_compressed_image(uint32_t topic_id, Callback callback) {
+        transport_.enable_large_buffers();
+        auto reassembler = std::make_shared<CompressedImageReassembler>(
+            [callback](uint32_t frame_id, const std::vector<uint8_t>& image,
+                       uint64_t capture_timestamp_ns, uint8_t quality) {
+                callback(frame_id, image, capture_timestamp_ns, quality);
+            });
+        {
+            std::lock_guard<std::mutex> lock(state_mutex_);
+            compressed_image_reassemblers_.push_back(reassembler); // keep alive for node lifetime
+            declared_topics_.insert(topic_id);
+            subscribed_topics_.insert(topic_id);
+        }
+        transport_.set_topic_handler(topic_id, [reassembler](const uint8_t* payload, size_t len) {
+            if (len < kCompressedImageChunkHeaderBytes) return;
+            uint32_t frame_id; uint16_t chunk_index, chunk_count, chunk_bytes;
+            uint64_t capture_timestamp_ns; uint8_t quality;
+            std::memcpy(&frame_id, payload, sizeof(frame_id));
+            std::memcpy(&chunk_index, payload + 4, sizeof(chunk_index));
+            std::memcpy(&chunk_count, payload + 6, sizeof(chunk_count));
+            std::memcpy(&chunk_bytes, payload + 8, sizeof(chunk_bytes));
+            std::memcpy(&capture_timestamp_ns, payload + 10, sizeof(capture_timestamp_ns));
+            std::memcpy(&quality, payload + 18, sizeof(quality));
+            const uint8_t* data = payload + kCompressedImageChunkHeaderBytes;
+            size_t data_len = len - kCompressedImageChunkHeaderBytes;
+            if (chunk_bytes != data_len) return; // mismatch: drop, never misinterpret bytes
+            reassembler->on_chunk_raw(frame_id, chunk_index, chunk_count, data, chunk_bytes,
+                                       capture_timestamp_ns, quality);
         });
     }
 
@@ -1032,8 +1156,10 @@ private:
     std::unordered_set<uint32_t> subscribed_topics_;
     std::unordered_map<uint32_t, std::vector<PeerAddr>> peers_;
     std::unordered_map<uint32_t, uint32_t> next_image_frame_id_;
+    std::unordered_map<uint32_t, uint32_t> next_compressed_image_frame_id_;
     std::unordered_map<uint32_t, std::string> topic_names_;
     std::vector<std::shared_ptr<ImageReassembler>> image_reassemblers_;
+    std::vector<std::shared_ptr<CompressedImageReassembler>> compressed_image_reassemblers_;
 
     std::mutex start_mutex_;
     bool started_ = false;

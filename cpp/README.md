@@ -25,7 +25,8 @@ cpp/
     beacon.hpp / multicast_discovery.hpp Mode B (multicast) discovery
     crypto.hpp               AES-256-GCM for the rlcore signaling handshake
     platform.hpp             Linux/macOS/Windows socket + threading shim
-    ... (topic_hash.hpp, ring_buffer.hpp, frame.hpp, image.hpp, standard_msgs.hpp, relay_wire.hpp, topic_directory.hpp)
+    ... (topic_hash.hpp, ring_buffer.hpp, frame.hpp, image.hpp, compressed_image.hpp,
+         adaptive_bitrate.hpp, standard_msgs.hpp, relay_wire.hpp, topic_directory.hpp)
 
   rlcore/                registration daemon + relay (own standalone CMakeLists.txt)
     relink_rlcore.cpp       the daemon nodes register with (Mode A)
@@ -51,7 +52,7 @@ The whole tree, in one shot:
 cd cpp
 cmake -B build .
 cmake --build build
-ctest --test-dir build          # runs the 10 self-contained unit tests
+ctest --test-dir build          # runs the 12 self-contained unit tests
 ```
 
 Or with the wrapper script:

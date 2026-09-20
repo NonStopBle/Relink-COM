@@ -132,6 +132,8 @@ if(RELINK_BUILD_TESTS)
         test_multicast_discovery
         test_udp_transport
         test_image
+        test_compressed_image
+        test_adaptive_bitrate
         test_relink_node)
     foreach(t ${RELINK_UNIT_TESTS})
         add_executable(${t} tests/${t}.cpp)

@@ -30,6 +30,11 @@ from .image import (
     ImageChunk, encode_image_chunks, ImageReassembler, ImageTooLargeError,
     MAX_IMAGE_BYTES, IMAGE_CHUNK_DATA_BYTES, IMAGE_CHUNK_HEADER_BYTES,
 )
+from .compressed_image import (
+    CompressedImageChunk, encode_compressed_image_chunks, CompressedImageReassembler,
+    CompressedImageTooLargeError, MAX_COMPRESSED_IMAGE_BYTES,
+    COMPRESSED_IMAGE_CHUNK_DATA_BYTES, COMPRESSED_IMAGE_CHUNK_HEADER_BYTES,
+)
 
 
 class DiscoveryMode(enum.Enum):
@@ -122,6 +127,7 @@ class RelinkNode:
         self._peers_lock = threading.Lock()
         self._peers: Dict[int, List[PeerAddr]] = {}
         self._next_image_frame_id: Dict[int, int] = {}
+        self._next_compressed_image_frame_id: Dict[int, int] = {}
         self._topic_names: Dict[int, str] = {}
 
         self._transport = UdpTransport()
@@ -504,8 +510,8 @@ class RelinkNode:
         topic_id = self._topic_id_for(topic)
         if not is_wire_type(msg_type):
             raise TypeError(f"{msg_type} must be a ctypes.Structure subclass with _pack_ = 1")
-        if msg_type is ImageChunk:
-            self._transport.enable_large_buffers()  # Image always stays on the shared transport
+        if msg_type is ImageChunk or msg_type is CompressedImageChunk:
+            self._transport.enable_large_buffers()  # Image/CompressedImage always stay on the shared transport
         else:
             self._register_pair(topic_id, pair, pair_id)
             self._transport_for(topic_id)
@@ -524,9 +530,10 @@ class RelinkNode:
         self._declared_topics.add(topic_id)
         self._subscribed_topics.add(topic_id)
         expected_size = ctypes.sizeof(msg_type)
-        if msg_type is not ImageChunk:
+        is_large_blob = msg_type is ImageChunk or msg_type is CompressedImageChunk
+        if not is_large_blob:
             self._register_pair(topic_id, pair, pair_id)
-        t = self._transport if msg_type is ImageChunk else self._transport_for(topic_id)
+        t = self._transport if is_large_blob else self._transport_for(topic_id)
 
         def raw_handler(payload: bytes):
             if len(payload) != expected_size:
@@ -587,12 +594,13 @@ class RelinkNode:
         with self._peers_lock:
             peers = list(self._peers.get(topic_id, []))
         payload = bytes(value)
-        t = self._transport if type(value) is ImageChunk else self._transport_for(topic_id)
+        is_large_blob = type(value) is ImageChunk or type(value) is CompressedImageChunk
+        t = self._transport if is_large_blob else self._transport_for(topic_id)
         seq = t.next_seq()  # shared across every direct peer AND the relay copy
         all_ok = True
         for peer in peers:
             all_ok = t.publish_raw(topic_id, payload, peer, seq) and all_ok
-        if self._relay_enabled and type(value) is not ImageChunk:
+        if self._relay_enabled and not is_large_blob:
             t.publish_raw(topic_id, payload, self._relay_peer(), seq)
         return all_ok
 
@@ -687,6 +695,95 @@ class RelinkNode:
             if chunk_bytes != len(data):
                 return  # mismatch: drop, never misinterpret bytes
             reassembler.on_chunk_raw(frame_id, chunk_index, chunk_count, data)
+
+        self._transport.set_topic_handler(topic_id, raw_handler)
+
+    # --- CompressedImage: same MTU-chunking as Image, plus a capture
+    # timestamp and the encoder quality used, carried on every chunk so
+    # a receiver can measure end-to-end latency and report the quality
+    # actually used, with no side channel back to the publisher. Pair
+    # this with AdaptiveBitrateController (see adaptive_bitrate.py) to
+    # pick `quality` per frame -- this method itself does no encoding
+    # and no quality selection, same "bring your own codec" stance as
+    # Image. See compressed_image.py and examples/camera_stream.py. ---
+
+    def advertise_compressed_image(self, topic: Union[int, str]):
+        """Equivalent to advertise(topic, CompressedImageChunk) -- a
+        clearer name for this use case."""
+        self.advertise(topic, CompressedImageChunk)
+
+    def publish_compressed_image(self, topic: Union[int, str], data: bytes,
+                                  frame_id: int = None,
+                                  capture_timestamp_ns: int = None,
+                                  quality: int = 0) -> bool:
+        """Splits data (already-compressed bytes, e.g. a JPEG buffer)
+        into MTU-maximized chunks and publishes each one in order.
+        frame_id auto-increments per topic if not given.
+        capture_timestamp_ns defaults to time.time_ns() -- override it
+        if you captured the frame earlier than the call to this
+        function (e.g. batching). quality is purely informational: the
+        encoder quality (0-100) you used for this frame, so a
+        subscriber can display/log it without you needing a return
+        channel. Raises CompressedImageTooLargeError if data exceeds
+        the max representable size.
+
+        Same zero-copy send path as publish_image(): no intermediate
+        CompressedImageChunk is built, each chunk's header and a
+        memoryview slice of `data` go straight to
+        UdpTransport.publish_scattered()."""
+        topic_id = self._topic_id_for(topic)
+        if len(data) > MAX_COMPRESSED_IMAGE_BYTES:
+            raise CompressedImageTooLargeError(
+                f"{len(data)} bytes exceeds the max representable image size "
+                f"({MAX_COMPRESSED_IMAGE_BYTES} bytes, limited by chunk_count being a uint16)")
+        if frame_id is None:
+            with self._peers_lock:
+                frame_id = self._next_compressed_image_frame_id.get(topic_id, 0)
+                self._next_compressed_image_frame_id[topic_id] = (frame_id + 1) & 0xFFFFFFFF
+        if capture_timestamp_ns is None:
+            capture_timestamp_ns = time.time_ns()
+
+        self._ensure_started()
+        with self._peers_lock:
+            peers = list(self._peers.get(topic_id, []))
+
+        chunk_count = max(1, (len(data) + COMPRESSED_IMAGE_CHUNK_DATA_BYTES - 1)
+                          // COMPRESSED_IMAGE_CHUNK_DATA_BYTES)
+        view = memoryview(data)
+        all_ok = True
+        for i in range(chunk_count):
+            offset = i * COMPRESSED_IMAGE_CHUNK_DATA_BYTES
+            piece = view[offset:offset + COMPRESSED_IMAGE_CHUNK_DATA_BYTES]
+            header = struct.pack("<IHHHQB", frame_id, i, chunk_count, len(piece),
+                                 capture_timestamp_ns, quality)
+            for peer in peers:
+                ok = self._transport.publish_scattered(topic_id, header, piece, peer)
+                all_ok = ok and all_ok
+        return all_ok
+
+    def subscribe_compressed_image(self, topic: Union[int, str],
+                                    callback: Callable[[int, bytes, int, int], None]):
+        """Subscribes to a topic of CompressedImage chunks;
+        callback(frame_id, data, capture_timestamp_ns, quality) fires
+        once per COMPLETE image. Same drop-on-incomplete-frame
+        tradeoff, same "slow callback blocks the data thread" warning,
+        as subscribe_image() -- see there for the full explanation."""
+        topic_id = self._topic_id_for(topic)
+        self._transport.enable_large_buffers()
+        reassembler = CompressedImageReassembler(callback)
+        self._declared_topics.add(topic_id)
+        self._subscribed_topics.add(topic_id)
+
+        def raw_handler(payload: bytes):
+            if len(payload) < COMPRESSED_IMAGE_CHUNK_HEADER_BYTES:
+                return
+            frame_id, chunk_index, chunk_count, chunk_bytes, capture_timestamp_ns, quality = \
+                struct.unpack("<IHHHQB", payload[:COMPRESSED_IMAGE_CHUNK_HEADER_BYTES])
+            data = payload[COMPRESSED_IMAGE_CHUNK_HEADER_BYTES:]
+            if chunk_bytes != len(data):
+                return  # mismatch: drop, never misinterpret bytes
+            reassembler.on_chunk_raw(frame_id, chunk_index, chunk_count, data,
+                                     capture_timestamp_ns, quality)
 
         self._transport.set_topic_handler(topic_id, raw_handler)
 

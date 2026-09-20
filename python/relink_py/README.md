@@ -110,10 +110,14 @@ shows; the Python versions live here:
   it twice and watch two copies find each other and exchange messages
 - `examples/rlcore_pubsub.py` -- mode A (daemon), custom + default type
 - `examples/multicast_pubsub.py` -- mode B (no daemon)
-- `examples/camera_stream.py` -- a real webcam streamed as both raw and
-  JPEG-compressed, demonstrating why you'd chunk + compress a large
-  message; requires OpenCV, which you install yourself (`pip install
-  opencv-python`) -- it is not a ReLink dependency
+- `examples/camera_stream.py` -- a real webcam (or `--video-file PATH`,
+  for testing without one) streamed three ways: raw, fixed-quality
+  JPEG, and adaptive-quality JPEG via `CompressedImage` +
+  `AdaptiveBitrateController` (`relink/compressed_image.py` /
+  `relink/adaptive_bitrate.py`), demonstrating why you'd chunk,
+  compress, and adapt quality for a large message; requires OpenCV,
+  which you install yourself (`pip install opencv-python`) -- it is not
+  a ReLink dependency
 
 Run the pub/sub examples as two processes: `python3 rlcore_pubsub.py
 pub <rlcore_ip>` and `python3 rlcore_pubsub.py sub <rlcore_ip>`.
@@ -127,4 +131,7 @@ python3 tests/test_relink.py
 
 Plain-assert suite mirroring the C++ `tests/test_*.cpp` coverage: wire
 layout, frame codec, register/beacon codec, real-socket UDP delivery,
-and RelinkNode's discovery-mode error paths.
+RelinkNode's discovery-mode error paths, `Image`/`CompressedImage`
+chunking + reassembly (`tests/test_image.py` /
+`tests/test_compressed_image.py`), and `AdaptiveBitrateController`'s
+motion/bitrate quality selection (`tests/test_adaptive_bitrate.py`).

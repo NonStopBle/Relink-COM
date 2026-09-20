@@ -279,7 +279,7 @@ example and test — instead of compiling files one at a time:
 cd cpp
 cmake -B build .
 cmake --build build
-ctest --test-dir build          # runs the 10 self-contained unit tests
+ctest --test-dir build          # runs the 12 self-contained unit tests
 ```
 
 `-DRELINK_BUILD_EXAMPLES=OFF`/`-DRELINK_BUILD_TESTS=OFF` skip those
@@ -897,11 +897,17 @@ unbounded ones) are documented at the top of `standard_msgs.hpp`.
 | `trajectory_msgs` (4) | `JointTrajectory`, `JointTrajectoryPoint`, `MultiDOFJointTrajectory`, `MultiDOFJointTrajectoryPoint` |
 | `actionlib_msgs` (3) | `GoalID`, `GoalStatus`, `GoalStatusArray` |
 
-\* `Image`/`CompressedImage` map to ReLink's `ImageChunk` — a chunked
-large-blob type that goes through `advertise_image`/`publish_image`/
-`subscribe_image` instead of plain `advertise`/`publish`/`subscribe`,
-since a full image doesn't fit one UDP datagram (Step 8). Every other
-type in the table above is a normal, single-datagram message.
+\* `Image`/`CompressedImage` here are the ROS `sensor_msgs` types, and
+both map to ReLink's `Image` (`ImageChunk`) — a chunked large-blob type
+that goes through `advertise_image`/`publish_image`/`subscribe_image`
+instead of plain `advertise`/`publish`/`subscribe`, since a full image
+doesn't fit one UDP datagram (Step 8). Every other type in the table
+above is a normal, single-datagram message. Don't confuse this with
+ReLink's own, separately-named `CompressedImage` type (`CompressedImageChunk`,
+`advertise_compressed_image`/`publish_compressed_image`/`subscribe_compressed_image`)
+introduced later in Step 8 — that one is ReLink-specific, adds a
+capture timestamp and encoder quality to every chunk, and is meant to
+pair with `AdaptiveBitrateController`.
 
 [`standard_msgs_pubsub`](#step-10--all-examples)
 ([C++](cpp/examples/standard_msgs_pubsub.cpp) /
@@ -996,11 +1002,60 @@ receive — no hand-rolled chunking needed (see `camera_stream` in Step 10).
 > real-time: a dropped chunk drops the whole image (no retransmission),
 > and fewer chunks per frame means fewer chances to drop one.
 
+### CompressedImage and adaptive bitrate
+
+A single fixed JPEG quality is always a compromise: high enough to look
+good on a busy scene wastes bandwidth on a static one, low enough to be
+cheap on a static scene visibly smears a busy one. ReLink has a second
+built-in large-blob type, `CompressedImage`, for exactly this case —
+same MTU-chunking as `Image`, plus a capture timestamp and the encoder
+quality actually used, stamped onto **every** chunk (not just the
+first — UDP gives no ordering guarantee, so a receiver must be able to
+recover both even if the first chunk to arrive isn't chunk 0):
+
+```cpp
+node.advertise_compressed_image("/relink/camera/front");
+node.publish_compressed_image("/relink/camera/front", jpeg_bytes, jpeg_len,
+                               /*quality=*/quality, frame_id, capture_timestamp_ns);
+node.subscribe_compressed_image("/relink/camera/front",
+    [](uint32_t frame_id, const std::vector<uint8_t>& data,
+       uint64_t capture_timestamp_ns, uint8_t quality) { /* ... */ });
+```
+
+Pair it with `AdaptiveBitrateController` (`relink/adaptive_bitrate.hpp` /
+`relink/adaptive_bitrate.py`) to pick `quality` every frame instead of a
+fixed constant — pure arithmetic, no codec dependency of its own (bring
+your own JPEG encoder and your own motion signal, same "bring your own
+codec" stance as `Image`/`CompressedImage` themselves):
+
+```cpp
+relink::AdaptiveBitrateController::Config cfg;
+cfg.quality_min = 20; cfg.quality_max = 80;
+cfg.motion_ceiling = 25.0; cfg.target_bitrate_bps = 3'000'000.0;
+relink::AdaptiveBitrateController controller(cfg);
+
+int quality = controller.next_quality(motion_score, now_seconds);
+// ... encode at `quality`, then:
+controller.record_sent(encoded_bytes.size(), now_seconds);
+```
+
+It blends two signals: how much the scene changed since the last frame
+(any units you like, compared against `motion_ceiling` — quality trends
+up as the scene settles, down as it gets busier) and the actual
+bytes/sec recently sent (quality is pulled down further, proportionally,
+if a `target_bitrate_bps` ceiling is set and being exceeded regardless
+of motion). Quality changes are exponentially smoothed so a subscriber
+doesn't see frame-to-frame flicker every time motion crosses a
+threshold. See `camera_stream` (Step 10) for it wired up end to end
+against a real camera (or a video file — `--video-file`, handy for
+testing without one), with a live log of motion/quality/bytes per frame.
+
 ### Review
 
 - `advertise_image`/`publish_image`/`subscribe_image` chunk and reassemble automatically — no hand-rolled chunking.
 - A larger socket buffer trades drops for latency on short bursts; it doesn't fix a slow subscriber callback.
-- Prefer `image_compressed` over raw frames for anything real-time.
+- Prefer `image_compressed`/`image_adaptive` over raw frames for anything real-time.
+- `CompressedImage` adds a capture timestamp + quality to every chunk; `AdaptiveBitrateController` picks that quality from motion and a bitrate ceiling.
 
 Now, let's look at running the rlcore daemon for Mode A discovery.
 
@@ -1462,7 +1517,7 @@ exists in both C++ (`cpp/examples/`) and Python (`python/relink_py/examples/`).
 | **`trajectory_msgs_pubsub`** | Just the `trajectory_msgs` package: `JointTrajectoryPoint`, `JointTrajectory`, `MultiDOFJointTrajectoryPoint`, `MultiDOFJointTrajectory`. | `./trajectory_msgs_pubsub` (run twice, or against the Python copy) |
 | **`actionlib_msgs_pubsub`** | Just the `actionlib_msgs` package: `GoalID`, `GoalStatus`, `GoalStatusArray`. | `./actionlib_msgs_pubsub` (run twice, or against the Python copy) |
 | **`custom_types_pubsub`** | "Any message type" made concrete: one node publishing/subscribing a built-in type (`Bool`) alongside two user-defined custom types at once — a small struct (`Pose2D`) and a struct containing fixed-size arrays (`Waypoints`). Verified interoperable both same-language and cross-language (C++ ↔ Python). | `./custom_types_pubsub` (run twice, or against the Python copy) |
-| **`camera_stream`** | A real webcam streamed over ReLink two ways at once (`image_raw`, `image_compressed`) using the built-in `Image` type. **Requires OpenCV**, installed yourself — not a ReLink dependency. | `./camera_stream pub` and `... sub` |
+| **`camera_stream`** | A real webcam (or `--video-file PATH`, for testing without one) streamed over ReLink three ways at once: `image_raw` (`Image`), `image_compressed` (`Image` at a fixed JPEG quality), `image_adaptive` (`CompressedImage` at a quality `AdaptiveBitrateController` picks every frame from scene motion + a bitrate ceiling). **Requires OpenCV**, installed yourself — not a ReLink dependency. | `./camera_stream pub` and `... sub` |
 
 There's also a performance test harness (`cpp/tools/relink_benchmark.cpp`)
 used to produce the numbers in Step 12 — worth reading once you're

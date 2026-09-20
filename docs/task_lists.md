@@ -224,6 +224,80 @@ Everything implemented together so far, in order.
       section and the deeper Step 13 technical section) and the
       `cpp/` directory-layout diagram in the README's file tree.
 
+## Verified done (2026-09-20, CompressedImage + AdaptiveBitrateController)
+
+- [x] Studied the pre-ReLink P2P video streamer at
+      `/root/proj/Recom/udp-low-latency-system/src/video/*.cpp` for
+      real-world JPEG compression/adaptive-quality/optimization
+      technique -- it fixed-quality JPEG-encoded (turbojpeg), optionally
+      picked quality from a motion-based step function (low/high
+      threshold, no smoothing -- visibly flickered), downscaled before
+      encoding, and stamped a timestamp on every UDP fragment (not just
+      the first) for latency measurement since UDP doesn't guarantee
+      order. Ported the *ideas* (motion-adaptive quality, per-chunk
+      timestamp, bitrate awareness), not the code -- no turbojpeg/OpenCV
+      dependency was added to the core library.
+- [x] Added `AdaptiveBitrateController` (`cpp/include/relink/adaptive_bitrate.hpp`,
+      `relink_py/relink/adaptive_bitrate.py`) -- pure arithmetic, no
+      codec/image dependency of its own. Blends a caller-supplied motion
+      score (linear quality_max..quality_min mapping against a
+      configurable ceiling) with a rolling bytes/sec window clamped
+      against an optional target bitrate ceiling, and exponentially
+      smooths the result so quality doesn't flicker frame to frame like
+      the old project's step function did.
+- [x] Added a real core library type, `CompressedImage`
+      (`cpp/include/relink/compressed_image.hpp`,
+      `relink_py/relink/compressed_image.py`,
+      `advertise_compressed_image`/`publish_compressed_image`/
+      `subscribe_compressed_image` on RelinkNode in both languages) --
+      same MTU-chunking as `Image`, plus a capture timestamp and the
+      encoder quality actually used, stamped on EVERY chunk (not just
+      chunk 0, since UDP gives no ordering guarantee) so a subscriber
+      can measure true end-to-end latency and report quality with no
+      side channel back to the publisher. Distinct from (and not to be
+      confused with) the pre-existing ROS `sensor_msgs/CompressedImage`
+      mapping onto ReLink's `Image`/`ImageChunk` -- this is a new,
+      ReLink-specific wire type.
+      Verified: `cpp/tests/test_compressed_image.cpp` +
+      `relink_py/tests/test_compressed_image.py` (pure encode/reassemble
+      round trip including OUT-OF-ORDER chunk delivery, empty image,
+      dropped-chunk-never-completes, real multicast RelinkNode
+      end-to-end) and `cpp/tests/test_adaptive_bitrate.cpp` +
+      `relink_py/tests/test_adaptive_bitrate.py` (motion mapping,
+      smoothing monotonicity, bitrate-ceiling pressure, invalid-config
+      rejection) -- full `cpp/` CMake rebuild, `ctest` 12/12 (was 10),
+      full Python `test_relink.py`/`test_image.py` still ALL PASS (no
+      regressions from touching `node.py`'s ImageChunk special-casing
+      to also cover CompressedImageChunk).
+- [x] Extended `examples/camera_stream.{cpp,py}` with a third topic,
+      `image_adaptive`, wired to real `AdaptiveBitrateController` +
+      `CompressedImage` usage (grayscale-mean-abs-diff motion signal,
+      3 Mbps bitrate ceiling), plus a `--video-file PATH` flag (loops at
+      EOF) so the demo runs without camera hardware. Also fixed a
+      latent bug this surfaced: the raw-topic subscriber assumed a fixed
+      resolution via `reshape()`/`cv::Mat` without checking it -- since
+      `cv::VideoCapture::set()`/`cap.set()` is "a request, not a
+      guarantee" (the file's own prior docstring already said so), a
+      camera or file that ignored it would have corrupted the reshape;
+      now the publisher unconditionally resizes every frame and the
+      subscriber checks the byte count before reshaping.
+      Verified end-to-end against a real 1920x1080/30fps video file
+      (`/root/proj/videoplayback.mp4`, provided for this test) standing
+      in for a camera, in BOTH languages: Python delivered 83/83
+      image_raw, 82/82 image_compressed, 82/82 image_adaptive over one
+      run, with adaptive quality visibly tracking scene motion (roughly
+      60s-80 range) and sub-3ms loopback latency; C++ delivered
+      correctly-shaped, valid JPEGs on all three topics with sub-1ms
+      latency. `libopencv-dev`/`python3-opencv` installed for this
+      verification (not previously present in this environment).
+- [x] Updated root README (Step 8 new "CompressedImage and adaptive
+      bitrate" subsection + Review bullets, sensor_msgs footnote
+      disambiguating ROS's `CompressedImage` from ReLink's own, Step 10
+      `camera_stream` row, ctest count 10 -> 12), `cpp/README.md`
+      (layout diagram, ctest count), and `python/relink_py/README.md`
+      (examples list, tests list) to describe the new type/controller
+      and the video-file testing option.
+
 ## Ideas / not started
 
 (none open right now)
