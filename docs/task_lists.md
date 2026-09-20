@@ -199,10 +199,31 @@ Everything implemented together so far, in order.
       pre-pip-packaging `python/rlcore/relink_rlcore.py` layout) was
       corrected to the current `relink_py/relink/cli/` structure.
 
+## Verified done (2026-09-20, C++ relay merge)
+
+- [x] Gave `relink_rlcore.cpp` the same `--relay`/`--nat`-implies-`--relay`
+      merge as the Python build: plain-socket data-frame forwarding
+      (reusing the existing header-only `relay_wire.hpp` helpers --
+      `decode_relay_register`/`peek_frame_topic_id`, no new wire code)
+      folded onto rlcore's own socket, gated by a `relay_groups` map
+      pruned by the same TTL logic as registrations/roles.
+      Decision (asked and confirmed by the user): keep the standalone
+      `relink-relay` binary as-is rather than doing a full merge --
+      its AF_XDP fast path (own poll loop, signal handlers, raw-frame
+      parsing) would have been a much bigger, riskier port, for a
+      feature the merged form was never going to have anyway. So C++
+      now offers both: `relink-rlcore --relay` (plain sockets, one
+      process) or the standalone `relink-relay` (only reason to still
+      use it: AF_XDP). Python only has the merged form.
+      Verified: full `cpp/` rebuild via CMake -- clean; `ctest` 10/10;
+      `relink-rlcore --help` shows `--relay`; a raw relay REGISTER +
+      data-frame test forwarded correctly between two UDP sockets
+      against the real binary; ordinary registration
+      (`register_client_cli`) still works unaffected while `--relay`
+      is active. README updated throughout (both the quick-usage
+      section and the deeper Step 13 technical section) and the
+      `cpp/` directory-layout diagram in the README's file tree.
+
 ## Ideas / not started
 
-- [ ] Consider whether the C++ `relink-relay`/`relink-rlcore` should get
-      the same merge (a `--relay` flag on relink-rlcore.cpp), for full
-      topology parity with the now-merged Python build -- not done here,
-      out of scope for "merge relay.py into rlcore" which only named the
-      Python file.
+(none open right now)

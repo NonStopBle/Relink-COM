@@ -1105,26 +1105,33 @@ the direct one also got through. You don't have to detect or configure
 which case you're in.
 
 ```bash
-# C++: standalone relay binary (plain sockets, no AF_XDP -- see below)
+# C++: merged into relink-rlcore itself, one process, one port --
+# --nat implies --relay too, since that's exactly the NAT case it's for
+./relink-rlcore --port 8445 --relay --ip 10.0.0.5
+
+# C++: OR the standalone relay binary, its own process/port -- only
+# reason to still use this one is its AF_XDP fast path (see below)
 g++ -std=c++17 -O2 -I cpp/include -pthread cpp/rlcore/relink_relay.cpp -o relink-relay
 ./relink-relay --port 8446 --ip 10.0.0.5   # or just ./relink-relay [port]
 ./relink-relay --help
 
-# Python: folded directly into rlcore, not a separate process -- pass
-# --relay (or --nat, which implies it) to relink-rlcore/rlcore instead:
+# Python: also merged into rlcore, not a separate process -- pass
+# --relay (or --nat, which implies it) to rlcore:
 rlcore --port 8445 --relay --ip 10.0.0.5   # after: pip install -e python/relink_py
 ```
 
 `--ip` binds the relay to one local interface instead of all of them
-(default `0.0.0.0`). The C++ build still ships `relink-relay` as its
-own binary (with its own `[port]` positional form and `--help`); the
-Python build merged relay forwarding into `rlcore` itself, on the same
-socket, so a `pip install -e python/relink_py` deployment only ever
-needs one process. Either way, point `node.set_relay(ip, port)` at
-whichever one you're running — for Python's merged form, `port` is
-`rlcore`'s own `--port` (8445 by default), not the old relay-only
-default of 8446. Same bind-failure behavior as `relink-rlcore` in
-both cases — see the troubleshooting note above.
+(default `0.0.0.0`). Both builds fold relay forwarding directly into
+`relink-rlcore`/`rlcore` on the same socket as registration — one
+process, one port. The C++ build additionally still ships the
+standalone `relink-relay` binary as its own process, kept only because
+it's the sole way to get the AF_XDP fast path (see below); the merged
+`--relay` mode on either build is plain sockets. Either way, point
+`node.set_relay(ip, port)` at whichever one you're running — for the
+merged form (either language), `port` is `rlcore`'s/`relink-rlcore`'s
+own `--port` (8445 by default), not the standalone relay's default of
+8446. Same bind-failure behavior as `relink-rlcore` in every case —
+see the troubleshooting note above.
 
 **Stress-tested**: 30 concurrent nodes registering, punching, and
 publishing through the same `relink-rlcore --nat` instance at once —
@@ -1744,17 +1751,19 @@ NAT was dropping them before they ever arrived (not a local firewall —
 a path that was never open; that case needs a relay/TURN-style fallback
 — see below.
 
-**Relay fallback, for NATs punching can't cross at all.** Run
-`relink-relay` (C++, `cpp/rlcore/relink_relay.cpp`, its own process) or,
-on the Python build, just add `--relay` to the `rlcore` you're already
-running (`--nat` implies it, since that's exactly the mode where some
-client might have this kind of NAT) — no separate process needed there,
-it's the same daemon on the same port. Either way it just needs to be a
-host both nodes can reach; the same box already running
-`relink-rlcore`/`rlcore --nat` works fine. Then call `node.set_relay(ip,
-port)` on every node that needs it, before `spin()`/`publish()` traffic
-— `port` is 8446 for the standalone C++ relay, or the Python `rlcore`'s
-own `--port` (8445 by default) for the merged form. A relay reaches nodes direct punching
+**Relay fallback, for NATs punching can't cross at all.** Just add
+`--relay` to the `relink-rlcore`/`rlcore` you're already running
+(`--nat` implies it, since that's exactly the mode where some client
+might have this kind of NAT) — no separate process needed, it's the
+same daemon on the same port, in both languages. (The C++ build also
+still has the standalone `relink-relay` binary as its own process, kept
+only for its AF_XDP fast path — see below; skip it otherwise.) Either
+way it just needs to be a host both nodes can reach; the same box
+already running `relink-rlcore`/`rlcore --nat` works fine. Then call
+`node.set_relay(ip, port)` on every node that needs it, before
+`spin()`/`publish()` traffic — `port` is `relink-rlcore`'s/`rlcore`'s
+own `--port` (8445 by default) for the merged form, or 8446 for the
+standalone C++ relay. A relay reaches nodes direct punching
 structurally cannot, because both clients only ever open a NAT mapping
 toward the relay's one fixed `(ip, port)`, never toward each other — the
 relay's replies always come from that exact remote endpoint, which is
@@ -1972,8 +1981,11 @@ cpp/
     crypto.hpp                     AES-256-GCM for the rlcore signaling handshake
 
   rlcore/                       C++ daemons (Step 9)
-    relink_rlcore.cpp             registration daemon
-    relink_relay.cpp              relay fallback daemon (Step 13)
+    relink_rlcore.cpp             registration daemon; --relay/--nat also fold in
+                                   plain-socket relay forwarding (Step 13)
+    relink_relay.cpp              standalone relay daemon -- kept only for its
+                                   AF_XDP fast path; plain-socket users can use
+                                   relink-rlcore --relay instead
     CMakeLists.txt                 also buildable standalone; -DRELINK_ENABLE_XDP=ON for AF_XDP (Step 12)
     xdp/                           AF_XDP socket + eBPF kernel program
 

@@ -23,9 +23,24 @@
 // plays elsewhere). Without --nat (the default), the self-reported
 // address is used unchanged, correct for same-LAN deployments where a
 // private IP is directly routable between peers.
+//
+// --relay: folds the standalone relink-relay daemon's PLAIN-SOCKET
+// data-frame forwarding directly into this process, on this same
+// socket/port -- one daemon, one port, instead of running rlcore and
+// relink-relay separately. Some NAT types (notably "symmetric" NAT)
+// structurally cannot be punched through no matter how the client
+// retries, and a relay reachable at a single fixed address is the only
+// fallback for those -- since --nat mode is exactly the case where some
+// clients may have that kind of NAT, it implies --relay automatically.
+// The standalone relink-relay binary still exists separately and is
+// the only way to get its AF_XDP fast path (RELINK_ENABLE_XDP); this
+// merged mode is plain sockets only, deliberately kept simple. On the
+// client, point node.set_relay() at this SAME ip and --port (not
+// relay's own default of 8446) to actually use it.
 
 #include "relink/register.hpp"
 #include "relink/topic_directory.hpp"
+#include "relink/relay_wire.hpp"
 #include "relink/platform.hpp"
 #include "relink/crypto.hpp"
 #include <cstdio>
@@ -34,6 +49,7 @@
 #include <vector>
 #include <map>
 #include <set>
+#include <string>
 #include <tuple>
 #include <chrono>
 
@@ -55,6 +71,11 @@ struct PeerEntry {
 // tick without treating a genuinely dead node as still alive for long.
 static constexpr double kRegistrationTtlSec = 3.0;
 
+// Must outlive the client's relay re-register interval (node.py's
+// _relay_keepalive_loop / relink.hpp's equivalent fires every 10s) --
+// same value and rationale as the standalone relay's MEMBER_TTL_SECONDS.
+static constexpr double kRelayMemberTtlSec = 30.0;
+
 static double now_sec() {
     return std::chrono::duration<double>(
         std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -62,12 +83,17 @@ static double now_sec() {
 
 static void print_usage(const char* argv0) {
     std::printf(
-        "usage: %s [--port <port>] [--ip <address>] [--nat]\n"
+        "usage: %s [--port <port>] [--ip <address>] [--nat] [--relay]\n"
         "           [--encrypt-key <64-hex>] [--generate-key] [-h|--help]\n"
         "\n"
         "  --port <port>       UDP port to listen on (default %u)\n"
         "  --ip <address>      local address to bind to (default 0.0.0.0, all interfaces)\n"
-        "  --nat                enable NAT traversal / UDP hole punching\n"
+        "  --nat                enable NAT traversal / UDP hole punching (implies --relay)\n"
+        "  --relay              also forward data frames between peers that can't reach\n"
+        "                       each other directly, on this same port -- no separate\n"
+        "                       relink-relay process needed (point the client's\n"
+        "                       set_relay() at this ip:port to use it; use the\n"
+        "                       standalone relink-relay instead for its AF_XDP fast path)\n"
         "  --encrypt-key <hex>  require AES-256-GCM encrypted registration (64 hex chars)\n"
         "  --generate-key       print a fresh AES-256 key and exit\n"
         "  -h, --help           show this help and exit\n",
@@ -78,6 +104,7 @@ int main(int argc, char** argv) {
     uint16_t port = kRlCoreDefaultPort;
     const char* bind_ip = nullptr;
     bool nat_mode = false;
+    bool relay_mode = false;
     bool has_encrypt_key = false;
     uint8_t encrypt_key[kAesKeyBytes] = {};
     for (int i = 1; i < argc; ++i) {
@@ -100,6 +127,8 @@ int main(int argc, char** argv) {
             bind_ip = argv[++i];
         } else if (std::strcmp(argv[i], "--nat") == 0) {
             nat_mode = true;
+        } else if (std::strcmp(argv[i], "--relay") == 0) {
+            relay_mode = true;
         } else if (std::strcmp(argv[i], "--encrypt-key") == 0 && i + 1 < argc) {
             if (!hex_to_key32(argv[++i], encrypt_key)) {
                 std::fprintf(stderr, "relink-rlcore: --encrypt-key expects 64 hex characters "
@@ -112,6 +141,7 @@ int main(int argc, char** argv) {
             return 1;
         }
     }
+    if (nat_mode) relay_mode = true; // see the --relay comment above main()
 
     socket_t sock = ::socket(AF_INET, SOCK_DGRAM, 0);
     if (sock == kInvalidSocket) { std::perror("socket"); return 1; }
@@ -135,9 +165,18 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    std::printf("relink-rlcore (C++) listening on %s:%u%s\n",
-                bind_ip != nullptr ? bind_ip : "0.0.0.0", port,
-                nat_mode ? " (NAT traversal enabled)" : "");
+    {
+        std::string status;
+        if (nat_mode) status += "NAT traversal enabled";
+        if (relay_mode) {
+            if (!status.empty()) status += ", ";
+            status += "relay forwarding enabled";
+            if (nat_mode) status += " (auto via --nat)";
+        }
+        std::string suffix = status.empty() ? std::string() : (" (" + status + ")");
+        std::printf("relink-rlcore (C++) listening on %s:%u%s\n",
+                    bind_ip != nullptr ? bind_ip : "0.0.0.0", port, suffix.c_str());
+    }
 
     // topic_id -> set of peers registered for it
     std::map<uint32_t, std::set<PeerEntry>> table;
@@ -156,6 +195,14 @@ int main(int argc, char** argv) {
     // sent on the same periodic cadence as reregistration.
     std::map<std::pair<uint32_t, PeerEntry>, uint8_t> role_table;
     std::map<std::pair<uint32_t, PeerEntry>, double> role_last_seen;
+
+    // topic_id -> {peer -> time of last REGISTER/keepalive} -- only
+    // populated/consulted when relay_mode, per-topic forwarding group
+    // membership for the merged relay path (was the standalone relay's
+    // `groups`, now living here). Distinct from `table` above: rlcore
+    // registrations there track for peer-discovery/RegisterAck purposes,
+    // not who wants relayed copies of a topic's data frames.
+    std::map<uint32_t, std::map<PeerEntry, double>> relay_groups;
 
     auto prune_stale = [&]() {
         double now = now_sec();
@@ -180,6 +227,17 @@ int main(int argc, char** argv) {
                 it = role_last_seen.erase(it);
             } else {
                 ++it;
+            }
+        }
+        if (relay_mode) {
+            for (auto it = relay_groups.begin(); it != relay_groups.end(); ) {
+                auto& members = it->second;
+                for (auto mit = members.begin(); mit != members.end(); ) {
+                    if (now - mit->second > kRelayMemberTtlSec) mit = members.erase(mit);
+                    else ++mit;
+                }
+                if (members.empty()) it = relay_groups.erase(it);
+                else ++it;
             }
         }
     };
@@ -303,6 +361,40 @@ int main(int argc, char** argv) {
             continue;
         }
         if (role_kind == RoleDirKind::Reply) continue; // rlcore never queries anyone itself
+
+        if (relay_mode) {
+            // A relay REGISTER control packet (join a topic's forwarding
+            // group) or an ordinary data frame to forward -- checked
+            // before the RegisterRequest path below since neither shape
+            // can ever be a valid (plaintext or encrypted) RegisterRequest
+            // (see decode_relay_register/peek_frame_topic_id's exact
+            // size/start-byte checks), so this never steals traffic that
+            // path would otherwise have handled.
+            uint32_t relay_topic_id = 0;
+            if (decode_relay_register(recv_buf, static_cast<size_t>(n), &relay_topic_id)) {
+                PeerEntry from{ntohl(src.sin_addr.s_addr), ntohs(src.sin_port)};
+                relay_groups[relay_topic_id][from] = now_sec();
+                continue;
+            }
+            uint32_t frame_topic_id = 0;
+            if (peek_frame_topic_id(recv_buf, static_cast<size_t>(n), &frame_topic_id)) {
+                auto it = relay_groups.find(frame_topic_id);
+                if (it != relay_groups.end()) {
+                    PeerEntry from{ntohl(src.sin_addr.s_addr), ntohs(src.sin_port)};
+                    for (const auto& kv : it->second) {
+                        const PeerEntry& member = kv.first;
+                        if (member.ip == from.ip && member.port == from.port) continue; // never echo back to the sender
+                        struct sockaddr_in dst{};
+                        dst.sin_family = AF_INET;
+                        dst.sin_addr.s_addr = htonl(member.ip);
+                        dst.sin_port = htons(member.port);
+                        ::sendto(sock, reinterpret_cast<const char*>(recv_buf), static_cast<int>(n), 0,
+                                 reinterpret_cast<struct sockaddr*>(&dst), sizeof(dst));
+                    }
+                }
+                continue;
+            }
+        }
 
         // When --encrypt-key is set, every RegisterRequest must be an
         // AES-256-GCM-sealed blob under that key -- opened here before
