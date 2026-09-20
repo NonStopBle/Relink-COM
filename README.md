@@ -1488,12 +1488,27 @@ A few things worth knowing:
 - **`hz`/`bw`/`pub`** round out the CLI (rate, bandwidth, and manual
   publish by `--hex`/`--text`) — run `rl_topic.py <subcommand> --help`
   for the full flag list on any of them.
+- **`--ipc`** (on `hz`/`bw`/`echo`/`pub` only, not `list`/`info`) targets
+  a same-host [shared-memory IPC](#same-host-shared-memory-ipc-_local_ipc)
+  topic instead of the network: `<topic>` is still resolved to a numeric
+  id via the exact same name hash UDP topics use, but no
+  rlcore/multicast query happens at all — the tool attaches directly to
+  the shm ring (`advertise_local_ipc`/`subscribe_local_ipc`/
+  `publish_local_ipc`), same as any other same-host IPC user would.
+  ```bash
+  # two terminals, same machine:
+  rl_topic echo /my/ipc/topic --ipc
+  rl_topic pub /my/ipc/topic --ipc --text "hello over shm"
+  ```
+  `list`/`info` reject `--ipc` outright — there's no central directory
+  of shm-only topics to enumerate (rlcore/multicast never see them),
+  unlike UDP topics which `list`/`info` can always ask about.
 
 ### Review
 
 - `relink-rlcore` is a rendezvous point only — actual message traffic never passes through it.
 - `--nat` enables cross-network discovery via hole punching; `relink-relay` is the fallback for NAT types punching can't cross.
-- `rl_topic` (`list`/`info`/`hz`/`bw`/`echo`/`pub`) is the `rostopic`-equivalent CLI for inspecting a running system without writing code.
+- `rl_topic` (`list`/`info`/`hz`/`bw`/`echo`/`pub`) is the `rostopic`-equivalent CLI for inspecting a running system without writing code; `--ipc` retargets `hz`/`bw`/`echo`/`pub` at a same-host shared-memory topic instead of the network.
 
 Now that discovery and daemons are covered, let's tour every example program in the repo.
 
@@ -1966,6 +1981,10 @@ the exact workload that collapsed over UDP above. `relink_image_benchmark`
 exact comparison end to end — `pub`/`sub udp` vs `pub`/`sub shm` — and
 prints delivery rate + throughput for whichever transport you pick, so
 you can reproduce these numbers (or measure your own hardware) directly.
+Want to poke at a `*_local_ipc` topic from the command line instead of
+writing code? `rl_topic`'s `hz`/`bw`/`echo`/`pub` subcommands take an
+`--ipc` flag that does exactly that — see
+[Using `rl_topic`](#using-rl_topic--listing-and-inspecting-topics).
 
 ```python
 # Python -- small fixed-size messages
