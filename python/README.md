@@ -6,6 +6,19 @@ the wire protocol -- see [`relink_py/README.md`](relink_py/README.md)
 for the full technical background) and two command-line tools that
 install onto your `PATH` alongside it.
 
+## Quickstart
+
+```bash
+cd python/relink_py
+pip install -e .
+python3 examples/hello_relink.py   # run this again in a second terminal too
+```
+
+Two copies find each other over multicast and start exchanging
+messages within a second or two — no daemon, no config file, no manual
+IP address. See [Install](#install) below for what that actually put
+on your `PATH`.
+
 ## Install
 
 ```bash

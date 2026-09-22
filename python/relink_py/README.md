@@ -6,8 +6,16 @@ library (`relink/`). Proven wire-compatible with the C++ node in both
 directions and over both discovery modes -- see `tests/two_process_pub.py`
 / `tests/two_process_sub.py`.
 
-New here? See the root `README.md`'s **Zero to one** walkthrough --
-`examples/hello_relink.py` is the fastest way to see it work.
+New here? Run this now, in two terminals:
+
+```bash
+python3 examples/hello_relink.py   # run it again in a second terminal
+```
+
+Two copies find each other over multicast and start exchanging
+messages within a second or two — no daemon, no config, no manual IP
+address. See the root `README.md`'s **Zero to one** walkthrough for
+what's happening and why.
 
 ## Abstract -- why this exists
 

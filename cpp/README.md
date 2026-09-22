@@ -10,6 +10,24 @@ traversal, benchmarks, troubleshooting — see the
 [main project README](../README.md). This file only covers what's in
 `cpp/` and how to build it.
 
+## Quickstart
+
+```bash
+cd cpp
+cmake -B build .
+cmake --build build
+./build/src/sub      # in a second terminal: ./build/src/pub
+```
+
+That one build gives you the library, the daemon, `rl_topic`, every
+example, and every test — see [`src/README.md`](src/README.md) for the
+other `pub`/`sub`/`pubsub`/`main` variants. Just want to compile one
+file against the header-only library, no CMake at all?
+
+```bash
+g++ -std=c++17 -I include -pthread your_node.cpp -o your_node
+```
+
 ## Layout
 
 ```

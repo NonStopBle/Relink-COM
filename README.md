@@ -61,8 +61,36 @@ pick whichever language a given node needs.
 
 ---
 
+## Quickstart
+
+```bash
+git clone https://github.com/NonStopBle/Relink-COM.git
+cd Relink-COM
+
+# C++ -- build once, then run in two terminals
+g++ -std=c++17 -I cpp/include -pthread cpp/examples/hello_relink.cpp -o hello_relink
+./hello_relink
+
+# Python -- no build step, run in two terminals
+python3 python/relink_py/examples/hello_relink.py
+```
+
+Run either command twice (two terminals, one machine, or two machines
+on the same LAN — mix C++ and Python if you like) and watch them find
+each other over multicast within a second or two: no daemon, no config
+file, no manual IP address.
+
+Didn't see `received:` on either side? See [Step 14 —
+Troubleshooting](#step-14--troubleshooting). Otherwise, keep reading
+from [Step 0](#step-0--what-relink-actually-is) for the concepts, or
+jump straight to a full two-way node in [Step 5](#step-5--quick-start-c) /
+[Step 6](#step-6--quick-start-python).
+
+---
+
 ## Table of contents
 
+- [Quickstart](#quickstart)
 - [Words you might not know yet](#words-you-might-not-know-yet)
 - [Step 0 — What ReLink actually is](#step-0--what-relink-actually-is)
 - [Step 1 — Get the code](#step-1--get-the-code)

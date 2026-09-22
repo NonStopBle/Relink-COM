@@ -16,6 +16,13 @@ file covers only "how do I build and run these" — for the full API
 (message types, images, NAT traversal, etc.) see the
 [main project README](../../README.md).
 
+**Fastest path** (from the repo root):
+
+```bash
+cd cpp && cmake -B build . && cmake --build build
+./build/src/sub      # second terminal: ./build/src/pub
+```
+
 ## Building
 
 These are already wired into the top-level `cpp/CMakeLists.txt`:
