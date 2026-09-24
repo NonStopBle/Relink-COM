@@ -331,17 +331,29 @@ class RelinkNode:
                     encrypt_key=self.set_rlcore.encrypt_key)
                 if not outcome.ok:
                     return
-                for p in outcome.peers:
-                    addr = PeerAddr(p.ip, p.port)
+
+                def add_if_new(topic_id, addr):
+                    # Shared by both the primary address below and its
+                    # optional same-NAT LAN candidate (see wire.py's
+                    # RegisterAckPeer doc comment), so both get exactly
+                    # the same dedup-against-known-peers treatment.
                     with self._peers_lock:
-                        known = self._peers.setdefault(p.topic_id, [])
+                        known = self._peers.setdefault(topic_id, [])
                         is_new = addr not in known
                         if is_new:
                             known.append(addr)
-                    if is_new:
-                        for _ in range(3):  # newly-joined peer: open our NAT mapping to it right away
-                            t.publish_raw(NAT_PUNCH_TOPIC_ID, b"", addr)
-                            time.sleep(0.03)
+                    return is_new
+
+                for p in outcome.peers:
+                    addr = PeerAddr(p.ip, p.port)
+                    candidates = [addr]
+                    if p.lan_ip != 0 and (p.lan_ip, p.lan_port) != (p.ip, p.port):
+                        candidates.append(PeerAddr(p.lan_ip, p.lan_port))
+                    for cand in candidates:
+                        if add_if_new(p.topic_id, cand):
+                            for _ in range(3):  # newly-joined peer: open our NAT mapping to it right away
+                                t.publish_raw(NAT_PUNCH_TOPIC_ID, b"", cand)
+                                time.sleep(0.03)
 
             # Each group has its OWN socket (set_multiplex(False)) or all
             # share the one shared transport (default multiplex mode) --
@@ -1008,8 +1020,14 @@ class RelinkNode:
             # launches its recv thread, not after -- enabling it post-
             # start leaves a race window where an early direct+relay
             # duplicate pair can both slip through before the flag takes
-            # effect.
-            if self._relay_enabled:
+            # effect. Also needed under plain RLCORE mode (no relay) now
+            # that a peer can carry a second, same-NAT LAN candidate
+            # address (see the RegisterAckPeer handling below): if that
+            # peer's NAT/router happens to support hairpinning after all,
+            # both the LAN and public copies of a message can legitimately
+            # arrive, and this same seq_num-based check collapses them
+            # back into one delivery.
+            if self._relay_enabled or self._mode == DiscoveryMode.RLCORE:
                 for t, _ in groups:
                     t.enable_relay_dedup()
 
@@ -1050,6 +1068,23 @@ class RelinkNode:
                                 addr = PeerAddr(p.ip, p.port)
                                 self._peers.setdefault(p.topic_id, []).append(addr)
                                 newly_learned_peers.append((t, addr))
+                                # Same-NAT ("hairpin") fallback: also add
+                                # this peer's self-reported LAN address as
+                                # a SECOND destination for this topic, not
+                                # a replacement -- publish() already sends
+                                # the same seq_num to every entry in
+                                # self._peers[topic], and the
+                                # enable_relay_dedup() call above collapses
+                                # whichever copy(ies) actually arrive back
+                                # into one delivery. See wire.py's
+                                # RegisterAckPeer doc comment. Skipped when
+                                # rlcore had no LAN candidate for this peer
+                                # (lan_ip == 0) or it's identical to the
+                                # primary address already added.
+                                if p.lan_ip != 0 and (p.lan_ip, p.lan_port) != (p.ip, p.port):
+                                    lan_addr = PeerAddr(p.lan_ip, p.lan_port)
+                                    self._peers.setdefault(p.topic_id, []).append(lan_addr)
+                                    newly_learned_peers.append((t, lan_addr))
                 # If registration failed after retries, register_with_rlcore
                 # already logged an error; proceed with an empty peer table
                 # rather than crashing the node.

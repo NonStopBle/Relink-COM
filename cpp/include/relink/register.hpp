@@ -8,7 +8,7 @@
 //
 // Wire layout (all little-endian, matching wire.hpp's *Header structs):
 //   RegisterRequest = RegisterRequestHeader(8B) + topic_count * uint32_t
-//   RegisterAck     = RegisterAckHeader(3B) + peer_count * RegisterAckPeer(8B)
+//   RegisterAck     = RegisterAckHeader(3B) + peer_count * RegisterAckPeer(16B)
 
 #pragma once
 

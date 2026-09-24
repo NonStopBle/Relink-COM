@@ -1932,6 +1932,24 @@ always stays off this path — a several-hundred-chunk burst mirrored
 through a relay would be expensive for little benefit; a dropped Image
 frame is already tolerated, see the troubleshooting table below).
 
+**Same-NAT ("hairpin") fallback, for two nodes behind one router.** A
+narrower case than the mobile-carrier one above, but a common one:
+`--nat` always hands out each node's *observed* (public) endpoint, even
+when the peer asking is on the exact same LAN/NAT as the node it's
+asking about. Two such nodes then have to hairpin through their own
+router to reach each other, and plenty of consumer/office routers don't
+support that — registration with `relink-rlcore` still succeeds either
+way (that's just node-to-daemon, no hairpin involved), but the actual
+pub/sub traffic between the two same-LAN nodes silently goes nowhere.
+`relink-rlcore`/`rlcore --nat` now also hands out each peer's
+*self-reported* LAN address alongside its public one; a node punches and
+publishes to **both** addresses for that peer, and duplicate delivery
+(if the router turns out to support hairpinning after all) is dropped
+the same `seq_num`-based way as the relay path above. No configuration
+needed — this only ever adds a second candidate when rlcore already
+knows one, and a peer with no LAN candidate (or one identical to its
+public address) is unaffected.
+
 ## Step 14 — Troubleshooting
 
 **Description:** Common symptoms, what they mean, and the fix, in one table.
@@ -1944,6 +1962,7 @@ frame is already tolerated, see the troubleshooting table below).
 | `hello_relink` never prints `received:` on either side | The two copies aren't on the same network segment, or something is blocking UDP multicast (some WiFi routers, most cloud VPCs) | Switch to Mode A (Step 3/9): run `relink-rlcore` once, point both nodes at its IP with `set_rlcore.ip(...)` |
 | `rlcore IP not set` (thrown at `spin()`/`publish()`) | Called `set_rlcore.ip(...)` was never reached, or Mode A was selected without setting an IP | Call `node.set_rlcore.ip("x.x.x.x")` before any traffic, or switch to `use_multicast_discovery()` |
 | `no discovery method configured` | Neither discovery mode was selected before `spin()`/`publish()`/`subscribe()` traffic started | Pick exactly one mode (Step 3) before sending/receiving |
+| Publisher keeps sending (`peers_for_topic` non-empty) but subscriber never receives anything, over `relink-rlcore --nat` | Both nodes are behind the SAME router/NAT (rlcore's log shows the same public IP for both, different ports) — see [same-NAT fallback](#step-13--nat-traversal-cross-network-nodes) | Use `use_multicast_discovery()` for same-LAN nodes instead of rlcore/`--nat`, or update to a build that hands out a LAN fallback candidate (fixed above) |
 | `topic hash collision between "X" and "Y"` | Two different topic names hashed (FNV-1a) to the same 32-bit id — astronomically rare, but checked for | Rename one of the topics |
 | High packet loss at a high send rate | The receiver (especially Python) can't drain the socket as fast as it's being filled | Reduce the rate, or move that node to C++ (Step 12) — a bigger socket buffer only postpones this, see Step 8 |
 | A dropped/corrupted image frame | `Image` chunks have no retransmission — one lost UDP datagram drops the whole frame | Prefer a compressed payload (`image_compressed`) over raw frames (Step 8), and keep the subscriber callback fast |

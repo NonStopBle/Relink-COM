@@ -181,6 +181,20 @@ int main(int argc, char** argv) {
     // topic_id -> set of peers registered for it
     std::map<uint32_t, std::set<PeerEntry>> table;
 
+    // peer (its table identity -- the OBSERVED address in --nat mode,
+    // the self-reported one otherwise) -> that same node's self-reported
+    // LAN address. Handed out to other peers alongside the primary
+    // address so two nodes behind the SAME NAT ("hairpin" case, see
+    // RegisterAckPeer's doc comment in wire.hpp) have a second candidate
+    // to punch/send to that never needs to leave their shared LAN.
+    // Non-NAT mode: equals the primary address (harmless, the client
+    // skips a LAN candidate identical to the primary). Deliberately NOT
+    // pruned by prune_stale() below: it's keyed by peer address only, not
+    // (topic, peer) like `table`/`last_seen`, so a peer still live under
+    // one topic but expired under another would wrongly lose its entry.
+    // Unbounded but tiny (one 6-byte value per distinct peer ever seen).
+    std::map<PeerEntry, PeerEntry> lan_of;
+
     // (topic_id, peer) -> time of its most recent RegisterRequest --
     // lets prune_stale() below evict a registration once its owning node
     // stops re-registering (closed/crashed), so `rl_topic.py list`/
@@ -436,6 +450,12 @@ int main(int argc, char** argv) {
             self.port = req.node_port;
         }
 
+        // Record this node's self-reported LAN address alongside its
+        // table identity, so it can be handed to OTHER peers as a
+        // same-NAT ("hairpin") fallback candidate below -- see lan_of's
+        // doc comment above.
+        lan_of[self] = PeerEntry{req.node_ip, req.node_port};
+
         // Update table with this node's info for each topic it declared.
         double reg_now = now_sec();
         for (uint16_t i = 0; i < req.topic_count; ++i) {
@@ -451,7 +471,9 @@ int main(int argc, char** argv) {
             uint32_t topic = register_request_topic_at(req, i);
             for (const auto& peer : table[topic]) {
                 if (peer.ip == self.ip && peer.port == self.port) continue;
-                peers.push_back(RegisterAckPeer{peer.ip, peer.port, topic});
+                auto lit = lan_of.find(peer);
+                PeerEntry lan = (lit != lan_of.end()) ? lit->second : PeerEntry{0, 0};
+                peers.push_back(RegisterAckPeer{peer.ip, peer.port, topic, lan.ip, lan.port});
             }
         }
 

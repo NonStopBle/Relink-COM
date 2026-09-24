@@ -89,9 +89,14 @@ req = encode_register_request(0x0A000005, 5555, [100, 101, 200])
 dreq = decode_register_request(req)
 check(dreq.node_ip == 0x0A000005 and dreq.topic_ids == [100, 101, 200], "RegisterRequest round trip")
 
-ack = encode_register_ack(0, [RegisterAckPeer(0x0A000006, 6000, 100)])
+ack = encode_register_ack(0, [
+    RegisterAckPeer(0x0A000006, 6000, 100, 0xC0A80006, 6000),  # has a LAN candidate
+    RegisterAckPeer(0x0A000007, 7000, 101),                    # no LAN candidate known (defaults to 0, 0)
+])
 dack = decode_register_ack(ack)
 check(dack.status == 0 and dack.peers[0].port == 6000, "RegisterAck round trip")
+check(dack.peers[0].lan_ip == 0xC0A80006 and dack.peers[0].lan_port == 6000, "RegisterAckPeer LAN candidate round trip")
+check(dack.peers[1].lan_ip == 0 and dack.peers[1].lan_port == 0, "RegisterAckPeer with no LAN candidate round trip")
 
 # --- beacon.py round trip ---
 beacon = encode_beacon_packet(0x0A000005, 5000, [100, 200])

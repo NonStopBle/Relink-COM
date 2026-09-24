@@ -108,9 +108,22 @@ struct RegisterAckPeer {
     uint32_t ip;
     uint16_t port;
     uint32_t topic_id;
+    // Same-NAT ("hairpin") fallback candidate: this peer's own
+    // self-reported LAN address, alongside `ip`/`port` above (which, in
+    // --nat mode, is the peer's OBSERVED public/NAT-mapped address).
+    // Two nodes behind the SAME NAT/router that only ever learn each
+    // other's public endpoint have to hairpin through their own router
+    // to reach each other -- many consumer/office routers don't support
+    // that and silently drop the traffic, even though direct hole
+    // punching between genuinely different networks works fine. Zero
+    // (0, 0) means "no separate LAN candidate known" (non-NAT mode, or a
+    // peer whose self-reported address already equals `ip`/`port`) --
+    // the client skips punching/sending to an all-zero candidate.
+    uint32_t lan_ip;
+    uint16_t lan_port;
 };
 #pragma pack(pop)
-static_assert(sizeof(RegisterAckPeer) == 10, "RegisterAckPeer must be exactly 10 bytes");
+static_assert(sizeof(RegisterAckPeer) == 16, "RegisterAckPeer must be exactly 16 bytes");
 
 // ---------------------------------------------------------------------
 // BeaconPacket — mode B (multicast) discovery packet, fixed prefix.

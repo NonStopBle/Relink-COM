@@ -1037,7 +1037,14 @@ private:
             // recv thread below, not after -- enabling it post-start
             // leaves a race window where an early direct+relay duplicate
             // pair can both slip through before the flag takes effect.
-            if (relay_enabled_) {
+            // Also needed under plain RlCore mode (no --relay) now that a
+            // peer can carry a second, same-NAT LAN candidate address
+            // (see the RegisterAckPeer handling below): if that peer's
+            // NAT/router happens to support hairpinning after all, both
+            // the LAN and public copies of a message can legitimately
+            // arrive, and this same seq_num-based check is exactly what
+            // collapses them back into one delivery.
+            if (relay_enabled_ || mode == DiscoveryMode::RlCore) {
                 for (const auto& g : groups) g.transport->enable_relay_dedup();
             }
         }
@@ -1095,9 +1102,27 @@ private:
                         uint32_t ip = p.ip;
                         uint16_t port = p.port;
                         uint32_t topic_id = p.topic_id;
+                        uint32_t lan_ip = p.lan_ip;
+                        uint16_t lan_port = p.lan_port;
                         PeerAddr addr{ip, port};
                         peers_[topic_id].push_back(addr);
                         newly_learned_peers.push_back({g.transport, addr});
+                        // Same-NAT ("hairpin") fallback: also add this
+                        // peer's self-reported LAN address as a SECOND
+                        // destination for this topic, not a replacement --
+                        // publish() already sends the same seq_num to
+                        // every entry in peers_[topic_id], and the
+                        // enable_relay_dedup() call above collapses
+                        // whichever copy(ies) actually arrive back into
+                        // one delivery. See RegisterAckPeer's doc comment
+                        // in wire.hpp. Skipped when rlcore had no LAN
+                        // candidate for this peer (lan_ip == 0) or it's
+                        // identical to the primary address already added.
+                        if (lan_ip != 0 && !(lan_ip == ip && lan_port == port)) {
+                            PeerAddr lan_addr{lan_ip, lan_port};
+                            peers_[topic_id].push_back(lan_addr);
+                            newly_learned_peers.push_back({g.transport, lan_addr});
+                        }
                     }
                 }
             }
@@ -1597,6 +1622,23 @@ private:
                     // registration punch burst in ensure_started()) keeps
                     // population instant regardless of batch size.
                     std::vector<std::pair<PeerAddr, UdpTransport*>> newly_discovered;
+                    // Adds `addr` to peers_[topic_id] iff not already
+                    // present, returning whether it was new -- shared by
+                    // both the primary address below and its optional
+                    // same-NAT LAN candidate (see RegisterAckPeer's doc
+                    // comment in wire.hpp), so both get exactly the same
+                    // dedup-against-known-peers treatment.
+                    auto add_if_new = [&](uint32_t topic_id, const PeerAddr& addr) {
+                        std::lock_guard<std::mutex> lock(state_mutex_);
+                        auto& known = peers_[topic_id];
+                        for (const auto& existing : known) {
+                            if (existing.ip_host_order == addr.ip_host_order && existing.port == addr.port) {
+                                return false;
+                            }
+                        }
+                        known.push_back(addr);
+                        return true;
+                    };
                     for (const auto& p : outcome.peers) {
                         // p.topic_id is a misaligned field in a
                         // #pragma pack(1) struct (RegisterAckPeer in
@@ -1607,21 +1649,14 @@ private:
                         uint32_t ip = p.ip;
                         uint16_t port = p.port;
                         uint32_t topic_id = p.topic_id;
+                        uint32_t lan_ip = p.lan_ip;
+                        uint16_t lan_port = p.lan_port;
                         PeerAddr addr{ip, port};
-                        bool is_new;
-                        {
-                            std::lock_guard<std::mutex> lock(state_mutex_);
-                            auto& known = peers_[topic_id];
-                            is_new = true;
-                            for (const auto& existing : known) {
-                                if (existing.ip_host_order == addr.ip_host_order && existing.port == addr.port) {
-                                    is_new = false;
-                                    break;
-                                }
-                            }
-                            if (is_new) known.push_back(addr);
+                        if (add_if_new(topic_id, addr)) newly_discovered.push_back({addr, g.first});
+                        if (lan_ip != 0 && !(lan_ip == ip && lan_port == port)) {
+                            PeerAddr lan_addr{lan_ip, lan_port};
+                            if (add_if_new(topic_id, lan_addr)) newly_discovered.push_back({lan_addr, g.first});
                         }
-                        if (is_new) newly_discovered.push_back({addr, g.first});
                     }
                     if (!newly_discovered.empty()) {
                         std::lock_guard<std::mutex> lock(punch_threads_mutex_);

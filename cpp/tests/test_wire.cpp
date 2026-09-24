@@ -27,7 +27,7 @@ int main() {
     CHECK(sizeof(SecureExt) == 8);
     CHECK(sizeof(RegisterRequestHeader) == 8);
     CHECK(sizeof(RegisterAckHeader) == 3);
-    CHECK(sizeof(RegisterAckPeer) == 10);
+    CHECK(sizeof(RegisterAckPeer) == 16);
     CHECK(sizeof(BeaconPacketHeader) == 8);
     CHECK(sizeof(MultiArrayHeader) == 4);
 
@@ -100,6 +100,8 @@ int main() {
     CHECK(offsetof(RegisterAckPeer, ip) == 0);
     CHECK(offsetof(RegisterAckPeer, port) == 4);
     CHECK(offsetof(RegisterAckPeer, topic_id) == 6);
+    CHECK(offsetof(RegisterAckPeer, lan_ip) == 10);
+    CHECK(offsetof(RegisterAckPeer, lan_port) == 14);
 
     // --- default type field name/offset (all wrap a single `data`) ---
     CHECK(offsetof(Float32, data) == 0);

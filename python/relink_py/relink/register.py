@@ -14,7 +14,7 @@ _REQ_HEADER_FMT = "<IHH"   # node_ip, node_port, topic_count
 _REQ_HEADER_LEN = struct.calcsize(_REQ_HEADER_FMT)
 _ACK_HEADER_FMT = "<BH"    # status, peer_count
 _ACK_HEADER_LEN = struct.calcsize(_ACK_HEADER_FMT)
-_PEER_FMT = "<IHI"         # ip, port, topic_id
+_PEER_FMT = "<IHIIH"       # ip, port, topic_id, lan_ip, lan_port
 _PEER_LEN = struct.calcsize(_PEER_FMT)
 
 
@@ -46,12 +46,16 @@ class RegisterAckPeer(NamedTuple):
     ip: int
     port: int
     topic_id: int
+    # Same-NAT ("hairpin") LAN fallback candidate -- see wire.py's
+    # RegisterAckPeer doc comment. 0/0 means "none known".
+    lan_ip: int = 0
+    lan_port: int = 0
 
 
 def encode_register_ack(status: int, peers: List[RegisterAckPeer]) -> bytes:
     out = struct.pack(_ACK_HEADER_FMT, status, len(peers))
     for p in peers:
-        out += struct.pack(_PEER_FMT, p.ip, p.port, p.topic_id)
+        out += struct.pack(_PEER_FMT, p.ip, p.port, p.topic_id, p.lan_ip, p.lan_port)
     return out
 
 
@@ -70,7 +74,7 @@ def decode_register_ack(buf: bytes) -> DecodedRegisterAck:
     peers = []
     off = _ACK_HEADER_LEN
     for _ in range(peer_count):
-        ip, port, topic_id = struct.unpack_from(_PEER_FMT, buf, off)
-        peers.append(RegisterAckPeer(ip, port, topic_id))
+        ip, port, topic_id, lan_ip, lan_port = struct.unpack_from(_PEER_FMT, buf, off)
+        peers.append(RegisterAckPeer(ip, port, topic_id, lan_ip, lan_port))
         off += _PEER_LEN
     return DecodedRegisterAck(status, peers)

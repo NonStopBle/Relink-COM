@@ -71,7 +71,7 @@ REQ_HEADER_FMT = "<IHH"     # node_ip, node_port, topic_count
 REQ_HEADER_LEN = struct.calcsize(REQ_HEADER_FMT)
 ACK_HEADER_FMT = "<BH"      # status, peer_count
 ACK_HEADER_LEN = struct.calcsize(ACK_HEADER_FMT)
-PEER_FMT = "<IHI"           # ip, port, topic_id
+PEER_FMT = "<IHIIH"         # ip, port, topic_id, lan_ip, lan_port
 PEER_LEN = struct.calcsize(PEER_FMT)
 
 
@@ -88,8 +88,8 @@ def decode_register_request(buf: bytes):
 
 def encode_register_ack(status: int, peers) -> bytes:
     out = bytearray(struct.pack(ACK_HEADER_FMT, status, len(peers)))
-    for ip, port, topic_id in peers:
-        out += struct.pack(PEER_FMT, ip, port, topic_id)
+    for ip, port, topic_id, lan_ip, lan_port in peers:
+        out += struct.pack(PEER_FMT, ip, port, topic_id, lan_ip, lan_port)
     return bytes(out)
 
 
@@ -158,6 +158,20 @@ def main():
     print(f"relink-rlcore (Python) listening on {bind_ip}:{port}{suffix}", flush=True)
 
     table = {}  # topic_id -> set of (ip, port)
+
+    # (ip, port) [the table identity above -- the OBSERVED address in
+    # --nat mode, the self-reported one otherwise] -> that same node's
+    # self-reported LAN (node_ip, node_port). Handed out to other peers
+    # alongside the primary address so two nodes behind the SAME NAT
+    # ("hairpin" case, see wire.py's RegisterAckPeer doc comment) have a
+    # second candidate to punch/send to that never needs to leave their
+    # shared LAN. Non-NAT mode: equals the primary address (harmless, the
+    # client skips a LAN candidate identical to the primary). Deliberately
+    # NOT pruned by prune_stale(): it's keyed by peer address only, not
+    # (topic, peer) like `table`/`last_seen`, so a peer still live under
+    # one topic but expired under another would wrongly lose its entry --
+    # unbounded but tiny (one 6-byte value per distinct peer ever seen).
+    lan_of = {}
 
     # (topic_id, ip, port) -> time.time() of its most recent
     # RegisterRequest -- lets prune_stale() below evict a registration
@@ -365,6 +379,12 @@ def main():
         else:
             self_entry = (node_ip, node_port)
 
+        # Record this node's self-reported LAN address alongside its
+        # table identity, so it can be handed to OTHER peers as a
+        # same-NAT ("hairpin") fallback candidate below -- see lan_of's
+        # doc comment above.
+        lan_of[self_entry] = (node_ip, node_port)
+
         now = time.time()
         for topic in topics:
             table.setdefault(topic, set()).add(self_entry)
@@ -375,7 +395,8 @@ def main():
             for (ip, p) in table.get(topic, ()):
                 if (ip, p) == self_entry:
                     continue
-                peers.append((ip, p, topic))
+                lan_ip, lan_port = lan_of.get((ip, p), (0, 0))
+                peers.append((ip, p, topic, lan_ip, lan_port))
 
         ack = encode_register_ack(0, peers)
         if encrypt_key is not None:

@@ -106,10 +106,22 @@ class RegisterAckPeer(ctypes.LittleEndianStructure):
         ("ip", ctypes.c_uint32),
         ("port", ctypes.c_uint16),
         ("topic_id", ctypes.c_uint32),
+        # Same-NAT ("hairpin") fallback candidate: this peer's own
+        # self-reported LAN address, alongside ip/port above (which, in
+        # --nat mode, is the peer's OBSERVED public/NAT-mapped address).
+        # Two nodes behind the SAME NAT/router that only ever learn each
+        # other's public endpoint have to hairpin through their own
+        # router to reach each other -- many consumer/office routers
+        # don't support that and silently drop the traffic. Zero (0, 0)
+        # means "no separate LAN candidate known" -- the client skips
+        # punching/sending to an all-zero candidate. Mirrors
+        # relink/include/relink/wire.hpp's RegisterAckPeer exactly.
+        ("lan_ip", ctypes.c_uint32),
+        ("lan_port", ctypes.c_uint16),
     ]
 
 
-assert ctypes.sizeof(RegisterAckPeer) == 10
+assert ctypes.sizeof(RegisterAckPeer) == 16
 
 
 class MultiArrayHeader(ctypes.LittleEndianStructure):

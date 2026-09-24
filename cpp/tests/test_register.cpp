@@ -36,8 +36,8 @@ int main() {
     // --- RegisterAck round trip ---
     {
         RegisterAckPeer peers[2] = {
-            {0x0A000006, 6000, 100},
-            {0x0A000007, 7000, 101},
+            {0x0A000006, 6000, 100, 0xC0A80006, 6000},  // has a LAN candidate
+            {0x0A000007, 7000, 101, 0, 0},              // no LAN candidate known
         };
         uint8_t buf[256];
         size_t len = 0;
@@ -53,9 +53,13 @@ int main() {
         CHECK(p0.ip == 0x0A000006);
         CHECK(p0.port == 6000);
         CHECK(p0.topic_id == 100);
+        CHECK(p0.lan_ip == 0xC0A80006);
+        CHECK(p0.lan_port == 6000);
         auto p1 = register_ack_peer_at(dack, 1);
         CHECK(p1.ip == 0x0A000007);
         CHECK(p1.topic_id == 101);
+        CHECK(p1.lan_ip == 0);
+        CHECK(p1.lan_port == 0);
     }
 
     // --- empty topic list / empty peer list ---
