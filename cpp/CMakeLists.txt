@@ -120,6 +120,17 @@ target_link_libraries(src_pubsub PRIVATE relink)
 set_target_properties(src_pubsub PROPERTIES OUTPUT_NAME pubsub RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/src)
 set_target_properties(pub sub PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/src)
 
+# cpp/relink_pub_sub/ -- rlcore/--nat cross-network debugging pair (same
+# shape as src/pub.cpp|sub.cpp, hardcoded to a specific rlcore host/topic
+# for reproducing a real deployment's NAT-traversal test). Not part of
+# the documented quickstart -- ad hoc, kept in-tree so it builds/rebuilds
+# through the normal cmake flow instead of a one-off compile.
+add_executable(relink_pub relink_pub_sub/pub.cpp)
+target_link_libraries(relink_pub PRIVATE relink)
+
+add_executable(relink_sub relink_pub_sub/sub.cpp)
+target_link_libraries(relink_sub PRIVATE relink)
+
 if(RELINK_BUILD_EXAMPLES)
     set(RELINK_EXAMPLES
         hello_relink
