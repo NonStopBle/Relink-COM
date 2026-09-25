@@ -457,6 +457,16 @@ def cmd_pub(args):
                   f"({args.topic}): {'ok' if ok else 'ring full / failed'}")
             if i + 1 < reps:
                 time.sleep(args.rate_period)
+        # Explicit cleanup instead of leaving it to GC/interpreter
+        # shutdown: ShmRing.close()/unlink() must drop the ctypes header
+        # view (a live buffer export over the shared mmap) before the
+        # underlying SharedMemory is closed, and nothing guarantees that
+        # ordering happens before shutdown-time __del__ otherwise --
+        # left alone, the ring's SharedMemory.__del__ fires with the
+        # header view still alive and raises "BufferError: cannot close
+        # exported pointers exist" (harmless, but noisy on every pub
+        # process's exit -- see shm_transport.py's close() comment).
+        node.request_stop()
         return
 
     node.advertise_raw(topic)  # must declare BEFORE the first spin_once()

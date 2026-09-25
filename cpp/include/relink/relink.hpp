@@ -785,13 +785,28 @@ public:
 
     bool publish_local_ipc(uint32_t topic_id, const void* payload, size_t len) {
         relink::ShmRing* ring = nullptr;
+        uint32_t seq = 0;
         {
+            // seq must be drawn under the same lock as the ring lookup,
+            // not after releasing it: shm_seq_[topic_id]++ inserts a new
+            // entry (a structural mutation of the unordered_map) on this
+            // topic's first publish, same as shm_rings_.find() would if
+            // it weren't already guarded. Two threads publishing to two
+            // different topic_ids on the same node for the first time at
+            // once would otherwise race on that insert -- unlike bumping
+            // an EXISTING entry, which is safe across different keys,
+            // that's undefined behavior. try_push() itself is left
+            // outside the lock: it's the single-producer write into
+            // already-owned shared memory (per-topic ShmRing is SPSC, a
+            // separate documented caller contract), not node bookkeeping,
+            // so serializing it here would only add unneeded contention
+            // across unrelated topics.
             std::lock_guard<std::mutex> lock(shm_mutex_);
             auto it = shm_rings_.find(topic_id);
             if (it == shm_rings_.end()) return false;
             ring = it->second.get();
+            seq = shm_seq_[topic_id]++;
         }
-        uint32_t seq = shm_seq_[topic_id]++;
         return ring->try_push(static_cast<const uint8_t*>(payload), static_cast<uint32_t>(len), seq);
     }
     bool publish_local_ipc(const std::string& name, const void* payload, size_t len) {

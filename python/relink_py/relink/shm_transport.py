@@ -27,6 +27,7 @@ import os
 import struct
 import time
 from multiprocessing import shared_memory
+from multiprocessing import resource_tracker
 from typing import Optional, Tuple
 
 SHM_RING_MAGIC = 0x524C4B31  # "RLK1"
@@ -93,6 +94,26 @@ class ShmRing:
         except FileExistsError:
             self._shm = shared_memory.SharedMemory(name=posix_name, create=False)
             self._creator = False
+            # CPython's resource_tracker registers EVERY SharedMemory
+            # object on construction, creator or not (a known stdlib
+            # wart, unfixed before 3.13's track= param -- see
+            # bpo-38119/gh-82300). Left alone, this attacher's own
+            # resource_tracker treats the segment as its responsibility
+            # and unlinks it the moment THIS short-lived process exits
+            # -- even though it never created it and a long-lived
+            # creator/other attachers are still using it. That silently
+            # detaches every subsequent attacher onto a brand-new blank
+            # segment under the same name (open()'s create=True now
+            # succeeds instead of hitting FileExistsError), so messages
+            # published after the first attacher exits vanish with no
+            # error anywhere. Only the creator may ever unlink (see
+            # close()/unlink() and RelinkNode.request_stop() above) --
+            # unregistering here just makes this process's tracker
+            # honor that, instead of undermining it.
+            try:
+                resource_tracker.unregister(self._shm._name, "shared_memory")
+            except Exception:
+                pass
 
         self._hdr = ShmRingHeader.from_buffer(self._shm.buf)
         self._slots_offset = ctypes.sizeof(ShmRingHeader)

@@ -156,6 +156,16 @@ class RelinkNode:
         # discovered: both processes must call advertise/subscribe_
         # local_ipc() on the same topic themselves. Keyed by topic_id,
         # separate from the UDP peer/transport machinery above.
+        # Guards _shm_rings/_shm_seq bookkeeping (not the rings'
+        # contents themselves, each already its own SPSC ShmRing): a
+        # node driving several local-IPC topics from more than one
+        # thread would otherwise have concurrent first-inserts into
+        # these plain dicts for different topic_ids. CPython's GIL
+        # keeps that from corrupting the dicts, but publish_local_ipc's
+        # read-then-write of _shm_seq[topic_id] across two unlocked
+        # calls is still a lost-update race -- see the C++ mirror
+        # (relink.hpp's publish_local_ipc) for the same fix.
+        self._shm_lock = threading.Lock()
         self._shm_rings: Dict[int, ShmRing] = {}
         self._shm_handlers: Dict[int, Callable[[bytes], None]] = {}
         self._shm_seq: Dict[int, int] = {}
@@ -857,12 +867,17 @@ class RelinkNode:
         opened (e.g. a live, incompatible-version peer already owns it
         with a different capacity/max_payload)."""
         topic_id = self._topic_id_for(topic)
-        if topic_id in self._shm_rings:
-            return True
+        with self._shm_lock:
+            if topic_id in self._shm_rings:
+                return True
+        # ring.open() can block briefly polling a live-but-mid-init peer
+        # (see ShmRing.open()) -- deliberately outside the lock so it
+        # doesn't stall unrelated topics' publish_local_ipc() calls.
         ring = ShmRing()
         if not ring.open(f"/relink_topic_{topic_id}", capacity, max_payload=max_payload):
             return False
-        self._shm_rings[topic_id] = ring
+        with self._shm_lock:
+            self._shm_rings[topic_id] = ring
         self._declared_topics.add(topic_id)
         return True
 
@@ -879,11 +894,17 @@ class RelinkNode:
 
     def publish_local_ipc(self, topic: Union[int, str], payload: bytes) -> bool:
         topic_id = self._topic_id_for(topic)
-        ring = self._shm_rings.get(topic_id)
-        if ring is None:
-            return False
-        seq = self._shm_seq.get(topic_id, 0)
-        self._shm_seq[topic_id] = (seq + 1) & 0xFFFFFFFF
+        with self._shm_lock:
+            ring = self._shm_rings.get(topic_id)
+            if ring is None:
+                return False
+            seq = self._shm_seq.get(topic_id, 0)
+            self._shm_seq[topic_id] = (seq + 1) & 0xFFFFFFFF
+        # try_push() is the single-producer write into this topic's own
+        # SPSC ring -- left outside the lock, same reasoning as the C++
+        # mirror: it's per-topic shared-memory I/O, not shared
+        # bookkeeping, so serializing it here would only add unneeded
+        # contention across unrelated topics.
         return ring.try_push(payload, seq)
 
     # Convenience wrappers for whole Image/CompressedImage frames over

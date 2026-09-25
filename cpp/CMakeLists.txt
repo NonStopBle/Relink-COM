@@ -217,6 +217,8 @@ if(RELINK_BUILD_TESTS)
         nat_punch_test
         nat_stress_test
         nat_type_test
+        nat_latency_test
+        ipc_latency_test
         register_client_cli)
     foreach(t ${RELINK_MULTIPROCESS_TESTS})
         add_executable(${t} tests/${t}.cpp)
