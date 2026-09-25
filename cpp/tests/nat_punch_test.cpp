@@ -56,10 +56,17 @@ int main(int argc, char** argv) {
 
     std::printf("[%s] registering (attempt 1/2) with rlcore at %s:%u...\n",
                 role.c_str(), argv[2], rlcore_port);
+    // transport.start() (above) already owns recvfrom() on this socket via
+    // its dedicated data thread -- pass &transport so the RegisterAck is
+    // handed off through transport->get_register_reply() instead of racing
+    // that thread with a second recvfrom() here (see the contract on
+    // register_with_rlcore_on_socket() itself). Without this, the data
+    // thread wins the race for the ACK almost every time and this call
+    // times out and retries even though rlcore already replied correctly.
     auto outcome1 = register_with_rlcore_on_socket(
         transport.native_handle(), rlcore_ip, rlcore_port,
         0 /* self_ip unused server-side in --nat mode */, transport.local_port(),
-        topics, 1);
+        topics, 1, /*max_retries=*/3, /*timeout_ms=*/500, &transport);
     std::printf("[%s] attempt 1: ok=%d peers=%zu\n", role.c_str(), outcome1.ok, outcome1.peers.size());
 
     std::printf("[%s] waiting 3s for the other side to register too...\n", role.c_str());
@@ -68,7 +75,8 @@ int main(int argc, char** argv) {
     std::printf("[%s] registering (attempt 2/2)...\n", role.c_str());
     auto outcome2 = register_with_rlcore_on_socket(
         transport.native_handle(), rlcore_ip, rlcore_port,
-        0, transport.local_port(), topics, 1);
+        0, transport.local_port(), topics, 1,
+        /*max_retries=*/3, /*timeout_ms=*/500, &transport);
     std::printf("[%s] attempt 2: ok=%d peers=%zu\n", role.c_str(), outcome2.ok, outcome2.peers.size());
 
     std::vector<PeerAddr> peers;
