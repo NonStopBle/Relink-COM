@@ -359,6 +359,34 @@ def cmd_bw(args):
         pass
 
 
+def try_decode_text(payload: bytes):
+    """Best-effort auto-detect: a payload that's printable ASCII,
+    optionally zero-padded to a fixed buffer size (e.g. a ctypes
+    char array field, or std_msgs::String), is common enough to
+    auto-decode as text instead of a wall of hex -- with zero risk of
+    misreading real binary/struct data, since it falls back to hex the
+    instant any byte doesn't fit that exact shape (a control character
+    other than \\t/\\n/\\r, non-ASCII, or a non-zero byte after the first
+    zero). Mirrors the C++ CLI's try_decode_text(). Returns None (not
+    text) or the decoded str."""
+    if not payload:
+        return None
+    text_len = len(payload)
+    for i, b in enumerate(payload):
+        if b == 0:
+            if any(payload[i:]):
+                return None
+            text_len = i
+            break
+        if b < 0x20 and b not in (0x09, 0x0a, 0x0d):
+            return None
+        if b >= 0x7f:
+            return None
+    if text_len == 0:
+        return None
+    return payload[:text_len].decode("ascii")
+
+
 def resolve_echo_msg_type(args):
     """--hex always wins (explicit "just give me bytes"). Otherwise
     --msg <path.msg> (a user-authored custom schema, see msg_schema.py)
@@ -390,12 +418,16 @@ def resolve_echo_msg_type(args):
 
 def cmd_echo(args):
     """Mirrors `rostopic echo <topic>`: prints each message as it
-    arrives. ReLink has no message-type registry to decode the payload
-    against on its own, so by default this prints raw hex bytes -- but
-    if you tell it the shape via --type <BuiltinName> (e.g. Float32,
-    Imu) or --msg <path/to/custom.msg> (see msg_schema.py), it decodes
-    and pretty-prints field values instead. --hex forces raw hex
-    regardless of --type/--msg."""
+    arrives. ReLink has no wire-level type tag, so decoding is best-
+    effort, in priority order: (1) --type <BuiltinName> (e.g. Float32,
+    Imu) or --msg <path/to/custom.msg> (see msg_schema.py), always wins
+    if given; (2) auto-detect by exact payload size against every known
+    built-in type (see msg_schema.find_types_by_size()) -- only when
+    that size matches exactly ONE type, since many built-ins deliberately
+    share a size (e.g. Int32/UInt32/Float32 are all 4 bytes) and guessing
+    wrong would be worse than not guessing; (3) auto-detect plain
+    printable text (see try_decode_text()); (4) raw hex, the fallback
+    when none of the above apply. --hex forces raw hex regardless."""
     node = make_node(args)
     topic = resolve_topic_arg(args.topic)
     topic_id = node._topic_id_for(topic)
@@ -414,7 +446,15 @@ def cmd_echo(args):
                       "type/schema -- showing raw hex instead)")
                 print(binascii.hexlify(payload, " ").decode())
         else:
-            print(binascii.hexlify(payload, " ").decode())
+            auto = [] if args.hex else msg_schema.find_types_by_size(len(payload))
+            if len(auto) == 1:
+                name, cls = auto[0]
+                print(f"auto-detected type: {name}")
+                print(msg_schema.format_message(cls.from_buffer_copy(payload)))
+            elif not args.hex and (text := try_decode_text(payload)) is not None:
+                print(f'text: "{text}"')
+            else:
+                print(binascii.hexlify(payload, " ").decode())
         if args.count and count[0] >= args.count:
             # Runs on RelinkNode's background data thread -- raising
             # SystemExit here would only kill that thread, not the

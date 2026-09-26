@@ -93,19 +93,69 @@ def parse_msg_file(path: str):
     })
 
 
-def format_message(instance) -> str:
-    """Pretty-prints a ctypes.Structure instance's fields, one per
-    line -- used once a payload has been successfully decoded against a
-    known (--type) or custom (--msg) schema, instead of raw hex."""
+def format_message(instance, _indent: int = 0) -> str:
+    """Pretty-prints a ctypes.Structure instance's fields, one per line
+    -- used once a payload has been decoded against a known (--type) or
+    custom (--msg) schema, or auto-detected by size (see
+    find_types_by_size()), instead of raw hex. Recurses into nested
+    struct fields and arrays of structs (e.g. Imu.orientation is itself
+    a Quaternion) instead of printing their bare Python object repr,
+    which is all the previous flat version did."""
+    pad = "  " * (_indent + 1)
     lines = []
     for name, _ in instance._fields_:
         value = getattr(instance, name)
-        if isinstance(value, bytes):
-            value = value.rstrip(b"\x00").decode("utf-8", errors="replace")
-        elif hasattr(value, "__len__") and not isinstance(value, (str, bytes)):
-            value = list(value)
-        lines.append(f"  {name} = {value}")
+        if isinstance(value, ctypes.Structure):
+            lines.append(f"{pad}{name}:")
+            lines.append(format_message(value, _indent + 1))
+        elif isinstance(value, bytes):
+            text = value.rstrip(b"\x00").decode("utf-8", errors="replace")
+            lines.append(f"{pad}{name} = {text!r}")
+        elif isinstance(value, ctypes.Array):
+            items = list(value)
+            if items and isinstance(items[0], ctypes.Structure):
+                lines.append(f"{pad}{name}:")
+                for i, item in enumerate(items):
+                    lines.append(f"{pad}  [{i}]:")
+                    lines.append(format_message(item, _indent + 2))
+            else:
+                lines.append(f"{pad}{name} = {items}")
+        else:
+            lines.append(f"{pad}{name} = {value}")
     return "\n".join(lines)
+
+
+def find_types_by_size(payload_len: int):
+    """Every known built-in message type (same search space as
+    find_builtin_type()) whose exact wire size matches payload_len --
+    used by rl_topic echo's auto-decode to guess a payload's type when
+    no --type/--msg was given. Returns a list of (name, type) pairs; the
+    caller should only auto-decode when this has exactly one entry --
+    ReLink's wire format carries no type tag, so a size match is a
+    guess, not proof, and plenty of built-ins collide on purpose (Bool/
+    Byte/Char/Int8/UInt8 are all 1 byte; Int32/UInt32/Float32 are all 4)
+    -- multiple candidates means genuinely ambiguous, not a bug."""
+    import relink
+    from relink import std_msgs, geometry_msgs, sensor_msgs, nav_msgs
+    from relink import diagnostic_msgs, trajectory_msgs, actionlib_msgs
+    from relink.wire import is_wire_type
+
+    seen = set()
+    matches = []
+    for module in (relink, std_msgs, geometry_msgs, sensor_msgs, nav_msgs,
+                   diagnostic_msgs, trajectory_msgs, actionlib_msgs):
+        for name in dir(module):
+            if name.startswith("_"):
+                continue
+            candidate = getattr(module, name)
+            if not (isinstance(candidate, type) and is_wire_type(candidate)):
+                continue
+            if candidate in seen:
+                continue  # same type re-exported under multiple module names
+            seen.add(candidate)
+            if ctypes.sizeof(candidate) == payload_len:
+                matches.append((name, candidate))
+    return matches
 
 
 def find_builtin_type(name: str):

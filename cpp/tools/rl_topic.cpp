@@ -40,6 +40,7 @@
 
 #include "relink/relink.hpp"
 #include "relink/topic_directory.hpp"
+#include "msg_schema.hpp"
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -79,6 +80,7 @@ struct Args {
     double timeout = 1.5;
     bool ipc = false;
     bool relay = false;
+    std::string type_name; // --type <BuiltinName>, echo only (see msg_schema.hpp)
     int window = 100;
     double report_every = 5.0;
     int count = 0;
@@ -145,6 +147,13 @@ static void print_help() {
 "                          window -- never cached, so a renamed/removed\n"
 "                          topic or an unreachable target never lingers.\n"
 "  -n, --count <n>         (echo) Stop after this many messages.\n"
+"  --type <Name>           (echo) Decode payloads as this built-in ReLink\n"
+"                          type (e.g. Float32, Imu, Pose -- see\n"
+"                          cpp/tools/msg_schema.hpp for the full list)\n"
+"                          instead of guessing. Without --type, echo still\n"
+"                          auto-decodes when the payload's exact byte size\n"
+"                          matches exactly ONE known type (falls back to\n"
+"                          text, then hex, the moment that's ambiguous).\n"
 "  --window <n>            (hz) Rolling sample window size (default: 100).\n"
 "  --report-every <s>      (hz/bw) Report interval in seconds (default: 5.0).\n"
 "  -r, --repeat <n>        (pub) Number of times to publish (default: 1).\n"
@@ -192,6 +201,7 @@ static Args parse_args(int argc, char** argv) {
         else if (arg == "--timeout") { next_arg(argc, argv, i, &val); a.timeout = std::atof(val.c_str()); }
         else if (arg == "--ipc") { a.ipc = true; }
         else if (arg == "--relay") { a.relay = true; }
+        else if (arg == "--type") { next_arg(argc, argv, i, &val); a.type_name = val; }
         else if (arg == "--window") { next_arg(argc, argv, i, &val); a.window = std::atoi(val.c_str()); }
         else if (arg == "--report-every") { next_arg(argc, argv, i, &val); a.report_every = std::atof(val.c_str()); }
         else if (arg == "-n" || arg == "--count") { next_arg(argc, argv, i, &val); a.count = std::atoi(val.c_str()); }
@@ -626,16 +636,84 @@ static void cmd_bw(const Args& a) {
     }
 }
 
+// Best-effort auto-detect: a payload that's printable ASCII, optionally
+// zero-padded to a fixed buffer size (e.g. a char[] struct field, or
+// std_msgs::String), is common enough to auto-decode as text instead of
+// a wall of hex -- with zero risk of misreading real binary/struct data,
+// since it falls back to hex the instant any byte doesn't fit that exact
+// shape (a control character other than \t/\n/\r, non-ASCII, or a
+// non-zero byte after the first zero). There is no wire-level type
+// registry to decode against in general (see this file's header
+// comment) -- this is a shape heuristic, not a schema.
+static bool try_decode_text(const uint8_t* payload, size_t len, std::string* out) {
+    if (len == 0) return false;
+    size_t text_len = len;
+    for (size_t i = 0; i < len; ++i) {
+        uint8_t b = payload[i];
+        if (b == 0) {
+            for (size_t j = i; j < len; ++j) if (payload[j] != 0) return false;
+            text_len = i;
+            break;
+        }
+        if (b < 0x20 && b != '\n' && b != '\t' && b != '\r') return false;
+        if (b >= 0x7f) return false;
+    }
+    if (text_len == 0) return false;
+    out->assign(reinterpret_cast<const char*>(payload), text_len);
+    return true;
+}
+
 static void cmd_echo(const Args& a) {
     RelinkNode node;
     if (!a.ipc) configure_node(node, a);
     uint32_t topic_id = resolve_topic(node, a.topic);
+
+    // Resolved once, not per-message: --type always wins outright (an
+    // explicit, user-declared shape), same priority order as
+    // rl_topic.py's resolve_echo_msg_type(), minus --msg custom schemas
+    // (not implemented here -- see msg_schema.hpp's header comment).
+    const relink_msg_schema::TypeDesc* explicit_type = nullptr;
+    if (!a.type_name.empty()) {
+        explicit_type = relink_msg_schema::find_type_by_name(a.type_name);
+        if (!explicit_type) {
+            std::fprintf(stderr, "rl_topic echo: unknown built-in message type \"%s\" "
+                         "(see cpp/tools/msg_schema.hpp for the full list, e.g. Float32, Imu, Pose)\n",
+                         a.type_name.c_str());
+            std::exit(2);
+        }
+    }
+
     std::atomic<int> count{0};
     auto on_msg = [&](const uint8_t* payload, size_t len) {
         int n = ++count;
         std::printf("--- #%d (%zu bytes) ---\n", n, len);
-        for (size_t i = 0; i < len; ++i) std::printf("%02x ", payload[i]);
-        std::printf("\n");
+        if (explicit_type) {
+            if (len == explicit_type->size) {
+                std::printf("%s\n", relink_msg_schema::format_message(explicit_type, payload).c_str());
+            } else {
+                std::printf("(payload is %zu bytes, expected %zu for type \"%s\" -- showing raw hex instead)\n",
+                            len, explicit_type->size, explicit_type->name);
+                for (size_t i = 0; i < len; ++i) std::printf("%02x ", payload[i]);
+                std::printf("\n");
+            }
+        } else {
+            // No --type given: auto-detect by exact size match against
+            // every known built-in type, but ONLY when unambiguous --
+            // see msg_schema.hpp's find_types_by_size() doc comment on
+            // why more than one candidate must not guess. Falls through
+            // to the text heuristic, then raw hex.
+            auto matches = relink_msg_schema::find_types_by_size(len);
+            std::string text;
+            if (matches.size() == 1) {
+                std::printf("auto-detected type: %s\n", matches[0]->name);
+                std::printf("%s\n", relink_msg_schema::format_message(matches[0], payload).c_str());
+            } else if (try_decode_text(payload, len, &text)) {
+                std::printf("text: \"%s\"\n", text.c_str());
+            } else {
+                for (size_t i = 0; i < len; ++i) std::printf("%02x ", payload[i]);
+                std::printf("\n");
+            }
+        }
         std::fflush(stdout);
         if (a.count && n >= a.count) std::_Exit(0); // same rationale as rl_topic.py: runs off the data thread
     };
