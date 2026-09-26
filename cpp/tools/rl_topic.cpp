@@ -11,7 +11,13 @@
 // Usage: rl_topic list | info <topic> | hz <topic> | bw <topic> |
 //        echo <topic> | pub <topic> --hex <bytes> | --text <string>
 //   [--rlcore-ip <ip>] [--rlcore-port <port>] [--group <ip>] [--port <n>]
-//   [--timeout <s>] [--no-cache] [--refresh] [--ipc]
+//   [--timeout <s>] [--no-cache] [--refresh] [--ipc] [--relay]
+//
+// --relay (needs --rlcore-ip, mutually exclusive with --ipc's own
+// no-discovery path): opts the node into relay delivery via
+// RelinkNode::set_rlcore.setRelay(), i.e. the SAME rlcore ip:port
+// started with --relay/--nat, not a separate standalone relink-relay
+// address -- see relink.hpp's RlCoreConfig::setRelay() comment.
 //
 // --ipc (hz/bw/echo/pub only, not list/info -- see below) targets a
 // same-host shared-memory topic (relink/shm_transport.hpp) instead of
@@ -66,6 +72,7 @@ struct Args {
     bool no_cache = false;
     bool refresh = false;
     bool ipc = false;
+    bool relay = false;
     int window = 100;
     double report_every = 5.0;
     int count = 0;
@@ -101,6 +108,7 @@ static Args parse_args(int argc, char** argv) {
         else if (arg == "--no-cache") { a.no_cache = true; }
         else if (arg == "--refresh") { a.refresh = true; }
         else if (arg == "--ipc") { a.ipc = true; }
+        else if (arg == "--relay") { a.relay = true; }
         else if (arg == "--window") { next_arg(argc, argv, i, &val); a.window = std::atoi(val.c_str()); }
         else if (arg == "--report-every") { next_arg(argc, argv, i, &val); a.report_every = std::atof(val.c_str()); }
         else if (arg == "-n" || arg == "--count") { next_arg(argc, argv, i, &val); a.count = std::atoi(val.c_str()); }
@@ -421,6 +429,13 @@ static void configure_node(RelinkNode& node, const Args& a) {
     if (!a.rlcore_ip.empty()) {
         node.set_rlcore.ip(a.rlcore_ip);
         node.set_rlcore.port(a.rlcore_port);
+        // rlcore's own --relay/--nat folds relay forwarding into this
+        // SAME ip:port -- see RlCoreConfig::setRelay()'s comment.
+        if (a.relay) node.set_rlcore.setRelay(true);
+    } else if (a.relay) {
+        std::fprintf(stderr, "rl_topic: --relay requires --rlcore-ip <ip> "
+                     "(relay mode needs rlcore discovery, not multicast)\n");
+        std::exit(2);
     } else {
         node.use_multicast_discovery();
     }
@@ -601,8 +616,17 @@ static void cmd_pub(const Args& a) {
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
     if (n_peers == 0) {
-        std::fprintf(stderr, "rl_topic pub: no peers found for topic id %u within %.1fs "
-                     "-- publishing anyway (no-op if truly no one is listening)\n", topic_id, a.timeout);
+        if (node.relay_active()) {
+            // Relay delivery doesn't need a direct peer address at all --
+            // it always goes to the relay's fixed ip:port regardless of
+            // whether any direct peer has been learned, so this is not
+            // a sign that publishing will actually be a no-op.
+            std::fprintf(stderr, "rl_topic pub: no DIRECT peers found for topic id %u within %.1fs "
+                         "-- relay mode is on, publishing via relay\n", topic_id, a.timeout);
+        } else {
+            std::fprintf(stderr, "rl_topic pub: no peers found for topic id %u within %.1fs "
+                         "-- publishing anyway (no-op if truly no one is listening)\n", topic_id, a.timeout);
+        }
     }
 
     int reps = a.repeat > 0 ? a.repeat : 1;

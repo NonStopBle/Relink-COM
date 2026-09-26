@@ -37,7 +37,7 @@ int main() {
     // node.advertise<Chatter>(TOPIC_CHATTER);
     uint32_t topic_id = node.topic_id_for(TOPIC_CHATTER);
 
-    const auto period = std::chrono::milliseconds(500);
+    const auto period = std::chrono::milliseconds(1);
     int count = 0;
     while (true) {
         node.spin_once(); // services discovery -- call this every loop iteration
@@ -51,7 +51,7 @@ int main() {
         std::printf("sent: %s\n", msg.data);
         node.publish<Chatter>(TOPIC_CHATTER, msg);
 
-        if (node.peers_for_topic(topic_id).empty()) {
+        if (node.peers_for_topic(topic_id).empty() && !node.relay_active()) {
             std::printf("(no peers found yet -- is sub running on the network?)\n");
         }
 

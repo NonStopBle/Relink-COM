@@ -212,6 +212,15 @@ public:
         relay_port_ = port;
     }
 
+    // Whether a relay path (via set_relay() or set_rlcore.setRelay())
+    // is active. Callers that inspect peers_for_topic()/publish_raw()'s
+    // return value to decide "is anyone listening" should check this
+    // first -- with relay enabled, publish_raw() always attempts
+    // delivery via the relay's fixed address regardless of whether any
+    // DIRECT peer has been learned yet, so an empty peers_for_topic()
+    // list no longer means "no-op publish" the way it does without relay.
+    bool relay_active() const { return relay_enabled_; }
+
     // --- named topics: hash a human-readable topic name down to the
     // uint32_t that actually goes on the wire. One-way (FNV-1a) -- there
     // is no length limit on `name` since it is never itself transmitted,
@@ -411,8 +420,13 @@ public:
         for (const auto& peer : peers) {
             all_ok = t.publish_raw(topic_id, payload, payload_len, peer, seq) && all_ok;
         }
-        if (relay_enabled_) t.publish_raw(topic_id, payload, payload_len, relay_peer(), seq);
-        return all_ok && !peers.empty();
+        bool relay_ok = false;
+        if (relay_enabled_) relay_ok = t.publish_raw(topic_id, payload, payload_len, relay_peer(), seq);
+        // Direct delivery counts as success only if there was at least
+        // one direct peer to send to; the relay path counts as success
+        // on its own -- it doesn't need a direct peer address at all, so
+        // an empty `peers` list under relay is not a failure.
+        return (all_ok && !peers.empty()) || relay_ok;
     }
 
     // --- publish: sends to every currently-known peer for this topic ---
@@ -440,10 +454,11 @@ public:
         for (const auto& peer : peers) {
             all_ok = t.publish_raw(topic_id, &value, sizeof(T), peer, seq) && all_ok;
         }
+        bool relay_ok = false;
         if (relay_enabled_ && !kIsLargeBlob) {
-            t.publish_raw(topic_id, &value, sizeof(T), relay_peer(), seq);
+            relay_ok = t.publish_raw(topic_id, &value, sizeof(T), relay_peer(), seq);
         }
-        return all_ok;
+        return (all_ok && !peers.empty()) || relay_ok;
     }
 
     // --- Image: a library-provided large-blob type, automatically

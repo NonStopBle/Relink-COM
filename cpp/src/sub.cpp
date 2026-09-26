@@ -36,6 +36,6 @@ int main() {
     // pub/sub pair, but a pure subscriber can just block here.
     while (true) {
         node.spin_once();
-        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
 }
