@@ -65,7 +65,12 @@ static void run_side(const char* label, uint32_t rlcore_ip, uint16_t rlcore_port
 
     std::vector<PeerAddr> peers;
     for (const auto& p : outcome1.peers) peers.push_back(PeerAddr{p.ip, p.port});
-    for (const auto& p : outcome2.peers) peers.push_back(PeerAddr{p.ip, p.port});
+    for (const auto& p : outcome2.peers) {
+        PeerAddr pa{p.ip, p.port};
+        bool dup = false;
+        for (const auto& e : peers) if (e.ip_host_order == pa.ip_host_order && e.port == pa.port) dup = true;
+        if (!dup) peers.push_back(pa);
+    }
 
     registered_ok = !peers.empty();
     if (!registered_ok) {
