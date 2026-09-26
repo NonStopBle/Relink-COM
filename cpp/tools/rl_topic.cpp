@@ -39,6 +39,7 @@
 #include <string>
 #include <vector>
 #include <map>
+#include <set>
 #include <chrono>
 #include <thread>
 #include <atomic>
@@ -280,6 +281,7 @@ static std::map<uint32_t, std::string> query_multicast(const std::string& group,
     ::sendto(s, reinterpret_cast<const char*>(query_buf), static_cast<int>(query_len), 0,
              reinterpret_cast<struct sockaddr*>(&dest), sizeof(dest));
 
+    bool got_any = false;
     auto deadline = std::chrono::steady_clock::now() + std::chrono::duration<double>(timeout_s);
     while (std::chrono::steady_clock::now() < deadline) {
         uint8_t buf[kTopicDirMaxPacket];
@@ -289,10 +291,17 @@ static std::map<uint32_t, std::string> query_multicast(const std::string& group,
         if (topic_dir_packet_kind(buf, static_cast<size_t>(n)) != TopicDirKind::Reply) continue;
         std::vector<TopicDirEntry> entries;
         if (decode_topic_dir_entries(buf, static_cast<size_t>(n), &entries)) {
+            got_any = true;
             for (const auto& e : entries) out[e.topic_id] = e.name;
         }
     }
     relink::close_socket(s);
+    if (!got_any) {
+        std::fprintf(stderr, "rl_topic: no reply from any multicast responder on %s:%u "
+                     "(nothing on this LAN segment is using multicast discovery right now -- "
+                     "if your nodes use --rlcore-ip instead, pass the same flag here)\n",
+                     group.c_str(), port);
+    }
     return out;
 }
 
@@ -345,35 +354,56 @@ static std::map<uint32_t, std::vector<RolePeer>> query_rlcore_roles(
     return out;
 }
 
-static std::map<uint32_t, std::string> collect_names(const Args& a) {
+struct NameCollection {
+    std::map<uint32_t, std::string> names; // live query results, unioned with cache
+    std::set<uint32_t> live_ids;           // subset of `names` actually seen in THIS query
+};
+
+static NameCollection collect_names(const Args& a) {
     std::map<uint32_t, std::string> fresh = a.rlcore_ip.empty()
         ? query_multicast(a.group, a.port, a.timeout)
         : query_rlcore(a.rlcore_ip, a.rlcore_port, a.timeout);
 
-    if (a.no_cache) return fresh;
+    NameCollection out;
+    for (const auto& kv : fresh) out.live_ids.insert(kv.first);
+
+    if (a.no_cache) { out.names = std::move(fresh); return out; }
     std::map<uint32_t, std::string> cache = a.refresh ? std::map<uint32_t, std::string>{} : load_cache();
     for (const auto& kv : fresh) cache[kv.first] = kv.second; // fresh always wins
     save_cache(cache);
-    return cache;
+    out.names = std::move(cache);
+    return out;
 }
 
 // --------------------------------------------------------------------
 // Subcommands
 // --------------------------------------------------------------------
 static void cmd_list(const Args& a) {
-    auto names = collect_names(a);
+    auto collected = collect_names(a);
+    const auto& names = collected.names;
     if (names.empty()) {
         std::printf("rl_topic: no topics found (%s, %.1fs timeout)\n",
                     a.rlcore_ip.empty() ? "multicast" : ("rlcore " + a.rlcore_ip).c_str(), a.timeout);
         return;
     }
+    if (collected.live_ids.empty() && !a.no_cache) {
+        // query_rlcore()/query_multicast() already printed why nothing
+        // live came back -- make it unmistakable that EVERY line below is
+        // leftover from a past run (possibly against a different target
+        // entirely), not evidence anything is live right now.
+        std::fprintf(stderr, "rl_topic: no live reply -- every name below is from the local "
+                     "cache (~/.cache/relink/topic_names.json), not confirmed live this query "
+                     "(use --no-cache to see only what actually replied just now)\n");
+    }
     for (const auto& kv : names) {
-        std::printf("%-10u  %s\n", kv.first, kv.second.empty() ? "(unnamed)" : kv.second.c_str());
+        bool live = collected.live_ids.count(kv.first) != 0;
+        std::printf("%-10u  %-30s%s\n", kv.first, kv.second.empty() ? "(unnamed)" : kv.second.c_str(),
+                    live ? "" : "  (cached only -- not seen in this query)");
     }
 }
 
 static void cmd_info(const Args& a) {
-    auto names = collect_names(a);
+    auto names = collect_names(a).names;
     bool is_numeric = !a.topic.empty() &&
         (std::isdigit(static_cast<unsigned char>(a.topic[0])) || a.topic[0] == '-');
 
