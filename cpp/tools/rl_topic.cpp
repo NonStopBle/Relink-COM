@@ -140,7 +140,11 @@ static void print_help() {
 "  --no-cache              (list/info) Ignore/don't update the local topic-\n"
 "                          name cache -- show only what replied just now.\n"
 "  --refresh               (list/info) Discard the existing cache before\n"
-"                          merging in this query's fresh results.\n"
+"                          merging in this query's fresh results. (Also\n"
+"                          happens automatically whenever --rlcore-ip is\n"
+"                          set to a NEW address -- the cache is per-target,\n"
+"                          not global.) A cached name not seen in the live\n"
+"                          reply is tagged \"(old -- last seen <age> ago)\".\n"
 "  -n, --count <n>         (echo) Stop after this many messages.\n"
 "  --window <n>            (hz) Rolling sample window size (default: 100).\n"
 "  --report-every <s>      (hz/bw) Report interval in seconds (default: 5.0).\n"
@@ -303,8 +307,23 @@ static std::string json_escape(const std::string& s) {
     return out;
 }
 
-static std::map<uint32_t, std::string> load_cache() {
-    std::map<uint32_t, std::string> out;
+static long long now_unix() {
+    return static_cast<long long>(std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count());
+}
+
+// name plus the unix timestamp this name was last actually confirmed
+// live (not just cached) -- lets cmd_list() report an actual age
+// ("last seen 3m ago") instead of a bare, un-aged "cached" flag, which
+// was itself a real point of confusion (a name cached 5 minutes ago
+// looked identical to one cached weeks ago).
+struct CacheEntry {
+    std::string name;
+    long long ts = 0;
+};
+
+static std::map<uint32_t, CacheEntry> load_cache() {
+    std::map<uint32_t, CacheEntry> out;
     std::ifstream f(cache_path());
     if (!f) return out;
     std::string line;
@@ -315,30 +334,48 @@ static std::map<uint32_t, std::string> load_cache() {
         auto q2 = line.find('"', q1 + 1);
         if (q2 == std::string::npos || q2 >= colon) continue;
         std::string id_str = line.substr(q1 + 1, q2 - q1 - 1);
-        auto q3 = line.find('"', colon + 1);
-        if (q3 == std::string::npos) continue;
-        auto q4 = line.rfind('"');
-        if (q4 <= q3) continue;
-        std::string name = line.substr(q3 + 1, q4 - q3 - 1);
+
+        auto name_key = line.find("\"name\"", colon);
+        auto ts_key = line.find("\"ts\"", colon);
+        if (name_key == std::string::npos || ts_key == std::string::npos) continue;
+        auto name_colon = line.find(':', name_key);
+        auto nq1 = (name_colon == std::string::npos) ? std::string::npos : line.find('"', name_colon + 1);
+        auto nq2 = (nq1 == std::string::npos) ? std::string::npos : line.find('"', nq1 + 1);
+        auto ts_colon = line.find(':', ts_key);
+        if (nq1 == std::string::npos || nq2 == std::string::npos || ts_colon == std::string::npos) continue;
+        std::string name = line.substr(nq1 + 1, nq2 - nq1 - 1);
         try {
-            out[static_cast<uint32_t>(std::stoul(id_str))] = name;
+            uint32_t id = static_cast<uint32_t>(std::stoul(id_str));
+            long long ts = std::stoll(line.substr(ts_colon + 1));
+            out[id] = CacheEntry{name, ts};
         } catch (...) {}
     }
     return out;
 }
 
-static void save_cache(const std::map<uint32_t, std::string>& cache) {
+static void save_cache(const std::map<uint32_t, CacheEntry>& cache) {
     std::string path = cache_path();
     ensure_parent_dir(path);
     std::ofstream f(path, std::ios::trunc);
     f << "{\n";
     size_t i = 0;
     for (const auto& kv : cache) {
-        f << "  \"" << kv.first << "\": \"" << json_escape(kv.second) << "\"";
+        f << "  \"" << kv.first << "\": {\"name\": \"" << json_escape(kv.second.name)
+          << "\", \"ts\": " << kv.second.ts << "}";
         if (++i != cache.size()) f << ",";
         f << "\n";
     }
     f << "}\n";
+}
+
+// Wipes the topic-name cache entirely -- called whenever the rlcore
+// target changes (see main()): names cached under a DIFFERENT rlcore
+// are for an unrelated fleet and would otherwise sit there forever,
+// indistinguishable from this target's own names except by the "(old)"
+// age tag cmd_list() prints for a same-target stale name. Silently a
+// no-op if the file doesn't exist.
+static void clear_cache() {
+    std::remove(cache_path().c_str());
 }
 
 // --------------------------------------------------------------------
@@ -483,8 +520,9 @@ static std::map<uint32_t, std::vector<RolePeer>> query_rlcore_roles(
 }
 
 struct NameCollection {
-    std::map<uint32_t, std::string> names; // live query results, unioned with cache
-    std::set<uint32_t> live_ids;           // subset of `names` actually seen in THIS query
+    std::map<uint32_t, std::string> names;    // live query results, unioned with cache
+    std::set<uint32_t> live_ids;              // subset of `names` actually seen in THIS query
+    std::map<uint32_t, long long> last_seen;  // unix ts each non-live id was last actually live
 };
 
 static NameCollection collect_names(const Args& a) {
@@ -493,19 +531,35 @@ static NameCollection collect_names(const Args& a) {
         : query_rlcore(a.rlcore_ip, a.rlcore_port, a.timeout);
 
     NameCollection out;
+    long long now = now_unix();
     for (const auto& kv : fresh) out.live_ids.insert(kv.first);
 
     if (a.no_cache) { out.names = std::move(fresh); return out; }
-    std::map<uint32_t, std::string> cache = a.refresh ? std::map<uint32_t, std::string>{} : load_cache();
-    for (const auto& kv : fresh) cache[kv.first] = kv.second; // fresh always wins
+    std::map<uint32_t, CacheEntry> cache = a.refresh ? std::map<uint32_t, CacheEntry>{} : load_cache();
+    for (const auto& kv : fresh) cache[kv.first] = CacheEntry{kv.second, now}; // fresh always wins, ts refreshed
     save_cache(cache);
-    out.names = std::move(cache);
+    for (const auto& kv : cache) {
+        out.names[kv.first] = kv.second.name;
+        if (!out.live_ids.count(kv.first)) out.last_seen[kv.first] = kv.second.ts;
+    }
     return out;
 }
 
 // --------------------------------------------------------------------
 // Subcommands
 // --------------------------------------------------------------------
+// Formats a duration in seconds as a short human-readable age, coarsest
+// unit first (e.g. "3m12s", "5h2m", "14d3h") -- enough precision to tell
+// "just missed this query" apart from "genuinely stale", without the
+// clutter of every smaller unit down to seconds.
+static std::string format_age(long long seconds) {
+    if (seconds < 0) seconds = 0;
+    if (seconds < 60) return std::to_string(seconds) + "s";
+    if (seconds < 3600) return std::to_string(seconds / 60) + "m" + std::to_string(seconds % 60) + "s";
+    if (seconds < 86400) return std::to_string(seconds / 3600) + "h" + std::to_string((seconds % 3600) / 60) + "m";
+    return std::to_string(seconds / 86400) + "d" + std::to_string((seconds % 86400) / 3600) + "h";
+}
+
 static void cmd_list(const Args& a) {
     auto collected = collect_names(a);
     const auto& names = collected.names;
@@ -517,16 +571,24 @@ static void cmd_list(const Args& a) {
     if (collected.live_ids.empty() && !a.no_cache) {
         // query_rlcore()/query_multicast() already printed why nothing
         // live came back -- make it unmistakable that EVERY line below is
-        // leftover from a past run (possibly against a different target
-        // entirely), not evidence anything is live right now.
-        std::fprintf(stderr, "rl_topic: no live reply -- every name below is from the local "
+        // (old): leftover from a past run (possibly against a different
+        // target entirely), not evidence anything is live right now.
+        std::fprintf(stderr, "rl_topic: no live reply -- every name below is (old), from the local "
                      "cache (~/.cache/relink/topic_names.json), not confirmed live this query "
                      "(use --no-cache to see only what actually replied just now)\n");
     }
+    long long now = now_unix();
     for (const auto& kv : names) {
         bool live = collected.live_ids.count(kv.first) != 0;
+        std::string suffix;
+        if (!live) {
+            auto it = collected.last_seen.find(kv.first);
+            suffix = (it != collected.last_seen.end())
+                ? ("  (old -- last seen " + format_age(now - it->second) + " ago)")
+                : "  (old)";
+        }
         std::printf("%-10u  %-30s%s\n", kv.first, kv.second.empty() ? "(unnamed)" : kv.second.c_str(),
-                    live ? "" : "  (cached only -- not seen in this query)");
+                    suffix.c_str());
     }
 }
 
@@ -799,6 +861,20 @@ static void cmd_pub(const Args& a) {
 int main(int argc, char** argv) {
     Args a = parse_args(argc, argv);
     if (!a.rlcore_ip.empty()) {
+        std::string prev_ip;
+        uint16_t prev_port = 0;
+        bool had_prev = load_conf(&prev_ip, &prev_port);
+        if (!had_prev || prev_ip != a.rlcore_ip || prev_port != a.rlcore_port) {
+            // Switching to a different rlcore target (or setting one for
+            // the first time) -- wipe the topic-name cache. Otherwise
+            // names from the OLD target linger forever, indistinguishable
+            // from this target's own names except by the "(old)" age tag
+            // cmd_list() prints for a same-target stale name -- a real,
+            // repeated point of confusion. Not triggered by re-passing
+            // the SAME --rlcore-ip repeatedly, so caching still helps
+            // within one target's normal use.
+            clear_cache();
+        }
         save_conf(a.rlcore_ip, a.rlcore_port);
     } else {
         std::string remembered_ip;
