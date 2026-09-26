@@ -1186,49 +1186,17 @@ private:
             rlcore_self_ip_ = self_ip;
             rlcore_groups_.clear();
             for (const auto& g : groups) rlcore_groups_.emplace_back(g.transport, g.topics);
-            // Tell rlcore about any names we resolved for these topics
-            // (best-effort, fire-and-forget -- rl_topic.py's RLNQ query
-            // to rlcore is what actually depends on this, not any
-            // data-path behavior, so a dropped/lost announce here is
-            // harmless: worst case rl_topic.py's dictionary is missing
-            // one name until the next process that knows it announces).
-            {
-                std::vector<TopicDirEntry> entries;
-                {
-                    std::lock_guard<std::mutex> lock2(state_mutex_);
-                    entries.reserve(topic_names_.size());
-                    for (const auto& kv : topic_names_) entries.push_back(TopicDirEntry{kv.first, kv.second});
-                }
-                if (!entries.empty()) {
-                    // chunk_topic_dir_entries(), not one
-                    // encode_topic_dir_announce() call: a real large-
-                    // topic-count system (e.g. ~1000 topics) easily
-                    // exceeds kTopicDirMaxEntries (512) in one node, and
-                    // a single encode_topic_dir_announce() call would
-                    // just return false and get silently skipped by the
-                    // check this replaces, dropping every name for that
-                    // node with no announce ever reaching rlcore even
-                    // though registration/data traffic worked fine
-                    // (different wire protocols) -- rl_topic list/info
-                    // would then see nothing despite everything else
-                    // running. See chunk_topic_dir_entries()'s doc
-                    // comment for why entry-count chunking alone isn't
-                    // enough either.
-                    struct sockaddr_in dest{};
-                    dest.sin_family = AF_INET;
-                    dest.sin_addr.s_addr = htonl(set_rlcore.resolved_ip());
-                    dest.sin_port = htons(set_rlcore.resolved_port());
-                    for (const auto& chunk : chunk_topic_dir_entries(entries)) {
-                        uint8_t announce_buf[kTopicDirMaxPacket];
-                        size_t announce_len = 0;
-                        if (encode_topic_dir_announce(chunk, announce_buf, sizeof(announce_buf), &announce_len)) {
-                            ::sendto(transport_.native_handle(), reinterpret_cast<const char*>(announce_buf),
-                                     static_cast<int>(announce_len), 0,
-                                     reinterpret_cast<struct sockaddr*>(&dest), sizeof(dest));
-                        }
-                    }
-                }
-            }
+            // Tell rlcore about any names we resolved for these topics --
+            // rl_topic list/info's Name field depends on this (a separate
+            // wire protocol from registration/data traffic, so it can be
+            // missing even though everything else works). This first send
+            // is fire-and-forget same as before, but no longer the ONLY
+            // attempt: start_rlcore_reregister_thread() below repeats it
+            // every tick forever, same as it already does for the role
+            // announce, so one lost packet (plausible for the very first
+            // datagram a fresh socket sends across a real WAN path) no
+            // longer permanently hides the name from rl_topic.
+            announce_topic_names_to_rlcore();
 
             // If registration failed after retries, register_with_rlcore
             // already logged an error; proceed with an empty peer table
@@ -1522,6 +1490,42 @@ private:
         }
     }
 
+    // chunk_topic_dir_entries(), not one encode_topic_dir_announce()
+    // call: a real large-topic-count system (e.g. ~1000 topics) easily
+    // exceeds kTopicDirMaxEntries (512) in one node, and a single
+    // encode_topic_dir_announce() call would just return false and get
+    // silently skipped, dropping every name for that node with no
+    // announce ever reaching rlcore even though registration/data
+    // traffic worked fine (different wire protocols) -- rl_topic
+    // list/info would then see nothing despite everything else running.
+    // See chunk_topic_dir_entries()'s doc comment for why entry-count
+    // chunking alone isn't enough either. Fire-and-forget, no ack --
+    // called both once at ensure_started() time and every tick from
+    // start_rlcore_reregister_thread(), so a single lost packet doesn't
+    // permanently hide the name (see that call site's comment).
+    void announce_topic_names_to_rlcore() {
+        std::vector<TopicDirEntry> entries;
+        {
+            std::lock_guard<std::mutex> lock(state_mutex_);
+            entries.reserve(topic_names_.size());
+            for (const auto& kv : topic_names_) entries.push_back(TopicDirEntry{kv.first, kv.second});
+        }
+        if (entries.empty()) return;
+        struct sockaddr_in dest{};
+        dest.sin_family = AF_INET;
+        dest.sin_addr.s_addr = htonl(set_rlcore.resolved_ip());
+        dest.sin_port = htons(set_rlcore.resolved_port());
+        for (const auto& chunk : chunk_topic_dir_entries(entries)) {
+            uint8_t announce_buf[kTopicDirMaxPacket];
+            size_t announce_len = 0;
+            if (encode_topic_dir_announce(chunk, announce_buf, sizeof(announce_buf), &announce_len)) {
+                ::sendto(transport_.native_handle(), reinterpret_cast<const char*>(announce_buf),
+                         static_cast<int>(announce_len), 0,
+                         reinterpret_cast<struct sockaddr*>(&dest), sizeof(dest));
+            }
+        }
+    }
+
     void start_relay_keepalive_thread(std::vector<std::pair<UdpTransport*, std::vector<uint32_t>>> groups) {
         relay_keepalive_thread_ = std::thread([this, groups = std::move(groups)] {
             // Must outpace the relay daemon's kMemberTtlSeconds (30s) by
@@ -1569,6 +1573,12 @@ private:
                     groups_copy = rlcore_groups_;
                     self_ip = rlcore_self_ip_;
                 }
+                // Node-wide, not per-group -- repeats every tick like the
+                // per-group role announce below, so a lost topic-name
+                // announce (see ensure_started()'s call site) self-heals
+                // instead of leaving rl_topic list/info blind to that name
+                // for the rest of this node's lifetime.
+                announce_topic_names_to_rlcore();
                 // At many topics (e.g. 20+), re-registering every group
                 // every tick multiplies load on rlcore (a single-
                 // threaded server) and this node's own busy sockets by
