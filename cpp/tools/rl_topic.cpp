@@ -94,6 +94,7 @@ static bool next_arg(int argc, char** argv, int& i, std::string* out) {
 static void print_help() {
     std::printf(
 "usage: rl_topic <command> [topic] [options]\n"
+"       rl_topic [options]              (no command = list)\n"
 "\n"
 "commands:\n"
 "  list                    List every known topic id and name.\n"
@@ -165,15 +166,19 @@ static Args parse_args(int argc, char** argv) {
         print_help();
         std::exit(0);
     }
+    // No subcommand, just options (e.g. `rl_topic --rlcore-ip 1.2.3.4`) --
+    // default to `list`, the only command that takes no required
+    // <topic> argument, rather than making the caller spell it out.
+    int opts_start;
     if (argv[1][0] == '-') {
-        std::fprintf(stderr, "rl_topic: expected a command first (list|info|hz|bw|echo|pub), "
-                     "got \"%s\" -- options like --rlcore-ip go AFTER the command, e.g.:\n"
-                     "  rl_topic list --rlcore-ip 43.228.86.96\n", argv[1]);
-        std::exit(2);
+        a.command = "list";
+        opts_start = 1;
+    } else {
+        a.command = argv[1];
+        opts_start = 2;
     }
-    a.command = argv[1];
     std::vector<std::string> positional;
-    for (int i = 2; i < argc; ++i) {
+    for (int i = opts_start; i < argc; ++i) {
         std::string arg = argv[i];
         std::string val;
         if (arg == "-h" || arg == "--help") { print_help(); std::exit(0); }
