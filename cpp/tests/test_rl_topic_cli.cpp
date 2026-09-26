@@ -52,7 +52,7 @@ int main() {
     // that guard's message must never appear on the non---ipc path.
     {
         std::string out;
-        run("list --timeout 0.2 --no-cache", out);
+        run("list --timeout 0.2", out);
         CHECK(out.find("--ipc is not supported") == std::string::npos);
     }
     // Sanity/regression guard: hz/bw/echo/pub must NOT hit the list/info
