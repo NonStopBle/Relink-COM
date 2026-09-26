@@ -107,7 +107,9 @@ static void print_help() {
 "<topic> is either a name (e.g. /relink/imu) or a numeric wire id.\n"
 "\n"
 "discovery options (how this node finds peers -- pick ONE; default is\n"
-"multicast if --rlcore-ip is not given):\n"
+"multicast if --rlcore-ip is not given). --rlcore-ip is remembered across\n"
+"invocations (~/.cache/relink/conf.bin) -- give it once, then omit it on\n"
+"later commands; pass --rlcore-ip again any time to change it:\n"
 "  --rlcore-ip <ip>        Use rlcore (Mode A) instead of multicast: query/\n"
 "                          register directly against a relink-rlcore daemon\n"
 "                          at this address. Needed whenever your nodes are\n"
@@ -199,11 +201,9 @@ static Args parse_args(int argc, char** argv) {
 }
 
 // --------------------------------------------------------------------
-// Cache (~/.cache/relink/topic_names.json -- shared file/format with
-// rl_topic.py, deliberately simple enough that either tool can read/
-// write it without a JSON library: one "id": "name" pair per line).
+// Cache (~/.cache/relink/ -- shared directory/formats with rl_topic.py)
 // --------------------------------------------------------------------
-static std::string cache_path() {
+static std::string home_cache_dir() {
 #ifdef _WIN32
     // Forward slashes work fine in Windows file APIs (CreateFile,
     // fopen, mkdir) and let the '/'-splitting mkdir-p logic below stay
@@ -213,15 +213,80 @@ static std::string cache_path() {
     if (!home) home = "C:/Temp";
     std::string h(home);
     for (char& c : h) if (c == '\\') c = '/';
-    return h + "/relink/topic_names.json";
+    return h + "/relink";
 #else
     const char* home = std::getenv("HOME");
     if (!home) {
         struct passwd* pw = getpwuid(getuid());
         home = pw ? pw->pw_dir : "/tmp";
     }
-    return std::string(home) + "/.cache/relink/topic_names.json";
+    return std::string(home) + "/.cache/relink";
 #endif
+}
+
+// topic_names.json -- deliberately simple enough that either this tool
+// or rl_topic.py can read/write it without a JSON library: one
+// "id": "name" pair per line.
+static std::string cache_path() { return home_cache_dir() + "/topic_names.json"; }
+
+// conf.bin -- remembers the last --rlcore-ip/--rlcore-port explicitly
+// given, so a large-fleet user who always talks to the same rlcore
+// doesn't have to retype it on every invocation. Same 6-byte binary
+// layout as rl_topic.py's CONF_FMT ("!4sH": network-order packed IPv4 +
+// 2-byte port), so either tool reads/updates the same remembered
+// address.
+static std::string conf_path() { return home_cache_dir() + "/conf.bin"; }
+
+static void ensure_parent_dir(const std::string& path) {
+    auto slash = path.find_last_of('/');
+    if (slash == std::string::npos) return;
+    std::string dir = path.substr(0, slash);
+    // mkdir -p, minimal: create each path component.
+    std::string accum;
+    std::stringstream ss(dir);
+    std::string part;
+    while (std::getline(ss, part, '/')) {
+        if (part.empty()) { accum += "/"; continue; }
+        accum += part + "/";
+#ifdef _WIN32
+        ::mkdir(accum.c_str());
+#else
+        ::mkdir(accum.c_str(), 0755);
+#endif
+    }
+}
+
+// Returns true and fills *ip/*port if conf.bin holds a previously
+// remembered rlcore address; false if it doesn't exist or is corrupt/
+// truncated (never a fatal error -- caller just falls back to requiring
+// --rlcore-ip / defaulting to multicast, same as if this file never
+// existed).
+static bool load_conf(std::string* ip, uint16_t* port) {
+    std::ifstream f(conf_path(), std::ios::binary);
+    if (!f) return false;
+    uint8_t buf[6];
+    f.read(reinterpret_cast<char*>(buf), sizeof(buf));
+    if (!f || f.gcount() != static_cast<std::streamsize>(sizeof(buf))) return false;
+    struct in_addr ia{};
+    std::memcpy(&ia.s_addr, buf, 4);
+    *ip = inet_ntoa(ia);
+    uint16_t port_be;
+    std::memcpy(&port_be, buf + 4, 2);
+    *port = ntohs(port_be);
+    return true;
+}
+
+static void save_conf(const std::string& ip, uint16_t port) {
+    struct in_addr ia{};
+    if (::inet_pton(AF_INET, ip.c_str(), &ia) != 1) return;
+    uint8_t buf[6];
+    std::memcpy(buf, &ia.s_addr, 4);
+    uint16_t port_be = htons(port);
+    std::memcpy(buf + 4, &port_be, 2);
+    std::string path = conf_path();
+    ensure_parent_dir(path);
+    std::ofstream f(path, std::ios::binary | std::ios::trunc);
+    f.write(reinterpret_cast<const char*>(buf), sizeof(buf));
 }
 
 static std::string json_escape(const std::string& s) {
@@ -259,23 +324,7 @@ static std::map<uint32_t, std::string> load_cache() {
 
 static void save_cache(const std::map<uint32_t, std::string>& cache) {
     std::string path = cache_path();
-    auto slash = path.find_last_of('/');
-    if (slash != std::string::npos) {
-        std::string dir = path.substr(0, slash);
-        // mkdir -p, minimal: create each path component.
-        std::string accum;
-        std::stringstream ss(dir);
-        std::string part;
-        while (std::getline(ss, part, '/')) {
-            if (part.empty()) { accum += "/"; continue; }
-            accum += part + "/";
-#ifdef _WIN32
-            ::mkdir(accum.c_str());
-#else
-            ::mkdir(accum.c_str(), 0755);
-#endif
-        }
-    }
+    ensure_parent_dir(path);
     std::ofstream f(path, std::ios::trunc);
     f << "{\n";
     size_t i = 0;
@@ -744,6 +793,19 @@ static void cmd_pub(const Args& a) {
 
 int main(int argc, char** argv) {
     Args a = parse_args(argc, argv);
+    if (!a.rlcore_ip.empty()) {
+        save_conf(a.rlcore_ip, a.rlcore_port);
+    } else {
+        std::string remembered_ip;
+        uint16_t remembered_port = 0;
+        if (load_conf(&remembered_ip, &remembered_port)) {
+            a.rlcore_ip = remembered_ip;
+            a.rlcore_port = remembered_port;
+            std::fprintf(stderr, "rl_topic: using remembered rlcore at %s:%u (from %s; "
+                         "pass --rlcore-ip to change)\n",
+                         a.rlcore_ip.c_str(), a.rlcore_port, conf_path().c_str());
+        }
+    }
     if (a.ipc && (a.command == "list" || a.command == "info")) {
         std::fprintf(stderr, "rl_topic: --ipc is not supported for \"%s\" -- there is no "
                      "central directory of same-host IPC topics to enumerate (unlike UDP's "
