@@ -71,6 +71,7 @@ class _RlCoreConfig:
         self._ip = 0
         self._port = RLCORE_DEFAULT_PORT
         self._encrypt_key: Optional[bytes] = None
+        self._relay_requested = False
 
     def ip(self, addr: str):
         self._owner._select_mode(DiscoveryMode.RLCORE)
@@ -111,6 +112,25 @@ class _RlCoreConfig:
     @property
     def encrypt_key(self) -> Optional[bytes]:
         return self._encrypt_key
+
+    def set_relay(self, enabled: bool = True):
+        """Opt-in shortcut for the common case: rlcore itself was started
+        with --relay (or --nat, which implies it), which folds relay data
+        forwarding into this SAME ip:port instead of a separate
+        standalone relink-relay process (see relink_rlcore.cpp's --relay
+        comment). Equivalent to calling the node's own set_relay(ip, port)
+        with this config's own ip()/port(), so there's no second address
+        to keep in sync with the first. Resolved against ip()/port() at
+        _ensure_started() time, so call order relative to ip()/port()
+        doesn't matter. Mirrors the C++ API's set_rlcore.setRelay(). Use
+        RelinkNode.set_relay(ip, port) directly instead only when relaying
+        through a DIFFERENT address than rlcore itself (e.g. the
+        standalone relink-relay binary on its own default port)."""
+        self._relay_requested = enabled
+
+    @property
+    def relay_requested(self) -> bool:
+        return self._relay_requested
 
 
 class RelinkNode:
@@ -274,6 +294,12 @@ class RelinkNode:
             tick += 1
             groups = self._rlcore_groups
             self_ip = self._rlcore_self_ip
+            # Node-wide, not per-group -- repeats every tick like the
+            # per-group role announce below, so a lost topic-name announce
+            # (see _ensure_started()'s call site) self-heals instead of
+            # leaving rl_topic.py list/info blind to that name for the
+            # rest of this node's lifetime.
+            self._announce_topic_names_to_rlcore()
             # At many topics (e.g. 20+), re-registering every group every
             # tick multiplies load on rlcore (a single-threaded server)
             # and on this node's own busy sockets by the topic count,
@@ -419,6 +445,45 @@ class RelinkNode:
 
     def _relay_peer(self) -> PeerAddr:
         return PeerAddr(self._relay_ip, self._relay_port)
+
+    def _announce_topic_names_to_rlcore(self):
+        # encode_announce() rejects more than tdir.MAX_ENTRIES (512)
+        # entries in one packet -- a real large-topic-count system (e.g.
+        # ~1000 topics) easily exceeds that in a single node, and a single
+        # encode_announce() call would raise ValueError and get silently
+        # swallowed, dropping every name for that node with no announce
+        # ever reaching rlcore even though registration/data traffic
+        # worked fine (different wire protocols) -- rl_topic.py list/info
+        # would then see nothing despite everything else running. Chunk
+        # instead. Fire-and-forget, no ack -- called both once at
+        # _ensure_started() time and every tick from
+        # _rlcore_reregister_loop(), so a single lost packet doesn't
+        # permanently hide the name (see that call site's comment).
+        if not self._topic_names:
+            return
+        all_entries = [TopicDirEntry(tid, name) for tid, name in self._topic_names.items()]
+        rlcore_addr = (host_order_to_ipv4(self.set_rlcore.resolved_ip), self.set_rlcore.resolved_port)
+        # chunk_entries(), not a raw MAX_ENTRIES slice -- see its
+        # docstring: MAX_ENTRIES alone doesn't guarantee the encoded
+        # packet stays under MAX_PACKET once names have real-world length.
+        for chunk in tdir.chunk_entries(all_entries):
+            try:
+                announce = tdir.encode_announce(chunk)
+                self._transport.sock.sendto(announce, rlcore_addr)
+            except (ValueError, OSError):
+                pass
+
+    @property
+    def relay_active(self) -> bool:
+        """Whether a relay path (via set_relay() or set_rlcore.set_relay())
+        is active. Callers inspecting publish_raw()'s return value or
+        local peer knowledge to decide "is anyone listening" should check
+        this first -- with relay enabled, publish_raw() always attempts
+        delivery via the relay's fixed address regardless of whether any
+        DIRECT peer has been learned yet, so having no known direct peer
+        no longer means "no-op publish" the way it does without relay.
+        Mirrors the C++ API's RelinkNode::relay_active()."""
+        return self._relay_enabled
 
     def _register_all_topics_with_relay(self, groups):
         # (Dedup is armed earlier, in _ensure_started(), before any
@@ -622,9 +687,14 @@ class RelinkNode:
         all_ok = True
         for peer in peers:
             all_ok = t.publish_raw(topic_id, payload, peer, seq) and all_ok
+        relay_ok = False
         if self._relay_enabled:
-            t.publish_raw(topic_id, payload, self._relay_peer(), seq)
-        return all_ok and bool(peers)
+            relay_ok = t.publish_raw(topic_id, payload, self._relay_peer(), seq)
+        # Direct delivery counts as success only if there was at least one
+        # direct peer to send to; the relay path counts as success on its
+        # own -- it doesn't need a direct peer address at all, so an empty
+        # `peers` list under relay is not a failure.
+        return (all_ok and bool(peers)) or relay_ok
 
     # --- publish: sends to every currently-known peer for this topic ---
     def publish(self, topic: Union[int, str], value: ctypes.Structure) -> bool:
@@ -639,9 +709,10 @@ class RelinkNode:
         all_ok = True
         for peer in peers:
             all_ok = t.publish_raw(topic_id, payload, peer, seq) and all_ok
+        relay_ok = False
         if self._relay_enabled and not is_large_blob:
-            t.publish_raw(topic_id, payload, self._relay_peer(), seq)
-        return all_ok
+            relay_ok = t.publish_raw(topic_id, payload, self._relay_peer(), seq)
+        return (all_ok and bool(peers)) or relay_ok
 
     # --- Image: a library-provided large-blob type, automatically
     # chunked to the MTU maximum on send and reassembled on receive.
@@ -985,6 +1056,14 @@ class RelinkNode:
                     "use_multicast_discovery() before spin()/publish()/subscribe traffic")
             if self._mode == DiscoveryMode.RLCORE and not self.set_rlcore.ip_is_set:
                 raise RuntimeError("rlcore IP not set -- call set_rlcore.ip(...)")
+            if self.set_rlcore.relay_requested and not self._relay_enabled:
+                if self._mode != DiscoveryMode.RLCORE:
+                    raise RuntimeError(
+                        "set_rlcore.set_relay(True) requires rlcore discovery mode -- "
+                        "call set_rlcore.ip(...) first")
+                self._relay_enabled = True
+                self._relay_ip = self.set_rlcore.resolved_ip
+                self._relay_port = self.set_rlcore.resolved_port
 
             self._transport.bind(0)
 
@@ -1113,31 +1192,17 @@ class RelinkNode:
                 self._rlcore_groups = list(groups)
 
                 # Tell rlcore about any names we resolved for these topics
-                # (best-effort, fire-and-forget -- see the C++ side's
-                # identical comment in relink.hpp for the rationale).
-                # encode_announce() rejects more than tdir.MAX_ENTRIES
-                # (512) entries in one packet -- a real large-topic-count
-                # system (e.g. ~1000 topics) easily exceeds that in a
-                # single node, and the ONE announce call this used to be
-                # would raise ValueError and get silently swallowed by
-                # the bare except below, dropping every name for that
-                # node with no announce ever reaching rlcore even though
-                # registration/data traffic worked fine (different wire
-                # protocols) -- rl_topic.py list/info would then see
-                # nothing despite everything else running. Chunk instead.
-                if self._topic_names:
-                    all_entries = [TopicDirEntry(tid, name) for tid, name in self._topic_names.items()]
-                    rlcore_addr = (host_order_to_ipv4(self.set_rlcore.resolved_ip), self.set_rlcore.resolved_port)
-                    # chunk_entries(), not a raw MAX_ENTRIES slice -- see
-                    # its docstring: MAX_ENTRIES alone doesn't guarantee
-                    # the encoded packet stays under MAX_PACKET once
-                    # names have real-world length.
-                    for chunk in tdir.chunk_entries(all_entries):
-                        try:
-                            announce = tdir.encode_announce(chunk)
-                            self._transport.sock.sendto(announce, rlcore_addr)
-                        except (ValueError, OSError):
-                            pass
+                # -- rl_topic.py list/info's Name field depends on this (a
+                # separate wire protocol from registration/data traffic,
+                # so it can be missing even though everything else works).
+                # This first send is fire-and-forget same as before, but
+                # no longer the ONLY attempt: _rlcore_reregister_loop()
+                # repeats it every tick forever, same as it already does
+                # for the role announce, so one lost packet (plausible for
+                # the very first datagram a fresh socket sends across a
+                # real WAN path) no longer permanently hides the name from
+                # rl_topic.py.
+                self._announce_topic_names_to_rlcore()
 
                 self._transport.start()
             else:

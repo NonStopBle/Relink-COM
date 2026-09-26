@@ -12,6 +12,7 @@
 //        echo <topic> | pub <topic> --hex <bytes> | --text <string>
 //   [--rlcore-ip <ip>] [--rlcore-port <port>] [--group <ip>] [--port <n>]
 //   [--timeout <s>] [--no-cache] [--refresh] [--ipc] [--relay]
+// Run `rl_topic -h` / `rl_topic --help` for the full per-flag reference.
 //
 // --relay (needs --rlcore-ip, mutually exclusive with --ipc's own
 // no-discovery path): opts the node into relay delivery via
@@ -90,10 +91,82 @@ static bool next_arg(int argc, char** argv, int& i, std::string* out) {
     return true;
 }
 
+static void print_help() {
+    std::printf(
+"usage: rl_topic <command> [topic] [options]\n"
+"\n"
+"commands:\n"
+"  list                    List every known topic id and name.\n"
+"  info <topic>            Show details for one topic (by name or numeric id).\n"
+"  hz <topic>              Measure the publish rate of a topic.\n"
+"  bw <topic>              Measure the bandwidth of a topic.\n"
+"  echo <topic>            Print messages on a topic as they arrive.\n"
+"  pub <topic> --hex <bytes> | --text <string>\n"
+"                          Publish a raw payload to a topic.\n"
+"\n"
+"<topic> is either a name (e.g. /relink/imu) or a numeric wire id.\n"
+"\n"
+"discovery options (how this node finds peers -- pick ONE; default is\n"
+"multicast if --rlcore-ip is not given):\n"
+"  --rlcore-ip <ip>        Use rlcore (Mode A) instead of multicast: query/\n"
+"                          register directly against a relink-rlcore daemon\n"
+"                          at this address. Needed whenever your nodes are\n"
+"                          on different networks, or aren't using multicast.\n"
+"                          This is the SAME ip your RelinkNode code passes\n"
+"                          to set_rlcore.ip(\"...\") -- e.g. if pub/sub use\n"
+"                          set_rlcore.ip(\"43.228.86.96\"), pass\n"
+"                          --rlcore-ip 43.228.86.96 here too, or list/echo/\n"
+"                          pub will query the wrong discovery domain (a\n"
+"                          common cause of \"why doesn't rl_topic show my\n"
+"                          topic\" -- see --no-cache below).\n"
+"  --rlcore-port <port>    Port for --rlcore-ip (default: 8445, same as\n"
+"                          relink-rlcore's own --port default).\n"
+"  --relay                 (needs --rlcore-ip) Also opt into relay delivery\n"
+"                          via the SAME rlcore ip:port -- only useful if\n"
+"                          that rlcore was itself started with --relay or\n"
+"                          --nat. See relink.hpp's RlCoreConfig::setRelay().\n"
+"  --group <ip>            Multicast group to query when --rlcore-ip is NOT\n"
+"                          given (default: 239.255.0.1).\n"
+"  --port <n>              Multicast port (default: 7400).\n"
+"  --ipc                   (hz/bw/echo/pub only) Same-host shared-memory\n"
+"                          topic instead of the network -- no discovery at\n"
+"                          all, mutually exclusive with the options above.\n"
+"\n"
+"other options:\n"
+"  --timeout <s>           How long to wait for discovery replies (default: 1.5).\n"
+"  --no-cache              (list/info) Ignore/don't update the local topic-\n"
+"                          name cache -- show only what replied just now.\n"
+"  --refresh               (list/info) Discard the existing cache before\n"
+"                          merging in this query's fresh results.\n"
+"  -n, --count <n>         (echo) Stop after this many messages.\n"
+"  --window <n>            (hz) Rolling sample window size (default: 100).\n"
+"  --report-every <s>      (hz/bw) Report interval in seconds (default: 5.0).\n"
+"  -r, --repeat <n>        (pub) Number of times to publish (default: 1).\n"
+"  --rate-period <s>       (pub) Seconds between repeats when --repeat > 1.\n"
+"  -h, --help              Show this help and exit.\n"
+"\n"
+"examples:\n"
+"  rl_topic list --rlcore-ip 43.228.86.96 --rlcore-port 8445\n"
+"  rl_topic echo /relink/imu --rlcore-ip 43.228.86.96\n"
+"  rl_topic pub /relink/imu --rlcore-ip 43.228.86.96 --text \"hello\"\n"
+"  rl_topic pub /example/chatter --ipc --text \"hello\"\n");
+}
+
 static Args parse_args(int argc, char** argv) {
     Args a;
     if (argc < 2) {
-        std::fprintf(stderr, "usage: rl_topic <list|info|hz|bw|echo|pub> [topic] [options]\n");
+        std::fprintf(stderr, "usage: rl_topic <list|info|hz|bw|echo|pub> [topic] [options]\n"
+                              "       rl_topic -h  for full help\n");
+        std::exit(2);
+    }
+    if (std::strcmp(argv[1], "-h") == 0 || std::strcmp(argv[1], "--help") == 0) {
+        print_help();
+        std::exit(0);
+    }
+    if (argv[1][0] == '-') {
+        std::fprintf(stderr, "rl_topic: expected a command first (list|info|hz|bw|echo|pub), "
+                     "got \"%s\" -- options like --rlcore-ip go AFTER the command, e.g.:\n"
+                     "  rl_topic list --rlcore-ip 43.228.86.96\n", argv[1]);
         std::exit(2);
     }
     a.command = argv[1];
@@ -101,7 +174,8 @@ static Args parse_args(int argc, char** argv) {
     for (int i = 2; i < argc; ++i) {
         std::string arg = argv[i];
         std::string val;
-        if (arg == "--rlcore-ip") { next_arg(argc, argv, i, &val); a.rlcore_ip = val; }
+        if (arg == "-h" || arg == "--help") { print_help(); std::exit(0); }
+        else if (arg == "--rlcore-ip") { next_arg(argc, argv, i, &val); a.rlcore_ip = val; }
         else if (arg == "--rlcore-port") { next_arg(argc, argv, i, &val); a.rlcore_port = static_cast<uint16_t>(std::atoi(val.c_str())); }
         else if (arg == "--group") { next_arg(argc, argv, i, &val); a.group = val; }
         else if (arg == "--port") { next_arg(argc, argv, i, &val); a.port = static_cast<uint16_t>(std::atoi(val.c_str())); }

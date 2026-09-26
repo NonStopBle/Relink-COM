@@ -181,6 +181,7 @@ def query_multicast(group: str, port: int, timeout: float, bind_ip: str = None):
         s.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF, socket.inet_aton(bind_ip))
     s.settimeout(timeout)
     found = {}
+    got_any = False
     try:
         s.sendto(tdir.encode_query(), (group, port))
         deadline = time.time() + timeout
@@ -198,12 +199,17 @@ def query_multicast(group: str, port: int, timeout: float, bind_ip: str = None):
             entries = tdir.decode_entries(data)
             if entries is None:
                 continue
+            got_any = True
             for e in entries:
                 found[e.topic_id] = e.name
     except OSError as e:
         print(f"rl_topic: multicast query failed ({e})", file=sys.stderr)
     finally:
         s.close()
+    if not got_any:
+        print(f"rl_topic: no reply from any multicast responder on {group}:{port} "
+              "(nothing on this LAN segment is using multicast discovery right now -- "
+              "if your nodes use --rlcore-ip instead, pass the same flag here)", file=sys.stderr)
     return found
 
 
@@ -232,7 +238,15 @@ def make_node(args) -> RelinkNode:
     if args.rlcore_ip:
         node.set_rlcore.ip(args.rlcore_ip)
         node.set_rlcore.port(args.rlcore_port)
+        # rlcore's own --relay/--nat folds relay forwarding into this SAME
+        # ip:port -- see _RlCoreConfig.set_relay()'s docstring.
+        if getattr(args, "relay", False):
+            node.set_rlcore.set_relay(True)
     else:
+        if getattr(args, "relay", False):
+            print("rl_topic: --relay requires --rlcore-ip <ip> (relay mode needs "
+                  "rlcore discovery, not multicast)", file=sys.stderr)
+            sys.exit(2)
         node.use_multicast_discovery()
     return node
 
@@ -472,8 +486,16 @@ def cmd_pub(args):
     node.advertise_raw(topic)  # must declare BEFORE the first spin_once()
     n_peers = wait_for_peers(node, topic_id, args.timeout)
     if n_peers == 0:
-        print(f"rl_topic pub: no peers found for topic id {topic_id} within {args.timeout}s "
-              f"-- publishing anyway (no-op if truly no one is listening)", file=sys.stderr)
+        if node.relay_active:
+            # Relay delivery doesn't need a direct peer address at all --
+            # it always goes to the relay's fixed ip:port regardless of
+            # whether any direct peer has been learned, so this is not a
+            # sign that publishing will actually be a no-op.
+            print(f"rl_topic pub: no DIRECT peers found for topic id {topic_id} within "
+                  f"{args.timeout}s -- relay mode is on, publishing via relay", file=sys.stderr)
+        else:
+            print(f"rl_topic pub: no peers found for topic id {topic_id} within {args.timeout}s "
+                  f"-- publishing anyway (no-op if truly no one is listening)", file=sys.stderr)
 
     reps = args.repeat if args.repeat else 1
     for i in range(reps):
@@ -585,6 +607,9 @@ def build_parser():
                 "(relink/shm_transport.py) -- <topic> is still resolved to a numeric id "
                 "via the same string hash UDP topics use, but no rlcore/multicast query is "
                 "performed; the shm ring is attached to directly.")
+    relay_help = ("(needs --rlcore-ip) Also opt into relay delivery via the SAME rlcore "
+                  "ip:port -- only useful if that rlcore was itself started with --relay "
+                  "or --nat. Mirrors RelinkNode.set_rlcore.set_relay(); see its docstring.")
 
     p_hz = sub.add_parser("hz", help="Measure the publish rate of a topic (raw, type-agnostic).",
                            parents=[common])
@@ -593,6 +618,7 @@ def build_parser():
     p_hz.add_argument("--report-every", type=float, default=5.0,
                        help="Seconds of recent history to report on each tick.")
     p_hz.add_argument("--ipc", action="store_true", help=ipc_help)
+    p_hz.add_argument("--relay", action="store_true", help=relay_help)
     p_hz.set_defaults(func=cmd_hz)
 
     p_bw = sub.add_parser("bw", help="Measure the bandwidth of a topic (raw, type-agnostic).",
@@ -601,6 +627,7 @@ def build_parser():
     p_bw.add_argument("--report-every", type=float, default=5.0,
                        help="Seconds of recent history to report on each tick.")
     p_bw.add_argument("--ipc", action="store_true", help=ipc_help)
+    p_bw.add_argument("--relay", action="store_true", help=relay_help)
     p_bw.set_defaults(func=cmd_bw)
 
     p_echo = sub.add_parser("echo", help="Print messages on a topic, decoded if possible.",
@@ -618,6 +645,7 @@ def build_parser():
     p_echo.add_argument("--hex", action="store_true",
                          help="Always print raw hex, even if --type/--msg is also given.")
     p_echo.add_argument("--ipc", action="store_true", help=ipc_help)
+    p_echo.add_argument("--relay", action="store_true", help=relay_help)
     p_echo.set_defaults(func=cmd_echo)
 
     p_pub = sub.add_parser("pub", help="Publish a raw payload to a topic (type-agnostic).",
@@ -629,6 +657,7 @@ def build_parser():
     p_pub.add_argument("--rate-period", type=float, default=1.0,
                         help="Seconds between repeats when --repeat > 1.")
     p_pub.add_argument("--ipc", action="store_true", help=ipc_help)
+    p_pub.add_argument("--relay", action="store_true", help=relay_help)
     p_pub.set_defaults(func=cmd_pub)
 
     return p
