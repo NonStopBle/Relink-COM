@@ -79,6 +79,22 @@ public:
         bool has_encrypt_key() const { return has_encrypt_key_; }
         const uint8_t* encrypt_key() const { return has_encrypt_key_ ? encrypt_key_ : nullptr; }
 
+        // Opt-in shortcut for the common case: rlcore itself was started
+        // with --relay (or --nat, which implies it), which folds relay
+        // data forwarding into this SAME ip:port instead of a separate
+        // standalone relink-relay process (see rlcore's --relay comment
+        // in relink_rlcore.cpp). Equivalent to calling the node's own
+        // set_relay(ip, port) with this config's own ip()/port(), so
+        // there's no second address to keep in sync with the first.
+        // Resolved against ip()/port() at ensure_started() time (first
+        // spin()/publish()/subscribe call), so call order relative to
+        // ip()/port() doesn't matter. Use RelinkNode::set_relay(ip, port)
+        // directly instead only when relaying through a DIFFERENT address
+        // than rlcore itself (e.g. the standalone relink-relay binary on
+        // its own default port).
+        void setRelay(bool enabled = true) { relay_requested_ = enabled; }
+        bool relay_requested() const { return relay_requested_; }
+
     private:
         RelinkNode& owner_;
         bool ip_set_ = false;
@@ -86,6 +102,7 @@ public:
         uint16_t rlcore_port_ = kRlCoreDefaultPort;
         bool has_encrypt_key_ = false;
         uint8_t encrypt_key_[kAesKeyBytes] = {};
+        bool relay_requested_ = false;
     };
 
     RelinkNode() : set_rlcore(*this) {}
@@ -1000,6 +1017,16 @@ private:
         }
         if (mode == DiscoveryMode::RlCore && !set_rlcore.ip_is_set()) {
             throw std::runtime_error("rlcore IP not set -- call set_rlcore.ip(...)");
+        }
+        if (set_rlcore.relay_requested() && !relay_enabled_) {
+            if (mode != DiscoveryMode::RlCore) {
+                throw std::runtime_error(
+                    "set_rlcore.setRelay(true) requires rlcore discovery mode -- "
+                    "call set_rlcore.ip(...) first");
+            }
+            relay_enabled_ = true;
+            relay_ip_ = set_rlcore.resolved_ip();
+            relay_port_ = set_rlcore.resolved_port();
         }
 
         transport_.bind(0);

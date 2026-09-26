@@ -14,7 +14,13 @@ const char* TOPIC_CHATTER = "/example/chatter";
 
 int main() {
     RelinkNode node;
-    node.use_multicast_discovery();
+    // node.use_multicast_discovery();
+
+
+    node.set_rlcore.ip("43.228.86.96");
+    node.set_rlcore.port(8445);
+    node.set_rlcore.setRelay(true);
+    node.set_multiplex(false);
 
     // Subscribe before calling spin_once()/entering the loop, so we
     // don't miss any messages sent right after discovery completes.

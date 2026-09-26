@@ -21,13 +21,20 @@ const char* TOPIC_CHATTER = "/example/chatter";
 
 int main() {
     RelinkNode node;
+    
+
+    node.set_rlcore.ip("43.228.86.96");
+    node.set_rlcore.port(8445);
+    node.set_rlcore.setRelay(true);
+    node.set_multiplex(false);
+    
 
     // Multicast discovery: zero setup, works as long as pub/sub are on
     // the same LAN segment. For nodes on different networks, use
     // node.set_rlcore.ip("...") instead -- see README.md.
-    node.use_multicast_discovery();
+    // node.use_multicast_discovery();
 
-    node.advertise<Chatter>(TOPIC_CHATTER);
+    // node.advertise<Chatter>(TOPIC_CHATTER);
     uint32_t topic_id = node.topic_id_for(TOPIC_CHATTER);
 
     const auto period = std::chrono::milliseconds(500);
