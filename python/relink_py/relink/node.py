@@ -699,6 +699,15 @@ class RelinkNode:
     # --- publish: sends to every currently-known peer for this topic ---
     def publish(self, topic: Union[int, str], value: ctypes.Structure) -> bool:
         topic_id = self._topic_id_for(topic)
+        # Mirrors publish_raw()'s bookkeeping (this method never had it) --
+        # harmless no-op for rlcore registration if this is the first call
+        # for this topic (_ensure_started() below already snapshotted
+        # _declared_topics by now; advertise() before the first
+        # spin_once()/publish() is still required for actual peer
+        # discovery), but keeps _advertised_topics accurate for
+        # rl_topic.py info's role reporting either way.
+        self._declared_topics.add(topic_id)
+        self._advertised_topics.add(topic_id)
         self._ensure_started()
         with self._peers_lock:
             peers = list(self._peers.get(topic_id, []))

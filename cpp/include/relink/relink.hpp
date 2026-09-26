@@ -444,6 +444,15 @@ public:
         std::vector<PeerAddr> peers;
         {
             std::lock_guard<std::mutex> lock(state_mutex_);
+            // Mirrors publish_raw()'s bookkeeping (this method never had
+            // it) -- harmless no-op for rlcore registration if this is
+            // the first call for this topic (ensure_started() already
+            // snapshotted declared_topics_ by now; advertise<T>() before
+            // the first spin_once()/publish() is still required for
+            // actual peer discovery), but keeps advertised_topics_
+            // accurate for rl_topic info's role reporting either way.
+            declared_topics_.insert(topic_id);
+            advertised_topics_.insert(topic_id);
             auto it = peers_.find(topic_id);
             if (it != peers_.end()) peers = it->second;
         }

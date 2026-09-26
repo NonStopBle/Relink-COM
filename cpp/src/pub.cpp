@@ -34,7 +34,14 @@ int main() {
     // node.set_rlcore.ip("...") instead -- see README.md.
     // node.use_multicast_discovery();
 
-    // node.advertise<Chatter>(TOPIC_CHATTER);
+    // Must be called before the first spin_once()/publish() below --
+    // ensure_started() snapshots the declared-topic list exactly once,
+    // on that first call, to register with rlcore. Without this,
+    // publish<T>() below never registers the topic at all: it silently
+    // stays invisible to rl_topic list/info and never learns direct
+    // peers of its own (it only appeared to work via relay forwarding,
+    // as a side effect of sub.cpp being the one properly registered).
+    node.advertise<Chatter>(TOPIC_CHATTER);
     uint32_t topic_id = node.topic_id_for(TOPIC_CHATTER);
 
     const auto period = std::chrono::milliseconds(1);
